@@ -36,8 +36,7 @@ CONFIG: Dict[str, Any] = {
     "DB_PATH": "patterns.db",
     "CAPITAL_FILE": "capital_inicial.json",
     "WATCHLIST": [
-        "BTC/USDT:USDT",
-        "ETH/USDT:USDT",
+    
         "TON/USDT:USDT",
         "SOL/USDT:USDT",
         "HOME/USDT:USDT",
