@@ -15,6 +15,7 @@ try:
 except ImportError:
     ccxtpro = None
 import asyncio
+import os
 import time
 import logging
 import hashlib
@@ -170,6 +171,7 @@ class BybitAPIManager:
         self.api_key = api_key
         self.api_secret = api_secret
         self.sandbox = sandbox
+        self.proxy = os.getenv("BYBIT_PROXY", "")
 
         # Circuit Breaker
         self.circuit = CircuitBreaker(
@@ -204,7 +206,7 @@ class BybitAPIManager:
     # ──────────────────────────────────────────
     def _init_exchange(self) -> ccxt.bybit:
         """Configura el exchange REST con USDT-M Futures."""
-        exchange = ccxt.bybit({
+        config = {
             "apiKey":    self.api_key,
             "secret":    self.api_secret,
             "enableRateLimit": True,       # Rate limiter base de ccxt
@@ -212,7 +214,15 @@ class BybitAPIManager:
                 "defaultType": "linear",   # USDT-M Perpetual Futures
                 "recvWindow": 5000,
             },
-        })
+        }
+        if self.proxy:
+            config["proxies"] = {
+                "http": self.proxy,
+                "https": self.proxy,
+            }
+            logger.info(f"[Init] Usando proxy Bybit: {self.proxy}")
+
+        exchange = ccxt.bybit(config)
         if self.sandbox:
             exchange.set_sandbox_mode(True)
             logger.info("[Init] Sandbox activado.")
@@ -268,6 +278,16 @@ class BybitAPIManager:
             logger.critical(f"[Auth] Error de autenticación: {e}. Deteniendo bot.")
             self.circuit.failure_count = self.circuit.max_failures  # Forzar OPEN
             self.circuit.state = CircuitState.OPEN
+            raise
+
+        except ccxt.RateLimitExceeded as e:
+            logger.error(
+                f"[RateLimit/Access] {e}. Puede ser bloqueo geográfico o acceso restringido. "
+                "Revisa BYBIT_PROXY / VPN / ubicación de despliegue."
+            )
+            opened = self.circuit.record_failure()
+            if not opened:
+                await asyncio.sleep(30)
             raise
 
         except ccxt.NetworkError as e:
@@ -589,9 +609,12 @@ class BybitAPIManager:
         """Cierra todas las conexiones limpiamente."""
         await self.stop_websocket()
         if hasattr(self.exchange, "close"):
-            result = self.exchange.close()
-            if asyncio.iscoroutine(result):
-                await result
+            try:
+                result = self.exchange.close()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.warning(f"[BybitAPIManager] Error cerrando exchange: {e}")
         logger.info("[BybitAPIManager] Conexiones cerradas.")
 
 
