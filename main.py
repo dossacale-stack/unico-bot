@@ -24,7 +24,7 @@ logger = logging.getLogger("UNICO")
 CONFIG: Dict[str, Any] = {
     "API_KEY": os.getenv("BYBIT_API_KEY", ""),
     "API_SECRET": os.getenv("BYBIT_API_SECRET", ""),
-    "SANDBOX": os.getenv("BYBIT_SANDBOX", "true").lower() == "true",
+    "SANDBOX": os.getenv("BYBIT_SANDBOX", "false").lower() == "true",
     "MODE": os.getenv("BOT_MODE", "DRY_RUN"),
     "SCANNER_ENABLED": True,
     "MAX_POSITIONS": 3,
