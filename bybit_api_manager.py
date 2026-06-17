@@ -270,7 +270,12 @@ class BybitAPIManager:
         await self._rate_limit_wait(endpoint_type)
 
         try:
-            result = await coro if asyncio.iscoroutine(coro) else coro()
+            if asyncio.iscoroutine(coro):
+                result = await coro
+            elif callable(coro):
+                result = coro()
+            else:
+                result = coro
             self.circuit.record_success()
             return result
 
