@@ -588,7 +588,10 @@ class BybitAPIManager:
     async def close(self):
         """Cierra todas las conexiones limpiamente."""
         await self.stop_websocket()
-        await self.exchange.close()
+        if hasattr(self.exchange, "close"):
+            result = self.exchange.close()
+            if asyncio.iscoroutine(result):
+                await result
         logger.info("[BybitAPIManager] Conexiones cerradas.")
 
 
