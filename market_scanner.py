@@ -328,7 +328,20 @@ class MarketScanner:
         matched: Dict[str, Any],
     ) -> Optional[Signal]:
         pattern = matched["pattern"]
-        signal_type = SignalType(pattern["signal_type"])
+        signal_type_str = pattern["signal_type"]
+
+        # ============================================================
+        # 🔥 CORRECCIÓN: Validar que el tipo de señal sea válido
+        # ============================================================
+        try:
+            signal_type = SignalType(signal_type_str)
+        except ValueError:
+            logger.warning(
+                f"[MarketScanner] Tipo de señal inválido '{signal_type_str}' en patrón "
+                f"para {symbol}. Se omite."
+            )
+            return None
+
         entry_price = float(behavior["entry_price"])
         stop_loss = self._calculate_stop_loss(df, signal_type)
         take_profit = self._calculate_take_profit(
@@ -343,12 +356,18 @@ class MarketScanner:
         reward = abs(take_profit - entry_price)
         risk = abs(entry_price - stop_loss)
         risk_reward = reward / max(risk, 1e-6)
-        score = matched["match_ratio"] * min(1.0, float(pattern.get("rb_real", 0.0)) / 50.0)
+        score = float(matched["match_ratio"])
+
+        logger.debug(
+            f"[MarketScanner] Signal candidate {symbol} {signal_type.value} | "
+            f"match_ratio={matched['match_ratio']:.2f} | rb_real={pattern.get('rb_real', 0.0)} | "
+            f"score={score:.2f} | rr={risk_reward:.2f}"
+        )
 
         return Signal(
             symbol=symbol,
             signal_type=signal_type,
-            score=float(score),
+            score=score,
             risk_reward=float(risk_reward),
             stop_loss=float(stop_loss),
             take_profit=float(take_profit),
