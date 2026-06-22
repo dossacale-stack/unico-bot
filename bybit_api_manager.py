@@ -7,6 +7,7 @@ Mejoras implementadas:
   3. Circuit Breaker con contador máximo de reintentos
   4. InvalidOrder como sub-error separado con lógica propia
   5. Caché en memoria con TTL por símbolo para DataFrames M15
+  6. Ajuste de apalancamiento (set_leverage) para modo One-Way
 """
 
 import ccxt
@@ -23,7 +24,7 @@ import hmac
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
-from typing import Optional, Dict, Tuple, Any
+from typing import Optional, Dict, Tuple, Any, List
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -151,6 +152,7 @@ class BybitAPIManager:
       5. Manejo de errores con sub-error InvalidOrder separado
       6. WebSocket con reconnect backoff exponencial
       7. Formateador / Pipeline de datos con caché TTL por símbolo
+      8. Ajuste de apalancamiento (set_leverage)
     """
 
     # Límites Bybit V5 (conservadores para seguridad)
@@ -164,13 +166,15 @@ class BybitAPIManager:
         api_key: str,
         api_secret: str,
         sandbox: bool = True,
+        dry_run: bool = False,
         cache_ttl_seconds: float = 60.0,
         circuit_max_failures: int = 5,
         circuit_recovery_timeout: float = 120.0,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
-        self.sandbox = sandbox
+        self.dry_run = dry_run
+        self.sandbox = sandbox or dry_run
         self.proxy = os.getenv("BYBIT_PROXY", "")
 
         # Circuit Breaker
@@ -195,6 +199,7 @@ class BybitAPIManager:
 
         # Inicializar exchange REST
         self.exchange = self._init_exchange()
+        self._market_symbols: Optional[set[str]] = None
         logger.info(
             f"[BybitAPIManager] Inicializado | "
             f"Modo: {'SANDBOX' if sandbox else 'LIVE'} | "
@@ -254,10 +259,39 @@ class BybitAPIManager:
             logger.debug(f"[RateLimiter] {endpoint_type} throttled {wait:.2f}s")
             await asyncio.sleep(wait)
 
+    async def _ensure_markets(self) -> None:
+        """Carga y almacena los símbolos soportados por Bybit."""
+        if self._market_symbols is not None:
+            return
+
+        try:
+            markets = await self._safe_call(
+                self.exchange.load_markets,
+                endpoint_type="public",
+            )
+            self._market_symbols = set(markets.keys())
+            logger.info(f"[BybitAPIManager] Cargados {len(self._market_symbols)} mercados de Bybit.")
+        except Exception as exc:
+            if self.dry_run:
+                logger.warning(
+                    "[BybitAPIManager] No se pudo cargar mercados en DRY_RUN. "
+                    "Se omite validación de símbolos y se usarán datos sintéticos."
+                )
+                self._market_symbols = set()
+            else:
+                raise
+
+    async def validate_symbols(self, symbols: List[str]) -> List[str]:
+        """Retorna los símbolos inválidos que no están disponibles en el exchange."""
+        await self._ensure_markets()
+        if self._market_symbols is None:
+            return symbols
+        return [symbol for symbol in symbols if symbol not in self._market_symbols]
+
     # ──────────────────────────────────────────
     #  3. CIRCUIT BREAKER WRAPPER
     # ──────────────────────────────────────────
-    async def _safe_call(self, coro, endpoint_type: str = "public"):
+    async def _safe_call(self, coro_or_callable, endpoint_type: str = "public"):
         """
         Wrapper universal: aplica rate limit + circuit breaker
         a cualquier llamada a la API.
@@ -270,12 +304,12 @@ class BybitAPIManager:
         await self._rate_limit_wait(endpoint_type)
 
         try:
-            if asyncio.iscoroutine(coro):
-                result = await coro
-            elif callable(coro):
-                result = coro()
+            if asyncio.iscoroutine(coro_or_callable):
+                result = await coro_or_callable
+            elif callable(coro_or_callable):
+                result = await asyncio.to_thread(coro_or_callable)
             else:
-                result = coro
+                result = coro_or_callable
             self.circuit.record_success()
             return result
 
@@ -290,19 +324,22 @@ class BybitAPIManager:
                 f"[RateLimit/Access] {e}. Puede ser bloqueo geográfico o acceso restringido. "
                 "Revisa BYBIT_PROXY / VPN / ubicación de despliegue."
             )
-            opened = self.circuit.record_failure()
+            opened = False
+            if not self.dry_run:
+                opened = self.circuit.record_failure()
             if not opened:
                 await asyncio.sleep(30)
             raise
 
         except ccxt.NetworkError as e:
-            opened = self.circuit.record_failure()
             logger.warning(
                 f"[Network] Error de red ({self.circuit.failure_count}/"
                 f"{self.circuit.max_failures}): {e}"
             )
+            opened = False
+            if not self.dry_run:
+                opened = self.circuit.record_failure()
             if not opened:
-                # Pausa controlada antes de reintentar
                 await asyncio.sleep(30)
             raise
 
@@ -317,7 +354,9 @@ class BybitAPIManager:
             raise
 
         except ccxt.ExchangeError as e:
-            opened = self.circuit.record_failure()
+            opened = False
+            if not self.dry_run:
+                opened = self.circuit.record_failure()
             logger.error(
                 f"[Exchange] Error del exchange ({self.circuit.failure_count}/"
                 f"{self.circuit.max_failures}): {e}"
@@ -348,7 +387,7 @@ class BybitAPIManager:
 
         try:
             raw = await self._safe_call(
-                self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit),
+                lambda: self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit),
                 endpoint_type="public",
             )
         except Exception as exc:
@@ -431,7 +470,7 @@ class BybitAPIManager:
     async def fetch_balance(self) -> Dict[str, float]:
         """Retorna balance USDT disponible y total."""
         raw = await self._safe_call(
-            self.exchange.fetch_balance({"type": "linear"}),
+            lambda: self.exchange.fetch_balance({"type": "linear"}),
             endpoint_type="private",
         )
         usdt = raw.get("USDT", {})
@@ -441,8 +480,38 @@ class BybitAPIManager:
             "total": float(usdt.get("total", 0.0)),
         }
 
+    async def get_min_amount(self, symbol: str) -> float:
+        """Retorna el tamaño mínimo de orden permitido para el símbolo."""
+        await self._ensure_markets()
+        market = getattr(self.exchange, "markets", {}).get(symbol)
+        if not market:
+            return 0.0
+
+        amount_limits = market.get("limits", {}).get("amount", {})
+        min_amount = amount_limits.get("min") if isinstance(amount_limits, dict) else 0.0
+        if min_amount:
+            return float(min_amount)
+        return float(market.get("limits", {}).get("price", {}).get("min", 0.0))
+
     # ──────────────────────────────────────────
-    #  7. COLOCAR ORDEN (con validación SL)
+    #  7. AJUSTAR APALANCAMIENTO (NUEVO)
+    # ──────────────────────────────────────────
+    async def set_leverage(self, symbol: str, leverage: int) -> None:
+        """
+        Establece el apalancamiento para el símbolo en modo One-Way.
+        """
+        try:
+            await self._safe_call(
+                lambda: self.exchange.set_leverage(leverage, symbol),
+                endpoint_type="private",
+            )
+            logger.info(f"[Leverage] {symbol} apalancamiento ajustado a {leverage}x")
+        except Exception as e:
+            logger.error(f"[Leverage] Error al setear apalancamiento para {symbol}: {e}")
+            raise
+
+    # ──────────────────────────────────────────
+    #  8. COLOCAR ORDEN (con validación SL)
     # ──────────────────────────────────────────
     async def place_order(
         self,
@@ -467,7 +536,7 @@ class BybitAPIManager:
 
         try:
             order = await self._safe_call(
-                self.exchange.create_order(symbol, order_type, side, amount, price, params),
+                lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
                 endpoint_type="private",
             )
             logger.info(
@@ -483,7 +552,7 @@ class BybitAPIManager:
             params.pop("stopLoss", None)
             params.pop("takeProfit", None)
             order = await self._safe_call(
-                self.exchange.create_order(symbol, order_type, side, amount, price, params),
+                lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
                 endpoint_type="private",
             )
             logger.warning(
@@ -493,16 +562,16 @@ class BybitAPIManager:
             return order
 
     # ──────────────────────────────────────────
-    #  8. CANCELAR ORDEN
+    #  9. CANCELAR ORDEN
     # ──────────────────────────────────────────
     async def cancel_order(self, order_id: str, symbol: str) -> Dict:
         return await self._safe_call(
-            self.exchange.cancel_order(order_id, symbol),
+            lambda: self.exchange.cancel_order(order_id, symbol),
             endpoint_type="private",
         )
 
     # ──────────────────────────────────────────
-    #  9. WEBSOCKET — OHLCV EN TIEMPO REAL
+    #  10. WEBSOCKET — OHLCV EN TIEMPO REAL
     # ──────────────────────────────────────────
     async def start_websocket(self, symbols: list, timeframe: str = "15m"):
         """
@@ -595,7 +664,7 @@ class BybitAPIManager:
             logger.info("[WebSocket] Stream cerrado.")
 
     # ──────────────────────────────────────────
-    #  10. ESTADO DEL SISTEMA
+    #  11. ESTADO DEL SISTEMA
     # ──────────────────────────────────────────
     def get_status(self) -> Dict:
         """Retorna estado actual del módulo para el dashboard."""
@@ -621,48 +690,3 @@ class BybitAPIManager:
             except Exception as e:
                 logger.warning(f"[BybitAPIManager] Error cerrando exchange: {e}")
         logger.info("[BybitAPIManager] Conexiones cerradas.")
-
-
-# ─────────────────────────────────────────────
-#  EJEMPLO DE USO / DRY RUN
-# ─────────────────────────────────────────────
-async def main():
-    manager = BybitAPIManager(
-        api_key="TU_API_KEY",
-        api_secret="TU_API_SECRET",
-        sandbox=True,
-        cache_ttl_seconds=60.0,
-        circuit_max_failures=5,
-        circuit_recovery_timeout=120.0,
-    )
-
-    try:
-        # Obtener OHLCV con caché
-        df = await manager.fetch_ohlcv("BTC/USDT:USDT", timeframe="15m", limit=300)
-        print(f"OHLCV BTC: {len(df)} velas | Último close: {df['close'].iloc[-1]:.2f}")
-
-        # Segunda llamada — usará caché (no llama a la API)
-        df2 = await manager.fetch_ohlcv("BTC/USDT:USDT", timeframe="15m", limit=300)
-        print(f"Desde caché: {len(df2)} velas")
-
-        # Balance
-        balance = await manager.fetch_balance()
-        print(f"Balance USDT: {balance}")
-
-        # Estado del sistema
-        status = manager.get_status()
-        print(f"Estado: {status}")
-
-        # WebSocket (corre en background)
-        ws_task = asyncio.create_task(
-            manager.start_websocket(["BTC/USDT:USDT", "ETH/USDT:USDT"], "15m")
-        )
-        await asyncio.sleep(10)
-        await manager.stop_websocket()
-
-    finally:
-        await manager.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
