@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -66,6 +67,7 @@ class MarketScanner:
         min_rr: float,
         position_pct: float,
         db_path: str = "patterns.db",
+        signal_cooldown_seconds: int = 60,  # NUEVO: 60s entre señales del mismo símbolo
     ):
         self.api = api_manager
         self.watchlist = watchlist
@@ -74,7 +76,10 @@ class MarketScanner:
         self.min_rr = min_rr
         self.position_pct = position_pct
         self.db_path = db_path
+        self.signal_cooldown_seconds = signal_cooldown_seconds
         self.patterns = self._load_patterns()
+        # Cooldown de 5 minutos entre señales del mismo símbolo (para el scanner)
+        self._symbol_cooldown = {}  # symbol -> timestamp
 
     def _normalize_symbol(self, symbol: str) -> str:
         return re.sub(r"[^\w]", "", symbol).upper()
@@ -100,9 +105,33 @@ class MarketScanner:
             )
             return [p.copy() for p in seed_patterns.PATTERNS]
 
+    def _can_signal(self, symbol: str) -> bool:
+        """
+        Verifica si se puede generar una nueva señal para este símbolo.
+        Cooldown de 60 segundos entre señales.
+        """
+        now = time.time()
+        if symbol in self._symbol_cooldown:
+            elapsed = now - self._symbol_cooldown[symbol]
+            if elapsed < self.signal_cooldown_seconds:
+                remaining = self.signal_cooldown_seconds - elapsed
+                logger.debug(
+                    f"[MarketScanner] {symbol} en cooldown de señales. "
+                    f"Restan {remaining:.0f}s."
+                )
+                return False
+        return True
+
     async def scan_all(self) -> List[Signal]:
         signals: List[Signal] = []
+        now = time.time()
+
         for symbol in self.watchlist:
+            # Cooldown de 5 minutos para el mismo símbolo
+            if symbol in self._symbol_cooldown:
+                if now - self._symbol_cooldown[symbol] < 300:
+                    continue
+
             try:
                 df = await self.api.fetch_ohlcv(symbol, timeframe="15m", limit=100)
                 if df is None or len(df) < 40:
@@ -123,8 +152,18 @@ class MarketScanner:
                     ),
                 )
                 signal = self._build_signal(symbol, df, behavior, best)
+
+                # NUEVO: Verificar cooldown antes de generar señal
                 if signal and signal.score >= self.min_score and signal.risk_reward >= self.min_rr:
-                    signals.append(signal)
+                    if self._can_signal(symbol):
+                        self._symbol_cooldown[symbol] = now
+                        signals.append(signal)
+                        logger.debug(
+                            f"[MarketScanner] Señal generada para {symbol}. "
+                            f"Próxima señal en {self.signal_cooldown_seconds}s."
+                        )
+                    else:
+                        logger.debug(f"[MarketScanner] {symbol} en cooldown, señal ignorada.")
 
             except Exception as exc:
                 logger.warning(f"[MarketScanner] Error en {symbol}: {exc}")
@@ -330,9 +369,12 @@ class MarketScanner:
         pattern = matched["pattern"]
         signal_type_str = pattern["signal_type"]
 
-        # ============================================================
-        # 🔥 CORRECCIÓN: Validar que el tipo de señal sea válido
-        # ============================================================
+        # Ignorar patrones NO_SIGNAL
+        if signal_type_str == "NO_SIGNAL":
+            logger.debug(f"[MarketScanner] Ignorando patrón NO_SIGNAL para {symbol}")
+            return None
+
+        # Validar SignalType
         try:
             signal_type = SignalType(signal_type_str)
         except ValueError:
@@ -343,59 +385,17 @@ class MarketScanner:
             return None
 
         entry_price = float(behavior["entry_price"])
-        stop_loss = self._calculate_stop_loss(df, signal_type)
-        take_profit = self._calculate_take_profit(
-            entry_price, stop_loss, pattern.get("rb_real", 0.0), signal_type
-        )
-        if stop_loss is None or take_profit is None:
-            return None
-
-        if entry_price == stop_loss:
-            return None
-
-        reward = abs(take_profit - entry_price)
-        risk = abs(entry_price - stop_loss)
-        risk_reward = reward / max(risk, 1e-6)
         score = float(matched["match_ratio"])
-
-        logger.debug(
-            f"[MarketScanner] Signal candidate {symbol} {signal_type.value} | "
-            f"match_ratio={matched['match_ratio']:.2f} | rb_real={pattern.get('rb_real', 0.0)} | "
-            f"score={score:.2f} | rr={risk_reward:.2f}"
-        )
+        risk_reward = 0.0  # se recalcula en RiskManager
 
         return Signal(
             symbol=symbol,
             signal_type=signal_type,
             score=score,
-            risk_reward=float(risk_reward),
-            stop_loss=float(stop_loss),
-            take_profit=float(take_profit),
+            risk_reward=risk_reward,
+            stop_loss=0.0,
+            take_profit=0.0,
             entry_price=entry_price,
             df=df,
             pattern_id=pattern.get("id"),
         )
-
-    def _calculate_stop_loss(self, df: pd.DataFrame, signal_type: SignalType) -> Optional[float]:
-        if signal_type.is_long():
-            return float(df["low"].iloc[-5:].min())
-        return float(df["high"].iloc[-5:].max())
-
-    def _calculate_take_profit(
-        self,
-        entry_price: float,
-        stop_loss: float,
-        rb_real: float,
-        signal_type: SignalType,
-    ) -> Optional[float]:
-        if entry_price == stop_loss:
-            return None
-
-        base_distance = abs(entry_price - stop_loss)
-        ratio = 3.0
-        if rb_real and rb_real > 0:
-            ratio = max(3.0, min(6.0, float(rb_real) / 10.0))
-
-        if signal_type.is_long():
-            return entry_price + base_distance * ratio
-        return entry_price - base_distance * ratio
