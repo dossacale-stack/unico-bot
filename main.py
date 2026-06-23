@@ -36,12 +36,12 @@ CONFIG: Dict[str, Any] = {
     
     # ─── GESTIÓN DE RIESGO ───
     "MAX_POSITIONS": 3,
-    "POSITION_PCT": 0.10,           # 10% del capital por operación
-    "SL_PCT": 0.40,                 # 40% de la posición = 4% del capital
-    "TP_MULTIPLE": 10.0,            # 10x el riesgo = 40% del capital
-    "LEVERAGE": 10,                 # Apalancamiento base
-    "COOLDOWN_MINUTES": 15,         # Cooldown post-cierre (mismo símbolo)
-    "MAX_ENTRIES_DAILY": 3,         # Límite diario por símbolo
+    "POSITION_PCT": 0.10,
+    "SL_PCT": 0.40,
+    "TP_MULTIPLE": 10.0,
+    "LEVERAGE": 10,
+    "COOLDOWN_MINUTES": 15,
+    "MAX_ENTRIES_DAILY": 3,
     
     # ─── APRENDIZAJE ───
     "LEARNING_ENABLED": True,
@@ -50,18 +50,34 @@ CONFIG: Dict[str, Any] = {
     "DB_PATH": "patterns.db",
     "CAPITAL_FILE": "capital_inicial.json",
     
-    # ─── WATCHLIST (ACTUALIZADA CON ACTIVOS DE LA IMAGEN) ───
+    # ─── WATCHLIST CORREGIDA (SIN :USDT) ───
     "WATCHLIST": [
         # ─── ACTIVOS DE LA IMAGEN ───
-        "DEXEUSDT:USDT",        # $62.71M  +23.25%
-        "BRUSDT:USDT",          # $2.92M   +22.62%
-        "LIGHTUSDT:USDT",       # $2.92M   +16.95%
-        "RESOLVUSDT:USDT",      # $29.51M  +16.37%
-        "OPGUSDT:USDT",         # $5.36M   +14.64%
-        "VELVETUSDT:USDT",      # $6.13M   +11.62%
-        "BEATUSDT:USDT",        # $21.34M  +11.59%
-        "TSTBSCUSDT:USDT",      # $811.43K +10.99%
-        "POPCATUSDT:USDT",      # $24.45M  +10.07%
+        "DEXEUSDT",
+        "BRUSDT",
+        "LIGHTUSDT",
+        "RESOLVUSDT",
+        "OPGUSDT",
+        "VELVETUSDT",
+        "BEATUSDT",
+        "TSTBSCUSDT",
+        "POPCATUSDT",
+        
+        # ─── ACTIVOS PRINCIPALES (siempre útiles) ───
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "BNBUSDT",
+        "XRPUSDT",
+        
+        # ─── ALTCOINS POPULARES ───
+        "ADAUSDT",
+        "DOGEUSDT",
+        "LINKUSDT",
+        "AVAXUSDT",
+        "MATICUSDT",
+        "ATOMUSDT",
+        "DOTUSDT",
     ],
 }
 
@@ -71,14 +87,12 @@ class UnicoBot:
         self.config = config
         self.mode = BotMode[config["MODE"]]
         
-        # ─── API MANAGER ───
         self.api = BybitAPIManager(
             api_key=config["API_KEY"],
             api_secret=config["API_SECRET"],
             sandbox=config["SANDBOX"],
         )
         
-        # ─── RISK MANAGER ───
         self.rm = RiskManager(
             api_manager=self.api,
             mode=self.mode,
@@ -92,7 +106,6 @@ class UnicoBot:
             max_entries_daily=config.get("MAX_ENTRIES_DAILY", 3),
         )
         
-        # ─── SCANNER ───
         self.scanner = MarketScanner(
             api_manager=self.api,
             watchlist=config["WATCHLIST"],
@@ -104,10 +117,8 @@ class UnicoBot:
             signal_cooldown_seconds=60,
         )
         
-        # ─── ORDER EXECUTOR ───
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
         
-        # ─── ESTADO ───
         self.running = False
         self.stats = {
             "cycles": 0,
@@ -118,7 +129,6 @@ class UnicoBot:
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
         
-        # ─── SEÑALES ───
         signal.signal(signal.SIGINT, self._handle_shutdown)
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
@@ -165,7 +175,6 @@ class UnicoBot:
     async def _cycle(self) -> None:
         self.stats["cycles"] += 1
 
-        # ── CAPITAL Y KILL SWITCH ──
         capital = await self.rm.update_capital()
         stopped, reason = self.rm.kill_switch.check(capital.total_balance)
         if stopped:
@@ -173,7 +182,6 @@ class UnicoBot:
             self.running = False
             return
 
-        # ── SCANNER ──
         if self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
             signals = await self.scanner.scan_all()
             self.stats["signals"] += len(signals)
@@ -182,7 +190,6 @@ class UnicoBot:
         else:
             logger.debug("[Bot] Scanner en pausa o máximo de posiciones alcanzado.")
 
-        # ── MONITOREO DE POSICIONES ──
         if self.rm.positions:
             dfs = {}
             for symbol in list(self.rm.positions.keys()):
@@ -233,7 +240,6 @@ class UnicoBot:
                         )
                         logger.info(f"[Bot] Reverso abierto {symbol} {reverse_side}")
 
-        # ── STATUS ──
         self._log_status(capital)
         await asyncio.sleep(self.config["SCAN_INTERVAL"])
 
