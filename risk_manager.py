@@ -3,13 +3,15 @@ RiskManager — Módulo de Gestión de Riesgo y Ejecución
 ======================================================
 ÚNICO STRATEGY — Gestión de riesgo profesional
 
-Lógica de capital (MODIFICADA):
+Lógica de capital:
   - Posición:    10% del saldo total (ajustable)
   - SL:          40% de esa posición (= 4% del saldo) → FIJO
   - TP:          10x el riesgo (= 40% del saldo) → FIJO
   - Apalancamiento: DETECTADO AUTOMÁTICAMENTE por símbolo
   - Activos ST:  Reducción de posición a la mitad
   - Kill Switch: si pierde 15% del saldo del día → parar hasta 00:00
+  - Cooldown:    15 minutos entre entradas del mismo símbolo
+  - Límite diario: 3 entradas por símbolo al día
   - Estructura:  se mantiene para reversos (triple techo/suelo)
   - Reverso:     cierra contrato y abre en dirección contraria
 """
@@ -18,10 +20,12 @@ import asyncio
 import logging
 import sqlite3
 import os
+import time
 from datetime import datetime, timezone, time as dtime
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple
 from enum import Enum
+from collections import defaultdict
 
 import pandas as pd
 import numpy as np
@@ -111,6 +115,9 @@ class OpenPosition:
     highest_price:    float = 0.0
     lowest_price:     float = 0.0
     is_st_asset:      bool = False
+    score:            float = 0.0  # Para aprendizaje
+    signal_type:      Optional[str] = None  # Para aprendizaje
+    arrow_color:      Optional[str] = None  # Para aprendizaje
 
 
 # ─────────────────────────────────────────────
@@ -190,13 +197,13 @@ class KillSwitch:
 
 
 # ─────────────────────────────────────────────
-#  CALCULADORA DE POSICIÓN (MODIFICADA)
+#  CALCULADORA DE POSICIÓN
 # ─────────────────────────────────────────────
 class PositionCalculator:
     POSITION_PCT = 0.10
     SL_MAX_PCT   = 0.40
     TP_MULTIPLE  = 10.0
-    ST_REDUCTION = 0.50  # Reducción para activos ST
+    ST_REDUCTION = 0.50
 
     @classmethod
     def calculate(
@@ -211,9 +218,6 @@ class PositionCalculator:
         max_leverage:    Optional[int] = None,
         is_st_asset:     bool = False,
     ) -> PositionSize:
-        """
-        Calcula el tamaño de posición con SL y TP fijos.
-        """
         # Si es ST, reducir posición a la mitad
         position_pct = cls.POSITION_PCT
         if is_st_asset:
@@ -307,11 +311,6 @@ class StructureExitEngine:
         position: OpenPosition,
         df: pd.DataFrame,
     ) -> Tuple[bool, CloseReason, str]:
-        """
-        Evalúa si se debe cerrar o revertir la posición.
-        SOLO evalúa REVERSOS (trampas).
-        El SL y TP fijos se evalúan en RiskManager.monitor_positions()
-        """
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
@@ -401,7 +400,7 @@ class StructureExitEngine:
 
 
 # ─────────────────────────────────────────────
-#  RISK MANAGER PRINCIPAL (MODIFICADO)
+#  RISK MANAGER PRINCIPAL (MEJORADO)
 # ─────────────────────────────────────────────
 class RiskManager:
     def __init__(
@@ -415,6 +414,8 @@ class RiskManager:
         sl_pct:        float   = 0.40,
         tp_multiple:   float   = 10.0,
         st_reduction:  float   = 0.50,
+        cooldown_minutes: int = 15,      # NUEVO: cooldown entre entradas del mismo símbolo
+        max_entries_daily: int = 3,      # NUEVO: límite diario por símbolo
     ):
         self.api           = api_manager
         self.mode          = mode
@@ -425,9 +426,17 @@ class RiskManager:
         self.sl_pct        = sl_pct
         self.tp_multiple   = tp_multiple
         self.st_reduction  = st_reduction
+        self.cooldown_minutes = cooldown_minutes
+        self.max_entries_daily = max_entries_daily
         self.kill_switch   = KillSwitch()
         self.positions:    Dict[str, OpenPosition] = {}
         self._capital:     CapitalState = CapitalState()
+
+        # NUEVO: Cooldown por símbolo (post-cierre)
+        self._symbol_cooldown: Dict[str, float] = {}
+        # NUEVO: Límite diario por símbolo
+        self._symbol_daily_entries: Dict[str, int] = defaultdict(int)
+        self._last_entry_date: Dict[str, str] = {}
 
         # Actualizar constantes del PositionCalculator
         PositionCalculator.POSITION_PCT = position_pct
@@ -443,7 +452,9 @@ class RiskManager:
             f"Posición: {position_pct*100:.0f}% | "
             f"SL: {sl_pct*100:.0f}% de posición ({sl_pct*position_pct*100:.1f}% capital) | "
             f"TP: {tp_multiple}x riesgo | "
-            f"ST reducción: {st_reduction*100:.0f}%"
+            f"ST reducción: {st_reduction*100:.0f}% | "
+            f"Cooldown: {cooldown_minutes}min | "
+            f"Máx entradas/día: {max_entries_daily}"
         )
 
     # ──────────────────────────────────────────
@@ -485,7 +496,7 @@ class RiskManager:
         logger.info(f"[Capital] Balance DRY_RUN: ${balance:.2f}")
 
     # ──────────────────────────────────────────
-    #  EVALUAR NUEVA ENTRADA (MODIFICADO)
+    #  EVALUAR NUEVA ENTRADA (MEJORADO)
     # ──────────────────────────────────────────
     async def evaluate_entry(
         self,
@@ -514,6 +525,34 @@ class RiskManager:
         if signal.symbol in self.positions:
             logger.debug(
                 f"[RiskManager] Ya hay posición abierta en {signal.symbol}"
+            )
+            return None
+
+        # ── NUEVO: Verificar cooldown post-cierre ──
+        if signal.symbol in self._symbol_cooldown:
+            elapsed = time.time() - self._symbol_cooldown[signal.symbol]
+            cooldown_seconds = self.cooldown_minutes * 60
+            if elapsed < cooldown_seconds:
+                remaining = (cooldown_seconds - elapsed) / 60
+                logger.debug(
+                    f"[RiskManager] {signal.symbol} en cooldown. "
+                    f"Restan {remaining:.1f} min para nueva entrada."
+                )
+                return None
+            else:
+                # Limpiar cooldown expirado
+                del self._symbol_cooldown[signal.symbol]
+
+        # ── NUEVO: Verificar límite diario por símbolo ──
+        today = datetime.now(timezone.utc).date().isoformat()
+        if self._last_entry_date.get(signal.symbol) != today:
+            self._symbol_daily_entries[signal.symbol] = 0
+            self._last_entry_date[signal.symbol] = today
+
+        if self._symbol_daily_entries[signal.symbol] >= self.max_entries_daily:
+            logger.warning(
+                f"[RiskManager] {signal.symbol} alcanzó el límite diario de "
+                f"{self.max_entries_daily} entradas. Hoy no se opera más."
             )
             return None
 
@@ -556,13 +595,17 @@ class RiskManager:
             is_st_asset   = is_st,
         )
 
+        # Registrar que vamos a usar una entrada diaria
+        self._symbol_daily_entries[signal.symbol] += 1
+
         logger.info(
             f"[RiskManager] ✅ Entrada aprobada: "
             f"{signal.symbol} {side.value} | "
             f"${position_size.position_usd:.2f} | "
             f"Riesgo: ${position_size.risk_usd:.2f} | "
             f"SL: {position_size.stop_loss:.4f} | "
-            f"TP: {position_size.take_profit:.4f}"
+            f"TP: {position_size.take_profit:.4f} | "
+            f"Entradas hoy: {self._symbol_daily_entries[signal.symbol]}/{self.max_entries_daily}"
         )
 
         return position_size
@@ -575,6 +618,9 @@ class RiskManager:
         order_id:      str,
         position_size: PositionSize,
         pattern_id:    Optional[int] = None,
+        signal_type:   Optional[str] = None,
+        arrow_color:   Optional[str] = None,
+        score:         float = 0.0,
     ) -> OpenPosition:
         pos = OpenPosition(
             id           = order_id,
@@ -592,6 +638,9 @@ class RiskManager:
             highest_price= position_size.entry_price,
             lowest_price = position_size.entry_price,
             is_st_asset  = position_size.is_st_asset,
+            score        = score,
+            signal_type  = signal_type,
+            arrow_color  = arrow_color,
         )
         self.positions[position_size.symbol] = pos
         logger.info(
@@ -602,7 +651,7 @@ class RiskManager:
         return pos
 
     # ──────────────────────────────────────────
-    #  MONITOREAR POSICIONES (MODIFICADO)
+    #  MONITOREAR POSICIONES
     # ──────────────────────────────────────────
     async def monitor_positions(
         self,
@@ -671,7 +720,7 @@ class RiskManager:
         return results
 
     # ──────────────────────────────────────────
-    #  CERRAR POSICIÓN
+    #  CERRAR POSICIÓN (MEJORADO)
     # ──────────────────────────────────────────
     async def close_position(
         self,
@@ -703,6 +752,13 @@ class RiskManager:
             f"Duración: {duration_m:.0f}min"
         )
 
+        # ── NUEVO: Registrar cooldown post-cierre ──
+        self._symbol_cooldown[symbol] = time.time()
+        logger.info(
+            f"[RiskManager] {symbol} en cooldown por {self.cooldown_minutes} minutos "
+            f"(cerrado por {reason.value})"
+        )
+
         if pos.pattern_id:
             self._update_pattern_result(
                 pattern_id   = pos.pattern_id,
@@ -729,6 +785,10 @@ class RiskManager:
             "reason":       reason.value,
             "duration_min": round(duration_m, 0),
             "reverse":      reason == CloseReason.REVERSE,
+            "pattern_id":   pos.pattern_id,
+            "score":        pos.score,
+            "signal_type":  pos.signal_type,
+            "arrow_color":  pos.arrow_color,
         }
 
         if reason == CloseReason.REVERSE:
@@ -793,6 +853,8 @@ class RiskManager:
             "kill_switch":       self.kill_switch.active,
             "kill_switch_reason":self.kill_switch.reason,
             "open_positions":    len(self.positions),
+            "cooldown_symbols":  list(self._symbol_cooldown.keys()),
+            "daily_entries":     dict(self._symbol_daily_entries),
             "positions": {
                 sym: {
                     "side":        pos.side.value,
@@ -810,13 +872,12 @@ class RiskManager:
 
 
 async def main():
-    print("\n🔥 RiskManager v2.0 — Detección automática de apalancamiento")
+    print("\n🔥 RiskManager v3.0 — Con cooldown y límite diario")
     print("─" * 60)
-    print("  Este módulo ahora detecta automáticamente:")
-    print("  • Apalancamiento máximo permitido por símbolo")
-    print("  • Activos ST (Special Treatment) con mayor riesgo")
-    print("  • Ajusta SL/TP según el apalancamiento efectivo")
-    print("  • Reduce posición 50% para activos ST")
+    print("  🛡️  Cooldown: 15 minutos entre entradas del mismo símbolo")
+    print("  📊  Límite diario: 3 entradas por símbolo")
+    print("  🔒  SL fijo: 4% del capital")
+    print("  🚀  TP fijo: 40% del capital")
     print("─" * 60)
 
 if __name__ == "__main__":
