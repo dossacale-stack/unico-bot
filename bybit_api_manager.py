@@ -7,7 +7,9 @@ Mejoras implementadas:
   3. Circuit Breaker con contador máximo de reintentos
   4. InvalidOrder como sub-error separado con lógica propia
   5. Caché en memoria con TTL por símbolo para DataFrames M15
-  6. Ajuste de apalancamiento (set_leverage) para modo One-Way
+  6. Ajuste de apalancamiento (set_leverage)
+  7. Detección automática de apalancamiento máximo por símbolo
+  8. Detección de activos ST (Special Treatment)
 """
 
 import ccxt
@@ -44,20 +46,15 @@ logger = logging.getLogger("BybitAPIManager")
 #  ENUMS Y DATACLASSES
 # ─────────────────────────────────────────────
 class CircuitState(Enum):
-    CLOSED = "CLOSED"       # Normal, pasando peticiones
-    OPEN = "OPEN"           # Bloqueado tras demasiados fallos
-    HALF_OPEN = "HALF_OPEN" # Probando si el servicio se recuperó
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
 
 
 @dataclass
 class CircuitBreaker:
-    """
-    Detiene el bot tras MAX_FAILURES fallos consecutivos.
-    Entra en HALF_OPEN después de RECOVERY_TIMEOUT segundos
-    para verificar si Bybit se recuperó.
-    """
     max_failures: int = 5
-    recovery_timeout: float = 120.0   # 2 minutos antes de reintentar
+    recovery_timeout: float = 120.0
     state: CircuitState = CircuitState.CLOSED
     failure_count: int = 0
     last_failure_time: float = 0.0
@@ -67,7 +64,6 @@ class CircuitBreaker:
         self.state = CircuitState.CLOSED
 
     def record_failure(self) -> bool:
-        """Retorna True si el circuit se abre (bot debe detenerse)."""
         self.failure_count += 1
         self.last_failure_time = time.monotonic()
         if self.failure_count >= self.max_failures:
@@ -80,7 +76,6 @@ class CircuitBreaker:
         return False
 
     def can_attempt(self) -> bool:
-        """¿Se puede hacer una nueva petición?"""
         if self.state == CircuitState.CLOSED:
             return True
         if self.state == CircuitState.OPEN:
@@ -90,29 +85,17 @@ class CircuitBreaker:
                 logger.warning("[CircuitBreaker] Estado HALF_OPEN: probando reconexión.")
                 return True
             return False
-        # HALF_OPEN: permitir un intento
         return True
 
 
 @dataclass
 class RateLimiterSlot:
-    """
-    Límites diferenciados por tipo de endpoint.
-    Bybit V5:
-      - Public  (OHLCV):  120 req / 5s
-      - Private (Orders): 10 req / 1s
-    """
     max_requests: int
     window_seconds: float
     timestamps: list = field(default_factory=list)
 
     def acquire(self) -> float:
-        """
-        Bloquea (retorna segundos de espera necesarios) si se
-        supera el límite. Retorna 0.0 si puede proceder ya.
-        """
         now = time.monotonic()
-        # Limpiar timestamps fuera de la ventana
         self.timestamps = [t for t in self.timestamps if now - t < self.window_seconds]
         if len(self.timestamps) >= self.max_requests:
             wait = self.window_seconds - (now - self.timestamps[0])
@@ -123,10 +106,9 @@ class RateLimiterSlot:
 
 @dataclass
 class OHLCVCache:
-    """Caché con TTL para DataFrames — evita llamadas redundantes en el mismo candle M15."""
     data: Optional[pd.DataFrame] = None
     timestamp: float = 0.0
-    ttl_seconds: float = 60.0  # Refresca máximo 1 vez por minuto para M15
+    ttl_seconds: float = 60.0
 
     @property
     def is_valid(self) -> bool:
@@ -141,21 +123,6 @@ class OHLCVCache:
 #  BYBIT API MANAGER PRINCIPAL
 # ─────────────────────────────────────────────
 class BybitAPIManager:
-    """
-    Módulo API principal para futuros perpetuos USDT-M en Bybit.
-    
-    Capas implementadas:
-      1. Validación y configuración inicial (sandbox / live)
-      2. Rate Limiter diferenciado por endpoint
-      3. Firma HMAC-SHA256 (manejada por ccxt internamente)
-      4. Circuit Breaker con estados CLOSED / OPEN / HALF_OPEN
-      5. Manejo de errores con sub-error InvalidOrder separado
-      6. WebSocket con reconnect backoff exponencial
-      7. Formateador / Pipeline de datos con caché TTL por símbolo
-      8. Ajuste de apalancamiento (set_leverage)
-    """
-
-    # Límites Bybit V5 (conservadores para seguridad)
     _RATE_LIMITS = {
         "public":  RateLimiterSlot(max_requests=100, window_seconds=5.0),
         "private": RateLimiterSlot(max_requests=8,   window_seconds=1.0),
@@ -177,46 +144,41 @@ class BybitAPIManager:
         self.sandbox = sandbox or dry_run
         self.proxy = os.getenv("BYBIT_PROXY", "")
 
-        # Circuit Breaker
         self.circuit = CircuitBreaker(
             max_failures=circuit_max_failures,
             recovery_timeout=circuit_recovery_timeout,
         )
 
-        # Caché OHLCV por símbolo
         self._ohlcv_cache: Dict[str, OHLCVCache] = defaultdict(
             lambda: OHLCVCache(ttl_seconds=cache_ttl_seconds)
         )
 
-        # WebSocket
         self._ws_exchange: Optional[Any] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_reconnect_attempts: int = 0
         self._ws_max_reconnects: int = 10
-        self._ws_base_delay: float = 2.0      # segundos base para backoff
-        self._ws_data: Dict[str, Any] = {}    # últimos datos recibidos por símbolo
+        self._ws_base_delay: float = 2.0
+        self._ws_data: Dict[str, Any] = {}
         self._ws_running: bool = False
 
-        # Inicializar exchange REST
         self.exchange = self._init_exchange()
         self._market_symbols: Optional[set[str]] = None
+        self._leverage_cache: Dict[str, int] = {}  # Caché de apalancamiento
+        self._st_assets: set[str] = set()  # Activos ST detectados
+
         logger.info(
             f"[BybitAPIManager] Inicializado | "
             f"Modo: {'SANDBOX' if sandbox else 'LIVE'} | "
             f"Circuit: {self.circuit.max_failures} fallos máx."
         )
 
-    # ──────────────────────────────────────────
-    #  1. VALIDACIÓN Y CONFIGURACIÓN INICIAL
-    # ──────────────────────────────────────────
     def _init_exchange(self) -> ccxt.bybit:
-        """Configura el exchange REST con USDT-M Futures."""
         config = {
             "apiKey":    self.api_key,
             "secret":    self.api_secret,
-            "enableRateLimit": True,       # Rate limiter base de ccxt
+            "enableRateLimit": True,
             "options": {
-                "defaultType": "linear",   # USDT-M Perpetual Futures
+                "defaultType": "linear",
                 "recvWindow": 5000,
             },
         }
@@ -234,7 +196,6 @@ class BybitAPIManager:
         return exchange
 
     def _init_ws_exchange(self) -> Any:
-        """Configura el exchange WebSocket."""
         if ccxtpro is None:
             raise RuntimeError(
                 "ccxtpro no está disponible. Instala ccxtpro si necesitas WebSocket."
@@ -248,11 +209,7 @@ class BybitAPIManager:
             ws.set_sandbox_mode(True)
         return ws
 
-    # ──────────────────────────────────────────
-    #  2. RATE LIMITER DIFERENCIADO
-    # ──────────────────────────────────────────
     async def _rate_limit_wait(self, endpoint_type: str = "public"):
-        """Espera si se supera el límite del endpoint dado."""
         slot = self._RATE_LIMITS.get(endpoint_type, self._RATE_LIMITS["public"])
         wait = slot.acquire()
         if wait > 0:
@@ -260,7 +217,6 @@ class BybitAPIManager:
             await asyncio.sleep(wait)
 
     async def _ensure_markets(self) -> None:
-        """Carga y almacena los símbolos soportados por Bybit."""
         if self._market_symbols is not None:
             return
 
@@ -282,20 +238,12 @@ class BybitAPIManager:
                 raise
 
     async def validate_symbols(self, symbols: List[str]) -> List[str]:
-        """Retorna los símbolos inválidos que no están disponibles en el exchange."""
         await self._ensure_markets()
         if self._market_symbols is None:
             return symbols
         return [symbol for symbol in symbols if symbol not in self._market_symbols]
 
-    # ──────────────────────────────────────────
-    #  3. CIRCUIT BREAKER WRAPPER
-    # ──────────────────────────────────────────
     async def _safe_call(self, coro_or_callable, endpoint_type: str = "public"):
-        """
-        Wrapper universal: aplica rate limit + circuit breaker
-        a cualquier llamada a la API.
-        """
         if not self.circuit.can_attempt():
             raise RuntimeError(
                 "[CircuitBreaker] OPEN — bot pausado. Espera reconexión automática."
@@ -315,15 +263,12 @@ class BybitAPIManager:
 
         except ccxt.AuthenticationError as e:
             logger.critical(f"[Auth] Error de autenticación: {e}. Deteniendo bot.")
-            self.circuit.failure_count = self.circuit.max_failures  # Forzar OPEN
+            self.circuit.failure_count = self.circuit.max_failures
             self.circuit.state = CircuitState.OPEN
             raise
 
         except ccxt.RateLimitExceeded as e:
-            logger.error(
-                f"[RateLimit/Access] {e}. Puede ser bloqueo geográfico o acceso restringido. "
-                "Revisa BYBIT_PROXY / VPN / ubicación de despliegue."
-            )
+            logger.error(f"[RateLimit/Access] {e}.")
             opened = False
             if not self.dry_run:
                 opened = self.circuit.record_failure()
@@ -332,10 +277,7 @@ class BybitAPIManager:
             raise
 
         except ccxt.NetworkError as e:
-            logger.warning(
-                f"[Network] Error de red ({self.circuit.failure_count}/"
-                f"{self.circuit.max_failures}): {e}"
-            )
+            logger.warning(f"[Network] Error de red ({self.circuit.failure_count}/{self.circuit.max_failures}): {e}")
             opened = False
             if not self.dry_run:
                 opened = self.circuit.record_failure()
@@ -344,9 +286,7 @@ class BybitAPIManager:
             raise
 
         except ccxt.InvalidOrder as e:
-            # Sub-error específico: SL demasiado cercano, tamaño inválido, etc.
             logger.error(f"[InvalidOrder] Orden rechazada por Bybit: {e}")
-            # NO cuenta como fallo del circuit breaker — es error de lógica, no de red
             raise
 
         except ccxt.InsufficientFunds as e:
@@ -357,15 +297,9 @@ class BybitAPIManager:
             opened = False
             if not self.dry_run:
                 opened = self.circuit.record_failure()
-            logger.error(
-                f"[Exchange] Error del exchange ({self.circuit.failure_count}/"
-                f"{self.circuit.max_failures}): {e}"
-            )
+            logger.error(f"[Exchange] Error del exchange ({self.circuit.failure_count}/{self.circuit.max_failures}): {e}")
             raise
 
-    # ──────────────────────────────────────────
-    #  4. OBTENER OHLCV (con caché TTL)
-    # ──────────────────────────────────────────
     async def fetch_ohlcv(
         self,
         symbol: str,
@@ -373,13 +307,6 @@ class BybitAPIManager:
         limit: int = 300,
         force_refresh: bool = False,
     ) -> pd.DataFrame:
-        """
-        Retorna DataFrame OHLCV del símbolo.
-        Usa caché TTL para evitar llamadas redundantes dentro del mismo candle.
-
-        En modo sandbox / dry-run, si Bybit devuelve 403/NetworkError,
-        retorna datos sintéticos mínimos para que el bot no se bloquee.
-        """
         cache = self._ohlcv_cache[symbol]
         if cache.is_valid and not force_refresh:
             logger.debug(f"[Cache] Hit para {symbol} — usando datos en memoria.")
@@ -391,9 +318,7 @@ class BybitAPIManager:
                 endpoint_type="public",
             )
         except Exception as exc:
-            logger.warning(
-                f"[OHLCV] Fallback sintético para {symbol} tras error de API: {exc}"
-            )
+            logger.warning(f"[OHLCV] Fallback sintético para {symbol} tras error de API: {exc}")
             df = self._generate_synthetic_ohlcv(symbol, timeframe, limit)
             cache.update(df)
             return df
@@ -404,7 +329,6 @@ class BybitAPIManager:
         return df
 
     def _generate_synthetic_ohlcv(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-        """Crea un DataFrame OHLCV simple cuando la API de Bybit no está disponible."""
         now = datetime.now(timezone.utc)
         periods = limit + 1
         freq = self._normalize_timeframe(timeframe)
@@ -429,7 +353,6 @@ class BybitAPIManager:
         return df
 
     def _normalize_timeframe(self, timeframe: str) -> str:
-        """Normaliza timeframe de Bybit para pandas date_range."""
         tf = timeframe.strip().lower()
         if tf.endswith("m"):
             return tf[:-1] + "min"
@@ -441,34 +364,18 @@ class BybitAPIManager:
             return tf[:-1] + "w"
         return tf
 
-    # ──────────────────────────────────────────
-    #  5. FORMATEADOR / PIPELINE DE DATOS
-    # ──────────────────────────────────────────
     def _format_ohlcv(self, raw: list) -> pd.DataFrame:
-        """
-        Convierte datos crudos de ccxt a DataFrame limpio:
-          - Timestamp Unix (ms) → Datetime UTC
-          - Tipos float64 para todos los OHLCV
-          - Elimina velas incompletas (última vela en curso)
-        """
         df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        # Timestamp Unix ms → Datetime UTC
         df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         df.set_index("datetime", inplace=True)
         df.drop(columns=["timestamp"], inplace=True)
-        # Conversión float limpia
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float64)
-        # Eliminar última vela (incompleta en tiempo real)
         df = df.iloc[:-1]
         df.dropna(inplace=True)
         return df
 
-    # ──────────────────────────────────────────
-    #  6. BALANCE
-    # ──────────────────────────────────────────
     async def fetch_balance(self) -> Dict[str, float]:
-        """Retorna balance USDT disponible y total."""
         raw = await self._safe_call(
             lambda: self.exchange.fetch_balance({"type": "linear"}),
             endpoint_type="private",
@@ -481,7 +388,6 @@ class BybitAPIManager:
         }
 
     async def get_min_amount(self, symbol: str) -> float:
-        """Retorna el tamaño mínimo de orden permitido para el símbolo."""
         await self._ensure_markets()
         market = getattr(self.exchange, "markets", {}).get(symbol)
         if not market:
@@ -494,12 +400,93 @@ class BybitAPIManager:
         return float(market.get("limits", {}).get("price", {}).get("min", 0.0))
 
     # ──────────────────────────────────────────
-    #  7. AJUSTAR APALANCAMIENTO (NUEVO)
+    #  APALANCAMIENTO DINÁMICO (NUEVO)
     # ──────────────────────────────────────────
+    async def get_max_leverage(self, symbol: str) -> int:
+        """
+        Obtiene el apalancamiento máximo permitido para un símbolo.
+        También detecta si es un activo "ST" (Special Treatment).
+        """
+        # Verificar caché
+        if symbol in self._leverage_cache:
+            return self._leverage_cache[symbol]
+
+        try:
+            # 1. Intentar obtener de la caché de mercados
+            await self._ensure_markets()
+            market = self.exchange.markets.get(symbol)
+            
+            # 2. Verificar si es activo ST
+            is_st_asset = False
+            if market and 'info' in market:
+                info = market['info']
+                # Buscar indicadores de ST
+                if (info.get('isST') or 
+                    info.get('special_treatment') or
+                    'ST' in symbol.upper()):
+                    is_st_asset = True
+                    self._st_assets.add(symbol)
+                    logger.warning(f"[Leverage] {symbol} es un activo ST (mayor riesgo)")
+            
+            # 3. Obtener apalancamiento máximo
+            max_lev = 10  # Default seguro
+            
+            if market:
+                limits = market.get('limits', {})
+                leverage_limit = limits.get('leverage', {})
+                if leverage_limit:
+                    max_lev = int(leverage_limit.get('max', 10))
+            
+            # 4. Si es ST, limitar aún más (opcional)
+            if is_st_asset and max_lev > 5:
+                logger.warning(
+                    f"[Leverage] {symbol} es ST, reduciendo apalancamiento de "
+                    f"{max_lev}x a 5x por seguridad"
+                )
+                max_lev = 5
+            
+            # 5. Intentar con API directa de Bybit para confirmar
+            try:
+                response = await self._safe_call(
+                    lambda: self.exchange.public_get_v5_market_instruments_info({
+                        'category': 'linear',
+                        'symbol': symbol
+                    }),
+                    endpoint_type="public"
+                )
+                
+                if response and 'result' in response:
+                    for item in response['result'].get('list', []):
+                        if item.get('symbol') == symbol:
+                            leverage_filter = item.get('leverageFilter', {})
+                            api_max = int(leverage_filter.get('maxLeverage', 10))
+                            
+                            # Usar el menor entre ambos
+                            max_lev = min(max_lev, api_max)
+                            logger.debug(f"[Leverage] {symbol} max leverage (API): {max_lev}x")
+                            break
+            except Exception as e:
+                logger.debug(f"[Leverage] API directa falló para {symbol}: {e}")
+            
+            # Guardar en caché
+            self._leverage_cache[symbol] = max_lev
+            logger.info(f"[Leverage] {symbol} apalancamiento efectivo: {max_lev}x")
+            return max_lev
+            
+        except Exception as e:
+            logger.error(f"[Leverage] Error obteniendo apalancamiento para {symbol}: {e}")
+            return 10  # Default seguro
+
+    async def is_st_asset(self, symbol: str) -> bool:
+        """Verifica si un símbolo es un activo ST."""
+        if symbol in self._st_assets:
+            return True
+        # Intentar detectar
+        await self.get_max_leverage(symbol)
+        return symbol in self._st_assets
+
     async def set_leverage(self, symbol: str, leverage: int) -> None:
-        """
-        Establece el apalancamiento para el símbolo en modo One-Way.
-        """
+        """Establece el apalancamiento para el símbolo."""
         try:
             await self._safe_call(
                 lambda: self.exchange.set_leverage(leverage, symbol),
@@ -511,23 +498,19 @@ class BybitAPIManager:
             raise
 
     # ──────────────────────────────────────────
-    #  8. COLOCAR ORDEN (con validación SL)
+    #  COLOCAR ORDEN
     # ──────────────────────────────────────────
     async def place_order(
         self,
         symbol: str,
-        side: str,           # 'buy' | 'sell'
-        order_type: str,     # 'market' | 'limit'
+        side: str,
+        order_type: str,
         amount: float,
         price: Optional[float] = None,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         reduce_only: bool = False,
     ) -> Dict:
-        """
-        Coloca una orden en Bybit con validación previa de SL/TP.
-        Maneja InvalidOrder de forma separada para ajuste de parámetros.
-        """
         params: Dict[str, Any] = {"reduceOnly": reduce_only}
         if stop_loss:
             params["stopLoss"] = str(stop_loss)
@@ -546,9 +529,7 @@ class BybitAPIManager:
             return order
 
         except ccxt.InvalidOrder as e:
-            # Lógica separada: el SL puede estar demasiado cerca del precio actual
             logger.warning(f"[InvalidOrder] Ajustando parámetros: {e}")
-            # Reintentar sin SL/TP — dejar que OrderExecutor reajuste
             params.pop("stopLoss", None)
             params.pop("takeProfit", None)
             order = await self._safe_call(
@@ -561,9 +542,6 @@ class BybitAPIManager:
             )
             return order
 
-    # ──────────────────────────────────────────
-    #  9. CANCELAR ORDEN
-    # ──────────────────────────────────────────
     async def cancel_order(self, order_id: str, symbol: str) -> Dict:
         return await self._safe_call(
             lambda: self.exchange.cancel_order(order_id, symbol),
@@ -571,13 +549,9 @@ class BybitAPIManager:
         )
 
     # ──────────────────────────────────────────
-    #  10. WEBSOCKET — OHLCV EN TIEMPO REAL
+    #  WEBSOCKET
     # ──────────────────────────────────────────
     async def start_websocket(self, symbols: list, timeframe: str = "15m"):
-        """
-        Inicia stream WebSocket para los símbolos dados.
-        Reconnect automático con backoff exponencial.
-        """
         self._ws_exchange = self._init_ws_exchange()
         self._ws_running = True
         self._ws_reconnect_attempts = 0
@@ -585,11 +559,9 @@ class BybitAPIManager:
         await self._ws_loop(symbols, timeframe)
 
     async def _ws_loop(self, symbols: list, timeframe: str):
-        """Loop principal con backoff exponencial en reconexión."""
         while self._ws_running:
             try:
                 await self._ws_watch(symbols, timeframe)
-                # Si llega aquí sin excepción, resetear contador
                 self._ws_reconnect_attempts = 0
 
             except (ccxt.NetworkError, asyncio.TimeoutError, ConnectionResetError) as e:
@@ -602,7 +574,6 @@ class BybitAPIManager:
                     self._ws_running = False
                     break
 
-                # Backoff exponencial: 2, 4, 8, 16... hasta máx 120s
                 delay = min(
                     self._ws_base_delay ** self._ws_reconnect_attempts,
                     120.0,
@@ -613,7 +584,6 @@ class BybitAPIManager:
                 )
                 await asyncio.sleep(delay)
 
-                # Reinicializar exchange WS
                 try:
                     await self._ws_exchange.close()
                 except Exception:
@@ -630,7 +600,6 @@ class BybitAPIManager:
                 await asyncio.sleep(5)
 
     async def _ws_watch(self, symbols: list, timeframe: str):
-        """Suscripción activa a OHLCV en tiempo real."""
         tasks = [
             self._ws_exchange.watch_ohlcv(symbol, timeframe)
             for symbol in symbols
@@ -642,32 +611,24 @@ class BybitAPIManager:
                     raise result
                 if result:
                     self._ws_data[symbol] = result
-                    # Actualizar caché con datos WS
                     df = self._format_ohlcv(result)
                     self._ohlcv_cache[symbol].update(df)
-            # Recrear tasks para siguiente iteración
             tasks = [
                 self._ws_exchange.watch_ohlcv(symbol, timeframe)
                 for symbol in symbols
             ]
 
     def get_ws_data(self, symbol: str) -> Optional[pd.DataFrame]:
-        """Retorna el último DataFrame recibido por WebSocket."""
         cache = self._ohlcv_cache.get(symbol)
         return cache.data if cache and cache.is_valid else None
 
     async def stop_websocket(self):
-        """Cierra el stream WebSocket limpiamente."""
         self._ws_running = False
         if self._ws_exchange:
             await self._ws_exchange.close()
             logger.info("[WebSocket] Stream cerrado.")
 
-    # ──────────────────────────────────────────
-    #  11. ESTADO DEL SISTEMA
-    # ──────────────────────────────────────────
     def get_status(self) -> Dict:
-        """Retorna estado actual del módulo para el dashboard."""
         return {
             "circuit_state":      self.circuit.state.value,
             "circuit_failures":   self.circuit.failure_count,
@@ -677,10 +638,10 @@ class BybitAPIManager:
             "rate_public_used":   len(self._RATE_LIMITS["public"].timestamps),
             "rate_private_used":  len(self._RATE_LIMITS["private"].timestamps),
             "sandbox_mode":       self.sandbox,
+            "st_assets":          list(self._st_assets),
         }
 
     async def close(self):
-        """Cierra todas las conexiones limpiamente."""
         await self.stop_websocket()
         if hasattr(self.exchange, "close"):
             try:
