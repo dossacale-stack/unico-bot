@@ -22,32 +22,46 @@ logging.basicConfig(
 logger = logging.getLogger("UNICO")
 
 CONFIG: Dict[str, Any] = {
+    # ─── CREDENCIALES ───
     "API_KEY": os.getenv("BYBIT_API_KEY", ""),
     "API_SECRET": os.getenv("BYBIT_API_SECRET", ""),
     "SANDBOX": os.getenv("BYBIT_SANDBOX", "false").lower() == "true",
     "MODE": os.getenv("BOT_MODE", "DRY_RUN"),
+    
+    # ─── ESTRATEGIA ───
     "SCANNER_ENABLED": True,
-    "MAX_POSITIONS": 3,
-    "POSITION_PCT": 0.10,
-    "SL_PCT": 0.40,
     "SCAN_INTERVAL": 3.0,
     "MIN_SCORE": 0.60,
     "MIN_RR": 3.0,
+    
+    # ─── GESTIÓN DE RIESGO ───
+    "MAX_POSITIONS": 3,
+    "POSITION_PCT": 0.10,           # 10% del capital por operación
+    "SL_PCT": 0.40,                 # 40% de la posición = 4% del capital
+    "TP_MULTIPLE": 10.0,            # 10x el riesgo = 40% del capital
+    "LEVERAGE": 10,                 # Apalancamiento base
+    "COOLDOWN_MINUTES": 15,         # Cooldown post-cierre (mismo símbolo)
+    "MAX_ENTRIES_DAILY": 3,         # Límite diario por símbolo
+    
+    # ─── APRENDIZAJE ───
+    "LEARNING_ENABLED": True,
+    
+    # ─── BASE DE DATOS ───
     "DB_PATH": "patterns.db",
     "CAPITAL_FILE": "capital_inicial.json",
-    "WATCHLIST": [
     
-        "H/USDT:USDT",
-        "MEGA/USDT:USDT",
-        "BE/USDT:USDT",
-        "QNTX/USDT:USDT",
-        "AIO/USDT:USDT",
-        "CLO/USDT:USDT",
-        "JTO/USDT:USDT",
-        "ESPORTS/USDT:USDT",
-        "SKYAI1/USDT:USDT",
-        "LAB/USDT:USDT",
-        "PARTI/USDT:USDT",
+    # ─── WATCHLIST (ACTUALIZADA CON ACTIVOS DE LA IMAGEN) ───
+    "WATCHLIST": [
+        # ─── ACTIVOS DE LA IMAGEN ───
+        "DEXEUSDT:USDT",        # $62.71M  +23.25%
+        "BRUSDT:USDT",          # $2.92M   +22.62%
+        "LIGHTUSDT:USDT",       # $2.92M   +16.95%
+        "RESOLVUSDT:USDT",      # $29.51M  +16.37%
+        "OPGUSDT:USDT",         # $5.36M   +14.64%
+        "VELVETUSDT:USDT",      # $6.13M   +11.62%
+        "BEATUSDT:USDT",        # $21.34M  +11.59%
+        "TSTBSCUSDT:USDT",      # $811.43K +10.99%
+        "POPCATUSDT:USDT",      # $24.45M  +10.07%
     ],
 }
 
@@ -56,17 +70,29 @@ class UnicoBot:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.mode = BotMode[config["MODE"]]
+        
+        # ─── API MANAGER ───
         self.api = BybitAPIManager(
             api_key=config["API_KEY"],
             api_secret=config["API_SECRET"],
             sandbox=config["SANDBOX"],
         )
+        
+        # ─── RISK MANAGER ───
         self.rm = RiskManager(
             api_manager=self.api,
             mode=self.mode,
             db_path=config["DB_PATH"],
             max_positions=config["MAX_POSITIONS"],
+            position_pct=config.get("POSITION_PCT", 0.10),
+            sl_pct=config.get("SL_PCT", 0.40),
+            tp_multiple=config.get("TP_MULTIPLE", 10.0),
+            leverage=config.get("LEVERAGE", 10),
+            cooldown_minutes=config.get("COOLDOWN_MINUTES", 15),
+            max_entries_daily=config.get("MAX_ENTRIES_DAILY", 3),
         )
+        
+        # ─── SCANNER ───
         self.scanner = MarketScanner(
             api_manager=self.api,
             watchlist=config["WATCHLIST"],
@@ -75,8 +101,13 @@ class UnicoBot:
             min_rr=config["MIN_RR"],
             position_pct=config["POSITION_PCT"],
             db_path=config["DB_PATH"],
+            signal_cooldown_seconds=60,
         )
+        
+        # ─── ORDER EXECUTOR ───
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
+        
+        # ─── ESTADO ───
         self.running = False
         self.stats = {
             "cycles": 0,
@@ -86,19 +117,26 @@ class UnicoBot:
             "reversals": 0,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
+        
+        # ─── SEÑALES ───
         signal.signal(signal.SIGINT, self._handle_shutdown)
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
     async def initialize(self) -> None:
         logger.info(
             "\n" + "=" * 60 + "\n"
-            + " 🚀 ÚNICO STRATEGY v2.0 — Inicializando\n"
+            + " 🚀 ÚNICO STRATEGY v3.0 — Inicializando\n"
             + f" Modo: {self.mode.value}\n"
             + f" Sandbox: {self.config['SANDBOX']}\n"
             + f" Scanner: {'ON' if self.config['SCANNER_ENABLED'] else 'PAUSE'}\n"
             + f" Watchlist: {len(self.config['WATCHLIST'])} símbolos\n"
             + f" Intervalo: {self.config['SCAN_INTERVAL']}s\n"
             + f" Máximo posiciones: {self.config['MAX_POSITIONS']}\n"
+            + f" Posición: {self.config['POSITION_PCT']*100:.0f}% capital\n"
+            + f" SL: {self.config['SL_PCT']*100:.0f}% de posición\n"
+            + f" TP: {self.config['TP_MULTIPLE']}x riesgo\n"
+            + f" Cooldown: {self.config['COOLDOWN_MINUTES']}min\n"
+            + f" Límite diario: {self.config['MAX_ENTRIES_DAILY']} entradas/símbolo\n"
             + "=" * 60
         )
 
@@ -127,6 +165,7 @@ class UnicoBot:
     async def _cycle(self) -> None:
         self.stats["cycles"] += 1
 
+        # ── CAPITAL Y KILL SWITCH ──
         capital = await self.rm.update_capital()
         stopped, reason = self.rm.kill_switch.check(capital.total_balance)
         if stopped:
@@ -134,6 +173,7 @@ class UnicoBot:
             self.running = False
             return
 
+        # ── SCANNER ──
         if self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
             signals = await self.scanner.scan_all()
             self.stats["signals"] += len(signals)
@@ -142,17 +182,22 @@ class UnicoBot:
         else:
             logger.debug("[Bot] Scanner en pausa o máximo de posiciones alcanzado.")
 
+        # ── MONITOREO DE POSICIONES ──
         if self.rm.positions:
             dfs = {}
             for symbol in list(self.rm.positions.keys()):
                 dfs[symbol] = await self.api.fetch_ohlcv(symbol, timeframe="15m", limit=100)
+            
             closes = await self.rm.monitor_positions(dfs)
+            
             for symbol, (should_close, reason, notes) in closes.items():
                 if not should_close:
                     continue
+                    
                 pos = self.rm.positions.get(symbol)
                 if not pos:
                     continue
+                    
                 close_side = "sell" if pos.side == "LONG" else "buy"
                 result = await self.executor.close_position(
                     symbol=symbol,
@@ -166,9 +211,9 @@ class UnicoBot:
 
                 close_result = await self.rm.close_position(symbol, reason, pos.current_price)
                 self.stats["closed"] += 1
+                
                 if reason == CloseReason.REVERSE:
                     self.stats["reversals"] += 1
-                    # Abrir reverso inmediatamente si se detecta
                     reverse_side = "sell" if pos.side == "LONG" else "buy"
                     reverse_order = await self.executor.open_position(
                         symbol=symbol,
@@ -182,9 +227,13 @@ class UnicoBot:
                             order_id=reverse_order["id"],
                             position_size=pos,
                             pattern_id=pos.pattern_id,
+                            signal_type=pos.signal_type,
+                            arrow_color=pos.arrow_color,
+                            score=pos.score,
                         )
                         logger.info(f"[Bot] Reverso abierto {symbol} {reverse_side}")
 
+        # ── STATUS ──
         self._log_status(capital)
         await asyncio.sleep(self.config["SCAN_INTERVAL"])
 
@@ -200,6 +249,7 @@ class UnicoBot:
             sl_structural=signal.stop_loss,
             tp_structural=signal.take_profit,
         )
+        
         if not position_size:
             logger.debug(f"[Bot] Señal descartada por RiskManager: {signal.symbol}")
             return
@@ -209,9 +259,11 @@ class UnicoBot:
             symbol=signal.symbol,
             side=open_side,
             position_size=position_size,
-            stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit,
+            stop_loss=position_size.stop_loss,
+            take_profit=position_size.take_profit,
+            leverage=position_size.leverage,
         )
+        
         if not order:
             return
 
@@ -219,9 +271,15 @@ class UnicoBot:
             order_id=order["id"],
             position_size=position_size,
             pattern_id=signal.pattern_id,
+            signal_type=signal.signal_type.value,
+            arrow_color=None,
+            score=signal.score,
         )
         self.stats["opened"] += 1
-        logger.info(f"[Bot] Posición abierta {signal.symbol} {open_side}")
+        logger.info(
+            f"[Bot] Posición abierta {signal.symbol} {open_side} | "
+            f"SL: {position_size.stop_loss:.4f} TP: {position_size.take_profit:.4f}"
+        )
 
     def _log_status(self, capital: Any) -> None:
         logger.info(
@@ -243,7 +301,8 @@ class UnicoBot:
             await self.api.close()
         logger.info(
             f"[Bot] Estadísticas finales: ciclos={self.stats['cycles']}, "
-            f"señales={self.stats['signals']}, abiertas={self.stats['opened']}, cerradas={self.stats['closed']}"
+            f"señales={self.stats['signals']}, abiertas={self.stats['opened']}, "
+            f"cerradas={self.stats['closed']}, reversos={self.stats['reversals']}"
         )
 
 
@@ -261,17 +320,23 @@ def mostrar_estado() -> None:
         print("\n⚠️  La base de datos de patrones no existe. Ejecuta --init-db.")
         return
     print("\n" + "=" * 60)
-    print("  ÚNICO STRATEGY — Estado")
+    print("  ÚNICO STRATEGY v3.0 — Estado")
     print("=" * 60)
     print(f"Modo: {CONFIG['MODE']}")
     print(f"Sandbox: {CONFIG['SANDBOX']}")
-    print(f"Watchlist: {', '.join(CONFIG['WATCHLIST'])}")
+    print(f"Watchlist: {len(CONFIG['WATCHLIST'])} símbolos")
+    for symbol in CONFIG['WATCHLIST']:
+        print(f"  • {symbol}")
     print(f"DB: {CONFIG['DB_PATH']}")
+    print(f"Posición: {CONFIG['POSITION_PCT']*100:.0f}% del capital")
+    print(f"SL: {CONFIG['SL_PCT']*100:.0f}% de posición")
+    print(f"TP: {CONFIG['TP_MULTIPLE']}x riesgo")
     print("=" * 60)
 
 
 async def main() -> None:
     args = parse_args()
+    
     if args.dry_run:
         CONFIG["MODE"] = "DRY_RUN"
     if args.live:
@@ -293,6 +358,7 @@ async def main() -> None:
         sys.exit(1)
 
     bot = UnicoBot(CONFIG)
+    
     try:
         await bot.run()
     except KeyboardInterrupt:
@@ -305,15 +371,19 @@ async def main() -> None:
 
 if __name__ == "__main__":
     print("""
-╔═══════════════════════════════════════════════╗
-║ ÚNICO STRATEGY v2.0 — Bot                    ║
-║ Futuros Perpetuos USDT-M — Bybit             ║
-╠═══════════════════════════════════════════════╣
-║ Comandos:                                    ║
-║ python main.py --init-db     → inicializar DB║
-║ python main.py --status      → ver estado    ║
-║ python main.py --dry-run     → modo de prueba║
-║ python main.py --live        → modo real     ║
-╚═══════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════╗
+║            🧠 ÚNICO STRATEGY v3.0 — Bot                     ║
+║         Futuros Perpetuos USDT-M — Bybit                    ║
+╠═══════════════════════════════════════════════════════════════╣
+║  COMANDOS:                                                   ║
+║  python main.py --init-db     → Inicializar base de datos   ║
+║  python main.py --status      → Ver estado del bot          ║
+║  python main.py --dry-run     → Modo simulación (seguro)    ║
+║  python main.py --live        → Modo real (¡cuidado!)       ║
+╠═══════════════════════════════════════════════════════════════╣
+║  🛡️  SL: 4% del capital  |  🚀 TP: 40% del capital         ║
+║  📊 Posición: 10%        |  ⏱️  Cooldown: 15min            ║
+║  🔒 Límite diario: 3     |  🧠 Aprendizaje: ACTIVADO       ║
+╚═══════════════════════════════════════════════════════════════╝
 """)
     asyncio.run(main())
