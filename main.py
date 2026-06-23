@@ -30,7 +30,7 @@ CONFIG: Dict[str, Any] = {
     
     # ─── ESTRATEGIA ───
     "SCANNER_ENABLED": True,
-    "SCAN_INTERVAL": 3.0,
+    "SCAN_INTERVAL": 10.0,
     "MIN_SCORE": 0.60,
     "MIN_RR": 3.0,
     
