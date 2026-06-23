@@ -24,8 +24,7 @@ class OrderExecutor:
     def __init__(self, api_manager: BybitAPIManager, mode: BotMode):
         self.api = api_manager
         self.mode = mode
-        # Apalancamiento por defecto (puedes cambiarlo según tu estrategia)
-        self.default_leverage = 10  # Ajusta según tu tolerancia al riesgo
+        self.default_leverage = 10
 
     async def reconcile_positions(self) -> None:
         logger.info("[OrderExecutor] Reconciliando posiciones (modo base).")
@@ -40,15 +39,6 @@ class OrderExecutor:
         take_profit: float,
         leverage: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
-        """
-        Abre una posición en modo One-Way.
-        :param symbol: Símbolo (ej. "BTC/USDT:USDT")
-        :param side: "buy" o "sell"
-        :param position_size: Objeto con atributos .contracts, .entry_price, etc.
-        :param stop_loss: Precio de stop loss
-        :param take_profit: Precio de take profit
-        :param leverage: Apalancamiento (si no se pasa, usa default_leverage)
-        """
         amount = float(position_size.contracts)
         lev = leverage or self.default_leverage
 
@@ -56,7 +46,7 @@ class OrderExecutor:
             order_id = f"DRY-{symbol}-{int(time.time())}"
             logger.info(
                 f"[OrderExecutor] DRY_RUN abrir {symbol} {side} {amount} contratos "
-                f"(SL={stop_loss}, TP={take_profit})"
+                f"(SL={stop_loss:.4f}, TP={take_profit:.4f})"
             )
             return {
                 "id": order_id,
@@ -68,19 +58,19 @@ class OrderExecutor:
             }
 
         try:
-            # 1. Ajustar apalancamiento (solo en modo LIVE)
+            # 1. Ajustar apalancamiento
             await self.api.set_leverage(symbol, lev)
 
-            # 2. Verificar balance disponible (diagnóstico)
+            # 2. Verificar balance disponible
             try:
                 bal = await self.api.fetch_balance()
                 logger.debug(
-                    f"[OrderExecutor][DEBUG] balance before order: total={bal.get('total')} free={bal.get('free')}"
+                    f"[OrderExecutor] balance antes de orden: total={bal.get('total')} free={bal.get('free')}"
                 )
             except Exception as e:
-                logger.debug(f"[OrderExecutor][DEBUG] no se pudo fetch_balance: {e}")
+                logger.debug(f"[OrderExecutor] no se pudo fetch_balance: {e}")
 
-            # 3. Verificar tamaño mínimo según el mercado
+            # 3. Verificar tamaño mínimo
             try:
                 min_amt = await self.api.get_min_amount(symbol)
             except Exception:
@@ -92,7 +82,12 @@ class OrderExecutor:
                 )
                 amount = float(min_amt)
 
-            # 4. Colocar orden (modo One-Way, no necesita positionIdx)
+            # 4. Validar SL y TP
+            if stop_loss <= 0 or take_profit <= 0:
+                logger.error(f"[OrderExecutor] SL/TP inválidos: SL={stop_loss}, TP={take_profit}")
+                return None
+
+            # 5. Colocar orden (modo One-Way)
             order = await self.api.place_order(
                 symbol=symbol,
                 side=side,
@@ -123,10 +118,6 @@ class OrderExecutor:
         current_price: float,
         reason: Any,
     ) -> Optional[Dict[str, Any]]:
-        """
-        Cierra una posición con orden de mercado reduce_only.
-        :param side: "sell" si la posición es long, "buy" si es short.
-        """
         if self.mode == BotMode.DRY_RUN:
             logger.info(
                 f"[OrderExecutor] DRY_RUN cerrar {symbol} {contracts} contratos con side {side}"
@@ -156,17 +147,10 @@ class OrderExecutor:
         position_size: Any,
         leverage: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
-        """
-        Invierte la posición actual usando una orden de mercado sin reduce_only.
-        (Funciona en modo One-Way: al enviar una orden contraria sin reduce_only,
-        Bybit cierra la posición actual y abre la nueva en una sola operación).
-        """
         opposite = "sell" if current_side.lower() == "buy" else "buy"
         amount = float(position_size.contracts)
         lev = leverage or self.default_leverage
 
-        # Primero cerramos la posición actual (reduce_only) y luego abrimos la contraria
-        # Para mayor seguridad, lo hacemos en dos pasos.
         close_result = await self.close_position(
             symbol=symbol,
             side=current_side,
@@ -178,7 +162,6 @@ class OrderExecutor:
             logger.error(f"[OrderExecutor] No se pudo cerrar la posición para revertir {symbol}")
             return None
 
-        # Abrir la nueva posición en dirección contraria
         open_result = await self.open_position(
             symbol=symbol,
             side=opposite,
