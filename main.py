@@ -63,21 +63,6 @@ CONFIG: Dict[str, Any] = {
         "TSTBSCUSDT",
         "POPCATUSDT",
         
-        # ─── ACTIVOS PRINCIPALES (siempre útiles) ───
-        "BTCUSDT",
-        "ETHUSDT",
-        "SOLUSDT",
-        "BNBUSDT",
-        "XRPUSDT",
-        
-        # ─── ALTCOINS POPULARES ───
-        "ADAUSDT",
-        "DOGEUSDT",
-        "LINKUSDT",
-        "AVAXUSDT",
-        "MATICUSDT",
-        "ATOMUSDT",
-        "DOTUSDT",
     ],
 }
 
