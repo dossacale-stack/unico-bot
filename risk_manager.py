@@ -3,17 +3,16 @@ RiskManager — Módulo de Gestión de Riesgo y Ejecución
 ======================================================
 ÚNICO STRATEGY — Gestión de riesgo profesional
 
-Lógica de capital:
+Lógica de capital (MODIFICADA):
   - Posición:    10% del saldo total
-  - SL:          40% de esa posición (= 4% del saldo)
+  - SL:          40% de esa posición (= 4% del saldo) → NUEVO: se usa SIEMPRE
+  - TP:          10x el riesgo (= 40% del saldo) → NUEVO: fijo
   - Kill Switch: si pierde 15% del saldo del día → parar hasta 00:00
-  - TP:          por estructura — no por ratio fijo
+  - Estructura:  se mantiene para reversos (triple techo/suelo)
   - Reverso:     cierra contrato y abre en dirección contraria
 
-Cierre por comportamiento de EMAs, no por precio:
-  - Mantener mientras cascada de EMAs activa
-  - Cerrar cuando EMA21 cruza en dirección contraria
-  - Revertir cuando aparece trampa (triple techo / breakout falso)
+El SL y TP ya no se calculan por estructura (EMA/swing),
+sino que se usan los valores fijos basados en el riesgo.
 """
 
 import asyncio
@@ -41,7 +40,7 @@ class PositionSide(Enum):
 class CloseReason(Enum):
     STOP_LOSS       = "SL"
     TAKE_PROFIT     = "TP"
-    STRUCTURE_BREAK = "STRUCTURE"   # EMA cruzó en contra
+    STRUCTURE_BREAK = "STRUCTURE"   # EMA cruzó en contra (solo para reversos)
     REVERSE         = "REVERSE"     # Trampa detectada — revertir
     KILL_SWITCH     = "KILL_SWITCH"
     MANUAL          = "MANUAL"
@@ -193,9 +192,6 @@ class KillSwitch:
             self._reset_time = now + timedelta(days=days)
         else:
             # Reset a las 00:00 UTC del día siguiente
-            tomorrow = now.date().__class__(
-                now.year, now.month, now.day
-            )
             from datetime import timedelta
             self._reset_time = datetime.combine(
                 now.date() + timedelta(days=1),
@@ -210,18 +206,22 @@ class KillSwitch:
 
 
 # ─────────────────────────────────────────────
-#  CALCULADORA DE POSICIÓN
+#  CALCULADORA DE POSICIÓN (MODIFICADA)
 # ─────────────────────────────────────────────
 class PositionCalculator:
     """
     Calcula tamaño de posición basado en:
     - 10% del saldo como posición
-    - 40% de esa posición como SL máximo
-    - SL por estructura (EMA o swing) cuando es más corto
+    - 40% de esa posición como SL máximo = 4% del saldo
+    - TP fijo = 10x el riesgo = 40% del saldo
+    
+    ⚠️ SL y TP se calculan SIEMPRE con esta lógica fija,
+    independientemente de la estructura (EMA/swing).
     """
 
     POSITION_PCT = 0.10   # 10% del saldo
     SL_MAX_PCT   = 0.40   # 40% de la posición = 4% del saldo
+    TP_MULTIPLE  = 10.0   # 10x el riesgo → TP = 40% del saldo
 
     @classmethod
     def calculate(
@@ -229,46 +229,48 @@ class PositionCalculator:
         symbol:          str,
         side:            PositionSide,
         entry_price:     float,
-        sl_structural:   float,   # SL por estructura (EMA/swing)
-        tp_structural:   float,   # TP por estructura
+        sl_structural:   float,   # ⚠️ Ya NO se usa para SL
+        tp_structural:   float,   # ⚠️ Ya NO se usa para TP
         balance:         float,
-        leverage:        int = 20,
+        leverage:        int = 10,  # MODIFICADO: default 10x
     ) -> PositionSize:
         """
-        Calcula el tamaño de posición respetando los límites de riesgo.
+        Calcula el tamaño de posición con SL y TP fijos.
+        sl_structural y tp_structural se ignoran.
         """
+        # 1. Posición: 10% del saldo
         position_usd = balance * cls.POSITION_PCT
-        max_loss_usd = position_usd * cls.SL_MAX_PCT  # 4% del saldo
-
-        # Distancia al SL estructural
+        
+        # 2. Riesgo máximo: 40% de la posición = 4% del saldo
+        max_loss_usd = position_usd * cls.SL_MAX_PCT
+        
+        # 3. SL en precio (fijo, basado en riesgo)
+        #    Distancia = (max_loss_usd / position_usd) / leverage
+        #    = 0.40 / leverage
+        sl_distance_pct = cls.SL_MAX_PCT / leverage  # 0.40/10 = 4% en precio
+        
         if side == PositionSide.LONG:
-            sl_distance = entry_price - sl_structural
-        else:
-            sl_distance = sl_structural - entry_price
-
-        sl_distance_pct = sl_distance / entry_price
-
-        # Verificar si el SL estructural excede el límite
-        sl_cost = position_usd * sl_distance_pct
-        if sl_cost > max_loss_usd:
-            # Ajustar posición para que el riesgo no exceda el límite
-            position_usd = max_loss_usd / sl_distance_pct
-            logger.warning(
-                f"[PositionCalc] SL estructural muy amplio. "
-                f"Posición reducida a ${position_usd:.2f}"
-            )
-
-        # Contratos
+            stop_loss = entry_price * (1 - sl_distance_pct)
+            take_profit = entry_price * (1 + cls.SL_MAX_PCT * cls.TP_MULTIPLE / leverage)
+            # Para LONG: TP = entry * (1 + 0.40*10/10) = entry * 1.40 → 40% arriba
+        else:  # SHORT
+            stop_loss = entry_price * (1 + sl_distance_pct)
+            take_profit = entry_price * (1 - cls.SL_MAX_PCT * cls.TP_MULTIPLE / leverage)
+            # Para SHORT: TP = entry * (1 - 0.40*10/10) = entry * 0.60 → 40% abajo
+        
+        # 4. Contratos
         position_with_leverage = position_usd * leverage
         contracts = position_with_leverage / entry_price
-
+        
+        # 5. Riesgo en USD (confirmación)
         risk_usd = position_usd * sl_distance_pct
-
+        
         logger.info(
             f"[PositionCalc] {symbol} {side.value} | "
             f"Posición: ${position_usd:.2f} | "
-            f"Riesgo: ${risk_usd:.2f} | "
-            f"SL dist: {sl_distance_pct*100:.2f}% | "
+            f"Riesgo: ${risk_usd:.2f} (4% del capital) | "
+            f"SL: {stop_loss:.4f} ({sl_distance_pct*100:.1f}%) | "
+            f"TP: {take_profit:.4f} | "
             f"Contratos: {contracts:.4f}"
         )
 
@@ -278,8 +280,8 @@ class PositionCalculator:
             position_usd    = round(position_usd, 2),
             risk_usd        = round(risk_usd, 2),
             entry_price     = entry_price,
-            stop_loss       = sl_structural,
-            take_profit     = tp_structural,
+            stop_loss       = stop_loss,
+            take_profit     = take_profit,
             contracts       = round(contracts, 4),
             leverage        = leverage,
             sl_distance_pct = round(sl_distance_pct * 100, 3),
@@ -310,14 +312,9 @@ class StructureExitEngine:
     """
     Decide cuándo cerrar o revertir basándose en
     el comportamiento de las EMAs — no en precio fijo.
-
-    Reglas de cierre LONG:
-      - EMA21 cruza hacia abajo de EMA55 → cerrar
-      - Triple techo + breakout falso → REVERTIR a short
-
-    Reglas de cierre SHORT:
-      - EMA21 cruza hacia arriba de EMA55 → cerrar
-      - Triple suelo + breakout falso → REVERTIR a long
+    
+    ⚠️ MODIFICADO: Ahora solo evalúa REVERSOS (trampas),
+    el SL y TP fijos se evalúan en RiskManager.monitor_positions()
     """
 
     # Cuántas velas atrás buscar el triple techo/suelo
@@ -331,20 +328,16 @@ class StructureExitEngine:
     ) -> Tuple[bool, CloseReason, str]:
         """
         Evalúa si se debe cerrar o revertir la posición.
-        Retorna (debe_cerrar, razón, notas).
+        ⚠️ SOLO evalúa REVERSOS (trampas).
+        El SL y TP fijos NO se evalúan aquí.
         """
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
-        # ── Verificar SL hard ──
-        if position.side == PositionSide.LONG:
-            if float(last["low"]) <= position.stop_loss:
-                return True, CloseReason.STOP_LOSS, "SL tocado"
-        else:
-            if float(last["high"]) >= position.stop_loss:
-                return True, CloseReason.STOP_LOSS, "SL tocado"
+        # ⚠️ SL y TP fijos se evalúan en monitor_positions()
+        # Aquí solo evaluamos reversos por estructura
 
-        # ── Cierre por estructura — cruce de EMA21 ──
+        # ── Verificar reverso por estructura ──
         ema21 = float(last["ema21"])
         ema55 = float(last["ema55"])
         ema21_prev = float(prev["ema21"])
@@ -354,15 +347,13 @@ class StructureExitEngine:
             # EMA21 cruzó hacia abajo de EMA55
             cross_down = (ema21 < ema55) and (ema21_prev >= ema55_prev)
             if cross_down:
-                # Verificar si es trampa (triple techo) o cierre real
                 is_trap = cls._detect_triple_top(df)
                 if is_trap:
                     return True, CloseReason.REVERSE, (
                         "Triple techo detectado — revertir a SHORT"
                     )
-                return True, CloseReason.STRUCTURE_BREAK, (
-                    "EMA21 cruzó bajo EMA55 — tendencia alcista terminada"
-                )
+                # Si no es trampa, NO cerramos por estructura
+                # (el SL fijo se encargará)
 
         else:  # SHORT
             # EMA21 cruzó hacia arriba de EMA55
@@ -373,9 +364,7 @@ class StructureExitEngine:
                     return True, CloseReason.REVERSE, (
                         "Triple suelo detectado — revertir a LONG"
                     )
-                return True, CloseReason.STRUCTURE_BREAK, (
-                    "EMA21 cruzó sobre EMA55 — tendencia bajista terminada"
-                )
+                # Si no es trampa, NO cerramos por estructura
 
         return False, CloseReason.MANUAL, ""
 
@@ -451,7 +440,7 @@ class StructureExitEngine:
 
 
 # ─────────────────────────────────────────────
-#  RISK MANAGER PRINCIPAL
+#  RISK MANAGER PRINCIPAL (MODIFICADO)
 # ─────────────────────────────────────────────
 class RiskManager:
     """
@@ -463,24 +452,38 @@ class RiskManager:
         self,
         api_manager,
         mode:          BotMode = BotMode.DRY_RUN,
-        leverage:      int     = 20,
+        leverage:      int     = 10,   # MODIFICADO: default 10x
         db_path:       str     = "patterns.db",
-        max_positions: int     = 3,   # máximo simultáneos
+        max_positions: int     = 3,
+        position_pct:  float   = 0.10,   # NUEVO: permite configurar
+        sl_pct:        float   = 0.40,   # NUEVO: permite configurar
+        tp_multiple:   float   = 10.0,   # NUEVO: permite configurar
     ):
         self.api           = api_manager
         self.mode          = mode
         self.leverage      = leverage
         self.db_path       = db_path
         self.max_positions = max_positions
+        self.position_pct  = position_pct
+        self.sl_pct        = sl_pct
+        self.tp_multiple   = tp_multiple
         self.kill_switch   = KillSwitch()
         self.positions:    Dict[str, OpenPosition] = {}
         self._capital:     CapitalState = CapitalState()
+
+        # Actualizar constantes del PositionCalculator
+        PositionCalculator.POSITION_PCT = position_pct
+        PositionCalculator.SL_MAX_PCT = sl_pct
+        PositionCalculator.TP_MULTIPLE = tp_multiple
 
         logger.info(
             f"[RiskManager] Iniciado | "
             f"Modo: {mode.value} | "
             f"Leverage: {leverage}x | "
-            f"Max posiciones: {max_positions}"
+            f"Max posiciones: {max_positions} | "
+            f"Posición: {position_pct*100:.0f}% | "
+            f"SL: {sl_pct*100:.0f}% de posición ({sl_pct*position_pct*100:.1f}% capital) | "
+            f"TP: {tp_multiple}x riesgo"
         )
 
     # ──────────────────────────────────────────
@@ -527,18 +530,18 @@ class RiskManager:
         logger.info(f"[Capital] Balance DRY_RUN: ${balance:.2f}")
 
     # ──────────────────────────────────────────
-    #  EVALUAR NUEVA ENTRADA
+    #  EVALUAR NUEVA ENTRADA (MODIFICADO)
     # ──────────────────────────────────────────
     async def evaluate_entry(
         self,
         signal,           # Signal del MarketScanner
         df: pd.DataFrame,
-        sl_structural: float,
-        tp_structural: float,
+        sl_structural: float,   # ⚠️ YA NO SE USA
+        tp_structural: float,   # ⚠️ YA NO SE USA
     ) -> Optional[PositionSize]:
         """
         Evalúa si se puede abrir una nueva posición.
-        Retorna PositionSize o None si no se puede.
+        ⚠️ sl_structural y tp_structural se ignoran.
         """
         # ── Kill Switch ──
         stopped, reason = self.kill_switch.check(
@@ -563,7 +566,7 @@ class RiskManager:
             )
             return None
 
-        # ── Calcular tamaño ──
+        # ── Calcular tamaño con SL/TP fijos ──
         from market_scanner import SignalType
         side = (PositionSide.LONG
                 if signal.signal_type in (
@@ -576,8 +579,8 @@ class RiskManager:
             symbol        = signal.symbol,
             side          = side,
             entry_price   = signal.entry_price,
-            sl_structural = sl_structural,
-            tp_structural = tp_structural,
+            sl_structural = 0.0,   # Ignorado
+            tp_structural = 0.0,   # Ignorado
             balance       = self._capital.total_balance,
             leverage      = self.leverage,
         )
@@ -586,7 +589,9 @@ class RiskManager:
             f"[RiskManager] ✅ Entrada aprobada: "
             f"{signal.symbol} {side.value} | "
             f"${position_size.position_usd:.2f} | "
-            f"Riesgo: ${position_size.risk_usd:.2f}"
+            f"Riesgo: ${position_size.risk_usd:.2f} | "
+            f"SL: {position_size.stop_loss:.4f} | "
+            f"TP: {position_size.take_profit:.4f}"
         )
 
         return position_size
@@ -625,7 +630,7 @@ class RiskManager:
         return pos
 
     # ──────────────────────────────────────────
-    #  MONITOREAR POSICIONES ABIERTAS
+    #  MONITOREAR POSICIONES ABIERTAS (MODIFICADO)
     # ──────────────────────────────────────────
     async def monitor_positions(
         self,
@@ -633,7 +638,7 @@ class RiskManager:
     ) -> Dict[str, Tuple[bool, CloseReason, str]]:
         """
         Revisa todas las posiciones abiertas.
-        Retorna dict de {symbol: (debe_cerrar, razón, notas)}
+        ⚠️ AHORA evalúa SL y TP FIJOS además de reversos.
         """
         results = {}
 
@@ -665,7 +670,27 @@ class RiskManager:
                 position.position_usd * pnl_pct * position.leverage
             )
 
-            # Evaluar si cerrar
+            # ── 1. Evaluar SL y TP fijos (NUEVO) ──
+            if position.side == PositionSide.LONG:
+                if current <= position.stop_loss:
+                    results[symbol] = (True, CloseReason.STOP_LOSS, 
+                                       f"SL fijo tocado {current:.4f}")
+                    continue
+                if current >= position.take_profit:
+                    results[symbol] = (True, CloseReason.TAKE_PROFIT, 
+                                       f"TP fijo tocado {current:.4f}")
+                    continue
+            else:  # SHORT
+                if current >= position.stop_loss:
+                    results[symbol] = (True, CloseReason.STOP_LOSS, 
+                                       f"SL fijo tocado {current:.4f}")
+                    continue
+                if current <= position.take_profit:
+                    results[symbol] = (True, CloseReason.TAKE_PROFIT, 
+                                       f"TP fijo tocado {current:.4f}")
+                    continue
+
+            # ── 2. Evaluar reverso por estructura (mantenido) ──
             should_close, reason, notes = StructureExitEngine.evaluate_exit(
                 position, df
             )
@@ -861,8 +886,11 @@ async def main():
     rm = RiskManager(
         api_manager   = MockAPI(),
         mode          = BotMode.DRY_RUN,
-        leverage      = 20,
+        leverage      = 10,   # MODIFICADO: 10x
         max_positions = 3,
+        position_pct  = 0.10,
+        sl_pct        = 0.40,
+        tp_multiple   = 10.0,
     )
 
     # Capital real desde la API
@@ -883,6 +911,8 @@ async def main():
     print(f"  Modo:           {status['mode']}")
     print(f"  Por operación:  ${balance * 0.10:.2f} (10% del balance real)")
     print(f"  Riesgo máx:     ${balance * 0.04:.2f} (4% del balance real)")
+    print(f"  SL en precio:   {0.40/10*100:.1f}% desde entrada")
+    print(f"  TP en precio:   {0.40*10/10*100:.1f}% desde entrada")
     print("═" * 40)
 
 
