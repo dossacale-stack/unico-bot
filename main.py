@@ -62,6 +62,15 @@ CONFIG: Dict[str, Any] = {
         "BEATUSDT",
         "TSTBSCUSDT",
         "POPCATUSDT",
+        "SLXUSDT",
+        "OUSDT",
+        "EVAA",
+        "AVNTUSDT",
+        "RAVEUSDT",
+        "MAGMAUSDT",
+        "AEROUSDT",
+        "CLOUSDT",
+        "HEIUSDT",
         
     ],
 }
