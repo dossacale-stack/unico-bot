@@ -37,6 +37,7 @@ class Signal:
     entry_price: float
     df: Optional[pd.DataFrame] = None
     pattern_id: Optional[int] = None
+    timeframe: str = "15m"
 
 
 MATCH_FIELDS = [
@@ -67,7 +68,8 @@ class MarketScanner:
         min_rr: float,
         position_pct: float,
         db_path: str = "patterns.db",
-        signal_cooldown_seconds: int = 60,  # NUEVO: 60s entre señales del mismo símbolo
+        signal_cooldown_seconds: int = 60,
+        timeframes: List[str] = None,
     ):
         self.api = api_manager
         self.watchlist = watchlist
@@ -77,48 +79,41 @@ class MarketScanner:
         self.position_pct = position_pct
         self.db_path = db_path
         self.signal_cooldown_seconds = signal_cooldown_seconds
-        self.patterns = self._load_patterns()
-        # Cooldown de 5 minutos entre señales del mismo símbolo (para el scanner)
-        self._symbol_cooldown = {}  # symbol -> timestamp
+        self.timeframes = timeframes or ["15m", "3m"]
+        self.patterns_by_tf = {}
+        self._signal_cooldown = {}
+        self._load_all_patterns()
 
     def _normalize_symbol(self, symbol: str) -> str:
         return re.sub(r"[^\w]", "", symbol).upper()
 
-    def _load_patterns(self) -> List[Dict[str, Any]]:
+    def _load_all_patterns(self) -> None:
         if not os.path.exists(self.db_path):
-            logger.warning(
-                "[MarketScanner] No se encontró DB de patrones. Usando patterns en memoria."
-            )
-            return [p.copy() for p in seed_patterns.PATTERNS]
+            logger.warning("[MarketScanner] No se encontró DB de patrones. Usando seed_patterns.")
+            for tf in self.timeframes:
+                self.patterns_by_tf[tf] = [p.copy() for p in seed_patterns.PATTERNS if p.get("timeframe") == tf]
+            return
 
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    "SELECT * FROM patterns WHERE resultado != 'EVITAR'"
-                ).fetchall()
-                return [dict(row) for row in rows]
+                for tf in self.timeframes:
+                    rows = conn.execute("""
+                        SELECT * FROM patterns
+                        WHERE timeframe = ? AND resultado != 'EVITAR'
+                    """, (tf,)).fetchall()
+                    self.patterns_by_tf[tf] = [dict(row) for row in rows]
+                    logger.info(f"[MarketScanner] Cargados {len(self.patterns_by_tf[tf])} patrones para {tf}")
         except Exception as exc:
-            logger.warning(
-                f"[MarketScanner] No se pudo cargar DB de patrones: {exc}. "
-                "Usando seed_patterns en memoria."
-            )
-            return [p.copy() for p in seed_patterns.PATTERNS]
+            logger.warning(f"[MarketScanner] Error cargando patrones: {exc}. Usando seed_patterns.")
+            for tf in self.timeframes:
+                self.patterns_by_tf[tf] = [p.copy() for p in seed_patterns.PATTERNS if p.get("timeframe") == tf]
 
     def _can_signal(self, symbol: str) -> bool:
-        """
-        Verifica si se puede generar una nueva señal para este símbolo.
-        Cooldown de 60 segundos entre señales.
-        """
         now = time.time()
-        if symbol in self._symbol_cooldown:
-            elapsed = now - self._symbol_cooldown[symbol]
+        if symbol in self._signal_cooldown:
+            elapsed = now - self._signal_cooldown[symbol]
             if elapsed < self.signal_cooldown_seconds:
-                remaining = self.signal_cooldown_seconds - elapsed
-                logger.debug(
-                    f"[MarketScanner] {symbol} en cooldown de señales. "
-                    f"Restan {remaining:.0f}s."
-                )
                 return False
         return True
 
@@ -127,49 +122,40 @@ class MarketScanner:
         now = time.time()
 
         for symbol in self.watchlist:
-            # Cooldown de 5 minutos para el mismo símbolo
-            if symbol in self._symbol_cooldown:
-                if now - self._symbol_cooldown[symbol] < 300:
+            if symbol in self._signal_cooldown:
+                if now - self._signal_cooldown[symbol] < 300:
                     continue
 
-            try:
-                df = await self.api.fetch_ohlcv(symbol, timeframe="15m", limit=100)
-                if df is None or len(df) < 40:
-                    continue
+            for timeframe in self.timeframes:
+                try:
+                    df = await self.api.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
+                    if df is None or len(df) < 40:
+                        continue
 
-                behavior = self._describe_behavior(df)
-                symbol_code = self._normalize_symbol(symbol)
-                matches = self._match_patterns(symbol_code, behavior)
+                    behavior = self._describe_behavior(df)
+                    symbol_code = self._normalize_symbol(symbol)
+                    matches = self._match_patterns(symbol_code, behavior, timeframe)
 
-                if not matches:
-                    continue
+                    if not matches:
+                        continue
 
-                best = max(
-                    matches,
-                    key=lambda item: (
-                        item["match_ratio"],
-                        item["pattern"].get("rb_real", 0.0),
-                    ),
-                )
-                signal = self._build_signal(symbol, df, behavior, best)
+                    best = max(matches, key=lambda item: (item["match_ratio"], item["pattern"].get("rb_real", 0.0)))
+                    signal = self._build_signal(symbol, df, behavior, best, timeframe)
 
-                # NUEVO: Verificar cooldown antes de generar señal
-                if signal and signal.score >= self.min_score and signal.risk_reward >= self.min_rr:
-                    if self._can_signal(symbol):
-                        self._symbol_cooldown[symbol] = now
-                        signals.append(signal)
-                        logger.debug(
-                            f"[MarketScanner] Señal generada para {symbol}. "
-                            f"Próxima señal en {self.signal_cooldown_seconds}s."
-                        )
-                    else:
-                        logger.debug(f"[MarketScanner] {symbol} en cooldown, señal ignorada.")
+                    if signal and signal.score >= self.min_score:
+                        if self._can_signal(symbol):
+                            self._signal_cooldown[symbol] = now
+                            signals.append(signal)
+                            logger.debug(f"[MarketScanner] Señal {symbol} {timeframe} Score: {signal.score:.2f}")
 
-            except Exception as exc:
-                logger.warning(f"[MarketScanner] Error en {symbol}: {exc}")
+                except Exception as exc:
+                    logger.debug(f"[MarketScanner] Error en {symbol} {timeframe}: {exc}")
 
         if not signals:
             logger.info("[MarketScanner] Ninguna señal encontrada en este ciclo.")
+        else:
+            logger.info(f"[MarketScanner] {len(signals)} señales encontradas")
+
         return signals
 
     def _describe_behavior(self, df: pd.DataFrame) -> Dict[str, Any]:
@@ -245,10 +231,7 @@ class MarketScanner:
 
         def bb_state_label(mid: float, upper: float, lower: float, recent: pd.DataFrame) -> str:
             width = (upper - lower) / max(mid, 1e-6)
-            previous_width = (
-                (recent["bb_upper"] - recent["bb_lower"]) /
-                recent["bb_mid"].replace(0, np.nan)
-            ).iloc[-5:-1].mean()
+            previous_width = ((recent["bb_upper"] - recent["bb_lower"]) / recent["bb_mid"].replace(0, np.nan)).iloc[-5:-1].mean()
             if width < 0.025:
                 return "MAX_SQUEEZE"
             if width < 0.045:
@@ -284,50 +267,37 @@ class MarketScanner:
         price = float(current["close"])
 
         return {
-            "ema21_vs_ema55": ema_relation(
-                float(current["ema21"]), float(current["ema55"]),
-                float(prior["ema21"]), float(prior["ema55"]),
-            ),
-            "ema55_vs_ema144": ema_relation(
-                float(current["ema55"]), float(current["ema144"]),
-                float(prior["ema55"]), float(prior["ema144"]),
-            ),
-            "ema144_vs_ema233": ema_relation(
-                float(current["ema144"]), float(current["ema233"]),
-                float(prior["ema144"]), float(prior["ema233"]),
-            ),
+            "ema21_vs_ema55": ema_relation(float(current["ema21"]), float(current["ema55"]),
+                                          float(prior["ema21"]), float(prior["ema55"])),
+            "ema55_vs_ema144": ema_relation(float(current["ema55"]), float(current["ema144"]),
+                                           float(prior["ema55"]), float(prior["ema144"])),
+            "ema144_vs_ema233": ema_relation(float(current["ema144"]), float(current["ema233"]),
+                                            float(prior["ema144"]), float(prior["ema233"])),
             "ema21_slope": slope_label(df["ema21"]),
             "ema144_slope": slope_label(df["ema144"]),
             "precio_vs_ema21": position_label(price, float(current["ema21"])),
             "precio_vs_ema55": position_label(price, float(current["ema55"])),
             "precio_vs_ema144": position_label(price, float(current["ema144"])),
             "precio_vs_ema233": position_label(price, float(current["ema233"])),
-            "bb_estado": bb_state_label(
-                float(current["bb_mid"]),
-                float(current["bb_upper"]),
-                float(current["bb_lower"]),
-                df.iloc[-10:],
-            ),
-            "bb_precio": bb_price_label(
-                price,
-                float(current["bb_mid"]),
-                float(current["bb_lower"]),
-                float(current["bb_upper"]),
-            ),
+            "bb_estado": bb_state_label(float(current["bb_mid"]), float(current["bb_upper"]),
+                                       float(current["bb_lower"]), df.iloc[-10:]),
+            "bb_precio": bb_price_label(price, float(current["bb_mid"]),
+                                       float(current["bb_lower"]), float(current["bb_upper"])),
             "volumen": volume_label(float(current["volume"]), volume_average),
             "patron_vela": candle_pattern(current),
             "fib_zona": fib_zone(price),
             "entry_price": price,
         }
 
-    def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any]) -> List[Dict[str, Any]]:
-        matches: List[Dict[str, Any]] = []
+    def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any], timeframe: str) -> List[Dict[str, Any]]:
+        matches = []
+        patterns = self.patterns_by_tf.get(timeframe, [])
 
-        for pattern in self.patterns:
+        for pattern in patterns:
             if pattern.get("symbol") not in {symbol_code, "UNIVERSAL"}:
                 continue
 
-            if pattern.get("timeframe", "15m") != "15m":
+            if pattern.get("timeframe") != timeframe:
                 continue
 
             score = 0
@@ -365,37 +335,32 @@ class MarketScanner:
         df: pd.DataFrame,
         behavior: Dict[str, Any],
         matched: Dict[str, Any],
+        timeframe: str,
     ) -> Optional[Signal]:
         pattern = matched["pattern"]
         signal_type_str = pattern["signal_type"]
 
-        # Ignorar patrones NO_SIGNAL
         if signal_type_str == "NO_SIGNAL":
-            logger.debug(f"[MarketScanner] Ignorando patrón NO_SIGNAL para {symbol}")
             return None
 
-        # Validar SignalType
         try:
             signal_type = SignalType(signal_type_str)
         except ValueError:
-            logger.warning(
-                f"[MarketScanner] Tipo de señal inválido '{signal_type_str}' en patrón "
-                f"para {symbol}. Se omite."
-            )
+            logger.warning(f"[MarketScanner] Tipo inválido '{signal_type_str}' para {symbol}")
             return None
 
         entry_price = float(behavior["entry_price"])
         score = float(matched["match_ratio"])
-        risk_reward = 0.0  # se recalcula en RiskManager
 
         return Signal(
             symbol=symbol,
             signal_type=signal_type,
             score=score,
-            risk_reward=risk_reward,
+            risk_reward=0.0,
             stop_loss=0.0,
             take_profit=0.0,
             entry_price=entry_price,
             df=df,
             pattern_id=pattern.get("id"),
+            timeframe=timeframe,
         )
