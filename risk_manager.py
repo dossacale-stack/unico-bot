@@ -1,25 +1,16 @@
 """
-RiskManager — Módulo de Gestión de Riesgo y Ejecución
-======================================================
-ÚNICO STRATEGY — Gestión de riesgo profesional
-
-Lógica de capital:
-  - Posición:    10% del saldo total (ajustable)
-  - SL:          40% de esa posición (= 4% del saldo) → FIJO
-  - TP:          10x el riesgo (= 40% del saldo) → FIJO
-  - Apalancamiento: DETECTADO AUTOMÁTICAMENTE por símbolo
-  - Activos ST:  Reducción de posición a la mitad
-  - Kill Switch: si pierde 15% del saldo del día → parar hasta 00:00
-  - Cooldown:    15 minutos entre entradas del mismo símbolo
-  - Límite diario: 3 entradas por símbolo al día
-  - Estructura:  se mantiene para reversos (triple techo/suelo)
-  - Reverso:     cierra contrato y abre en dirección contraria
+RiskManager — Gestión de Riesgo UNIFICADA (M15 + M3)
+=========================================================
+- SL: 4% del capital (40% de la posición)
+- TP: 20% del capital (5x SL)
+- Leverage: 10x
+- R:R: 5:1
+- TODOS los valores en USDT
 """
 
 import asyncio
 import logging
 import sqlite3
-import os
 import time
 from datetime import datetime, timezone, time as dtime
 from dataclasses import dataclass, field
@@ -33,103 +24,89 @@ import numpy as np
 logger = logging.getLogger("RiskManager")
 
 
-# ─────────────────────────────────────────────
-#  ENUMS
-# ─────────────────────────────────────────────
 class PositionSide(Enum):
-    LONG  = "LONG"
+    LONG = "LONG"
     SHORT = "SHORT"
-    NONE  = "NONE"
+    NONE = "NONE"
+
 
 class CloseReason(Enum):
-    STOP_LOSS       = "SL"
-    TAKE_PROFIT     = "TP"
+    STOP_LOSS = "SL"
+    TAKE_PROFIT = "TP"
     STRUCTURE_BREAK = "STRUCTURE"
-    REVERSE         = "REVERSE"
-    KILL_SWITCH     = "KILL_SWITCH"
-    MANUAL          = "MANUAL"
+    REVERSE = "REVERSE"
+    KILL_SWITCH = "KILL_SWITCH"
+    MANUAL = "MANUAL"
+
 
 class BotMode(Enum):
-    DRY_RUN  = "DRY_RUN"
-    LIVE     = "LIVE"
+    DRY_RUN = "DRY_RUN"
+    LIVE = "LIVE"
     BACKTEST = "BACKTEST"
 
 
-# ─────────────────────────────────────────────
-#  DATACLASSES
-# ─────────────────────────────────────────────
 @dataclass
 class CapitalState:
-    total_balance:     float = 0.0
-    available:         float = 0.0
+    total_balance: float = 0.0
+    available: float = 0.0
     day_start_balance: float = 0.0
-    day_pnl:           float = 0.0
-    day_pnl_pct:       float = 0.0
-    open_positions:    int   = 0
+    day_pnl: float = 0.0
+    day_pnl_pct: float = 0.0
+    open_positions: int = 0
     kill_switch_active: bool = False
-    kill_switch_until:  str  = ""
-
-    @property
-    def drawdown_pct(self) -> float:
-        if self.day_start_balance <= 0:
-            return 0.0
-        return ((self.day_start_balance - self.total_balance)
-                / self.day_start_balance * 100)
+    kill_switch_until: str = ""
 
 
 @dataclass
 class PositionSize:
-    symbol:           str
-    side:             PositionSide
-    position_usd:     float
-    risk_usd:         float
-    entry_price:      float
-    stop_loss:        float
-    take_profit:      float
-    contracts:        float
-    leverage:         int
-    sl_distance_pct:  float
-    max_loss_usd:     float
-    is_st_asset:      bool = False
+    symbol: str
+    side: PositionSide
+    position_usd: float
+    risk_usd: float
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    contracts: float
+    leverage: int
+    sl_distance_pct: float
+    max_loss_usd: float
+    is_st_asset: bool = False
+    timeframe: str = "15m"
 
 
 @dataclass
 class OpenPosition:
-    id:               str
-    symbol:           str
-    side:             PositionSide
-    entry_price:      float
-    current_price:    float
-    stop_loss:        float
-    take_profit:      float
-    contracts:        float
-    leverage:         int
-    position_usd:     float
-    risk_usd:         float
-    pattern_id:       Optional[int] = None
-    open_time:        str = field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat()
-    )
-    unrealized_pnl:   float = 0.0
+    id: str
+    symbol: str
+    side: PositionSide
+    entry_price: float
+    current_price: float
+    stop_loss: float
+    take_profit: float
+    contracts: float
+    leverage: int
+    position_usd: float
+    risk_usd: float
+    pattern_id: Optional[int] = None
+    timeframe: str = "15m"
+    open_time: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    unrealized_pnl: float = 0.0
     unrealized_pnl_pct: float = 0.0
-    highest_price:    float = 0.0
-    lowest_price:     float = 0.0
-    is_st_asset:      bool = False
-    score:            float = 0.0  # Para aprendizaje
-    signal_type:      Optional[str] = None  # Para aprendizaje
-    arrow_color:      Optional[str] = None  # Para aprendizaje
+    highest_price: float = 0.0
+    lowest_price: float = 0.0
+    is_st_asset: bool = False
+    score: float = 0.0
+    signal_type: Optional[str] = None
+    arrow_color: Optional[str] = None
 
 
-# ─────────────────────────────────────────────
-#  KILL SWITCH
-# ─────────────────────────────────────────────
 class KillSwitch:
-    DAILY_DRAWDOWN_LIMIT  = 15.0
+    DAILY_DRAWDOWN_LIMIT = 15.0
     WEEKLY_DRAWDOWN_LIMIT = 30.0
 
     def __init__(self):
-        self.active            = False
-        self.reason            = ""
+        self.active = False
+        self.reason = ""
         self.day_start_balance = 0.0
         self.week_start_balance = 0.0
         self._reset_time: Optional[datetime] = None
@@ -154,133 +131,131 @@ class KillSwitch:
             return True, self.reason
 
         if self.day_start_balance > 0:
-            daily_dd = ((self.day_start_balance - current_balance)
-                        / self.day_start_balance * 100)
+            daily_dd = ((self.day_start_balance - current_balance) / self.day_start_balance * 100)
             if daily_dd >= self.DAILY_DRAWDOWN_LIMIT:
-                self._activate(
-                    f"Drawdown diario {daily_dd:.1f}% >= {self.DAILY_DRAWDOWN_LIMIT}%"
-                )
+                self._activate(f"Drawdown diario {daily_dd:.1f}% >= {self.DAILY_DRAWDOWN_LIMIT}%")
                 return True, self.reason
 
         if self.week_start_balance > 0:
-            weekly_dd = ((self.week_start_balance - current_balance)
-                         / self.week_start_balance * 100)
+            weekly_dd = ((self.week_start_balance - current_balance) / self.week_start_balance * 100)
             if weekly_dd >= self.WEEKLY_DRAWDOWN_LIMIT:
-                self._activate(
-                    f"Drawdown semanal {weekly_dd:.1f}% >= {self.WEEKLY_DRAWDOWN_LIMIT}%",
-                    days=2
-                )
+                self._activate(f"Drawdown semanal {weekly_dd:.1f}% >= {self.WEEKLY_DRAWDOWN_LIMIT}%", days=2)
                 return True, self.reason
 
         return False, ""
 
     def _activate(self, reason: str, days: int = 0):
-        self.active  = True
-        self.reason  = reason
-        now          = datetime.now(timezone.utc)
+        self.active = True
+        self.reason = reason
+        now = datetime.now(timezone.utc)
 
         if days > 0:
             from datetime import timedelta
             self._reset_time = now + timedelta(days=days)
         else:
             from datetime import timedelta
-            self._reset_time = datetime.combine(
-                now.date() + timedelta(days=1),
-                dtime(0, 0, 0),
-                tzinfo=timezone.utc
-            )
+            self._reset_time = datetime.combine(now.date() + timedelta(days=1), dtime(0, 0, 0), tzinfo=timezone.utc)
 
-        logger.critical(
-            f"[KillSwitch] 🛑 ACTIVADO: {reason} | "
-            f"Reset: {self._reset_time.isoformat()}"
-        )
+        logger.critical(f"[KillSwitch] 🛑 ACTIVADO: {reason} | Reset: {self._reset_time.isoformat()}")
 
 
-# ─────────────────────────────────────────────
-#  CALCULADORA DE POSICIÓN
-# ─────────────────────────────────────────────
 class PositionCalculator:
-    POSITION_PCT = 0.10
-    SL_MAX_PCT   = 0.40
-    TP_MULTIPLE  = 10.0
-    ST_REDUCTION = 0.50
+    # ═══════════════════════════════════════════════════════════════
+    #  CONFIGURACIÓN UNIFICADA (M15 + M3)
+    #  SL: 4% del capital | TP: 20% del capital | Leverage: 10x
+    #  TODOS los valores en USDT
+    # ═══════════════════════════════════════════════════════════════
+    
+    POSITION_PCT = 0.10      # 10% del capital
+    SL_MAX_PCT = 0.40        # 40% de la posición = 4% capital
+    TP_MULTIPLE = 5.0        # 5x SL = 20% capital
+    LEVERAGE = 10            # 10x
+    ST_REDUCTION = 0.50      # 50% para activos ST
+
+    TIMEFRAME_CONFIG = {
+        "15m": {
+            "position_pct": 0.10,
+            "sl_pct": 0.40,
+            "tp_multiple": 5.0,
+            "leverage": 10,
+        },
+        "3m": {
+            "position_pct": 0.10,
+            "sl_pct": 0.40,
+            "tp_multiple": 5.0,
+            "leverage": 10,
+        },
+    }
+
+    @classmethod
+    def get_config(cls, timeframe: str):
+        return cls.TIMEFRAME_CONFIG.get(timeframe, cls.TIMEFRAME_CONFIG["15m"])
 
     @classmethod
     def calculate(
         cls,
-        symbol:          str,
-        side:            PositionSide,
-        entry_price:     float,
-        sl_structural:   float,
-        tp_structural:   float,
-        balance:         float,
-        leverage:        int = 10,
-        max_leverage:    Optional[int] = None,
-        is_st_asset:     bool = False,
+        symbol: str,
+        side: PositionSide,
+        entry_price: float,
+        sl_structural: float,
+        tp_structural: float,
+        balance: float,
+        leverage: Optional[int] = None,
+        max_leverage: Optional[int] = None,
+        is_st_asset: bool = False,
+        timeframe: str = "15m",
     ) -> PositionSize:
-        # Si es ST, reducir posición a la mitad
-        position_pct = cls.POSITION_PCT
+        config = cls.get_config(timeframe)
+
+        position_pct = config["position_pct"]
+        sl_pct = config["sl_pct"]
+        tp_multiple = config["tp_multiple"]
+        leverage = leverage or config["leverage"]
+
         if is_st_asset:
-            position_pct = cls.POSITION_PCT * cls.ST_REDUCTION
-            logger.warning(
-                f"[PositionCalc] {symbol} es ST, posición reducida al "
-                f"{position_pct*100:.0f}% del capital"
-            )
-        
-        # Si se pasa max_leverage, limitar el apalancamiento
+            position_pct = position_pct * cls.ST_REDUCTION
+            logger.warning(f"[PositionCalc] {symbol} es ST, posición reducida")
+
         if max_leverage and leverage > max_leverage:
-            logger.warning(
-                f"[PositionCalc] Apalancamiento {leverage}x > máximo {max_leverage}x "
-                f"para {symbol}. Usando {max_leverage}x."
-            )
+            logger.warning(f"[PositionCalc] Leverage {leverage}x > {max_leverage}x, usando {max_leverage}x")
             leverage = max_leverage
-        
-        # 1. Posición: % del saldo (ajustado por ST)
+
         position_usd = balance * position_pct
-        
-        # 2. Riesgo máximo: 40% de la posición
-        max_loss_usd = position_usd * cls.SL_MAX_PCT
-        
-        # 3. SL en precio (fijo, basado en riesgo)
-        sl_distance_pct = cls.SL_MAX_PCT / leverage
-        
+        max_loss_usd = position_usd * sl_pct
+        sl_distance_pct = sl_pct / leverage
+
         if side == PositionSide.LONG:
             stop_loss = entry_price * (1 - sl_distance_pct)
-            take_profit = entry_price * (1 + cls.SL_MAX_PCT * cls.TP_MULTIPLE / leverage)
-        else:  # SHORT
+            take_profit = entry_price * (1 + sl_pct * tp_multiple / leverage)
+        else:
             stop_loss = entry_price * (1 + sl_distance_pct)
-            take_profit = entry_price * (1 - cls.SL_MAX_PCT * cls.TP_MULTIPLE / leverage)
-        
-        # 4. Contratos
-        position_with_leverage = position_usd * leverage
-        contracts = position_with_leverage / entry_price
-        
-        # 5. Riesgo en USD (confirmación)
+            take_profit = entry_price * (1 - sl_pct * tp_multiple / leverage)
+
+        contracts = (position_usd * leverage) / entry_price
         risk_usd = position_usd * sl_distance_pct
-        
+
         logger.info(
-            f"[PositionCalc] {symbol} {side.value} | "
-            f"Posición: ${position_usd:.2f} | "
-            f"Riesgo: ${risk_usd:.2f} ({risk_usd/balance*100:.1f}% capital) | "
+            f"[PositionCalc] {symbol} {side.value} {timeframe} | "
+            f"Posición: {position_usd:.2f} USDT | Riesgo: {risk_usd:.2f} USDT | "
             f"SL: {stop_loss:.4f} ({sl_distance_pct*100:.1f}%) | "
-            f"TP: {take_profit:.4f} | "
-            f"Leverage: {leverage}x | "
-            f"Contratos: {contracts:.4f}"
+            f"TP: {take_profit:.4f} ({sl_pct*tp_multiple/leverage*100:.1f}%) | "
+            f"Leverage: {leverage}x | R:R: {tp_multiple:.1f}:1"
         )
 
         return PositionSize(
-            symbol          = symbol,
-            side            = side,
-            position_usd    = round(position_usd, 2),
-            risk_usd        = round(risk_usd, 2),
-            entry_price     = entry_price,
-            stop_loss       = stop_loss,
-            take_profit     = take_profit,
-            contracts       = round(contracts, 4),
-            leverage        = leverage,
-            sl_distance_pct = round(sl_distance_pct * 100, 3),
-            max_loss_usd    = round(max_loss_usd, 2),
-            is_st_asset     = is_st_asset,
+            symbol=symbol,
+            side=side,
+            position_usd=round(position_usd, 2),
+            risk_usd=round(risk_usd, 2),
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            contracts=round(contracts, 4),
+            leverage=leverage,
+            sl_distance_pct=round(sl_distance_pct * 100, 3),
+            max_loss_usd=round(max_loss_usd, 2),
+            is_st_asset=is_st_asset,
+            timeframe=timeframe,
         )
 
     @staticmethod
@@ -299,18 +274,11 @@ class PositionCalculator:
         return df.dropna()
 
 
-# ─────────────────────────────────────────────
-#  MOTOR DE CIERRE POR ESTRUCTURA
-# ─────────────────────────────────────────────
 class StructureExitEngine:
     TRIPLE_LOOKBACK = 20
 
     @classmethod
-    def evaluate_exit(
-        cls,
-        position: OpenPosition,
-        df: pd.DataFrame,
-    ) -> Tuple[bool, CloseReason, str]:
+    def evaluate_exit(cls, position: OpenPosition, df: pd.DataFrame) -> Tuple[bool, CloseReason, str]:
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
@@ -322,28 +290,21 @@ class StructureExitEngine:
         if position.side == PositionSide.LONG:
             cross_down = (ema21 < ema55) and (ema21_prev >= ema55_prev)
             if cross_down:
-                is_trap = cls._detect_triple_top(df)
-                if is_trap:
-                    return True, CloseReason.REVERSE, (
-                        "Triple techo detectado — revertir a SHORT"
-                    )
-
-        else:  # SHORT
+                if cls._detect_triple_top(df):
+                    return True, CloseReason.REVERSE, "Triple techo detectado — revertir a SHORT"
+        else:
             cross_up = (ema21 > ema55) and (ema21_prev <= ema55_prev)
             if cross_up:
-                is_trap = cls._detect_triple_bottom(df)
-                if is_trap:
-                    return True, CloseReason.REVERSE, (
-                        "Triple suelo detectado — revertir a LONG"
-                    )
+                if cls._detect_triple_bottom(df):
+                    return True, CloseReason.REVERSE, "Triple suelo detectado — revertir a LONG"
 
         return False, CloseReason.MANUAL, ""
 
     @classmethod
     def _detect_triple_top(cls, df: pd.DataFrame) -> bool:
         recent = df.tail(cls.TRIPLE_LOOKBACK)
-        highs  = recent["high"].values
-        last   = df.iloc[-1]
+        highs = recent["high"].values
+        last = df.iloc[-1]
 
         peaks = []
         for i in range(1, len(highs) - 1):
@@ -354,25 +315,22 @@ class StructureExitEngine:
             return False
 
         max_peak = max(peaks)
-        similar  = [p for p in peaks if abs(p - max_peak) / max_peak < 0.03]
-
+        similar = [p for p in peaks if abs(p - max_peak) / max_peak < 0.03]
         if len(similar) < 2:
             return False
 
-        last_high  = float(last["high"])
+        last_high = float(last["high"])
         last_close = float(last["close"])
         fake_break = last_high > max_peak and last_close < max_peak
-
         vol_ratio = float(last["vol_ratio"]) if "vol_ratio" in last else 1.0
-        high_vol  = vol_ratio >= 1.5
 
-        return fake_break and high_vol
+        return fake_break and vol_ratio >= 1.5
 
     @classmethod
     def _detect_triple_bottom(cls, df: pd.DataFrame) -> bool:
         recent = df.tail(cls.TRIPLE_LOOKBACK)
-        lows   = recent["low"].values
-        last   = df.iloc[-1]
+        lows = recent["low"].values
+        last = df.iloc[-1]
 
         valleys = []
         for i in range(1, len(lows) - 1):
@@ -383,103 +341,76 @@ class StructureExitEngine:
             return False
 
         min_valley = min(valleys)
-        similar    = [v for v in valleys
-                      if abs(v - min_valley) / min_valley < 0.03]
-
+        similar = [v for v in valleys if abs(v - min_valley) / min_valley < 0.03]
         if len(similar) < 2:
             return False
 
-        last_low   = float(last["low"])
+        last_low = float(last["low"])
         last_close = float(last["close"])
         fake_break = last_low < min_valley and last_close > min_valley
-
         vol_ratio = float(last["vol_ratio"]) if "vol_ratio" in last else 1.0
-        high_vol  = vol_ratio >= 1.5
 
-        return fake_break and high_vol
+        return fake_break and vol_ratio >= 1.5
 
 
-# ─────────────────────────────────────────────
-#  RISK MANAGER PRINCIPAL (MEJORADO)
-# ─────────────────────────────────────────────
 class RiskManager:
     def __init__(
         self,
         api_manager,
-        mode:          BotMode = BotMode.DRY_RUN,
-        leverage:      int     = 10,
-        db_path:       str     = "patterns.db",
-        max_positions: int     = 3,
-        position_pct:  float   = 0.10,
-        sl_pct:        float   = 0.40,
-        tp_multiple:   float   = 10.0,
-        st_reduction:  float   = 0.50,
-        cooldown_minutes: int = 15,      # NUEVO: cooldown entre entradas del mismo símbolo
-        max_entries_daily: int = 3,      # NUEVO: límite diario por símbolo
+        mode: BotMode = BotMode.DRY_RUN,
+        leverage: int = 10,
+        db_path: str = "patterns.db",
+        max_positions: int = 3,
+        position_pct: float = 0.10,
+        sl_pct: float = 0.40,
+        tp_multiple: float = 5.0,
+        st_reduction: float = 0.50,
+        cooldown_minutes: int = 15,
+        max_entries_daily: int = 3,
     ):
-        self.api           = api_manager
-        self.mode          = mode
-        self.leverage      = leverage
-        self.db_path       = db_path
+        self.api = api_manager
+        self.mode = mode
+        self.leverage = leverage
+        self.db_path = db_path
         self.max_positions = max_positions
-        self.position_pct  = position_pct
-        self.sl_pct        = sl_pct
-        self.tp_multiple   = tp_multiple
-        self.st_reduction  = st_reduction
+        self.position_pct = position_pct
+        self.sl_pct = sl_pct
+        self.tp_multiple = tp_multiple
+        self.st_reduction = st_reduction
         self.cooldown_minutes = cooldown_minutes
         self.max_entries_daily = max_entries_daily
-        self.kill_switch   = KillSwitch()
-        self.positions:    Dict[str, OpenPosition] = {}
-        self._capital:     CapitalState = CapitalState()
-
-        # NUEVO: Cooldown por símbolo (post-cierre)
+        self.kill_switch = KillSwitch()
+        self.positions: Dict[str, OpenPosition] = {}
+        self._capital = CapitalState()
         self._symbol_cooldown: Dict[str, float] = {}
-        # NUEVO: Límite diario por símbolo
         self._symbol_daily_entries: Dict[str, int] = defaultdict(int)
         self._last_entry_date: Dict[str, str] = {}
 
-        # Actualizar constantes del PositionCalculator
-        PositionCalculator.POSITION_PCT = position_pct
-        PositionCalculator.SL_MAX_PCT = sl_pct
-        PositionCalculator.TP_MULTIPLE = tp_multiple
-        PositionCalculator.ST_REDUCTION = st_reduction
-
         logger.info(
-            f"[RiskManager] Iniciado | "
-            f"Modo: {mode.value} | "
-            f"Leverage: {leverage}x | "
-            f"Max posiciones: {max_positions} | "
-            f"Posición: {position_pct*100:.0f}% | "
-            f"SL: {sl_pct*100:.0f}% de posición ({sl_pct*position_pct*100:.1f}% capital) | "
-            f"TP: {tp_multiple}x riesgo | "
-            f"ST reducción: {st_reduction*100:.0f}% | "
-            f"Cooldown: {cooldown_minutes}min | "
-            f"Máx entradas/día: {max_entries_daily}"
+            f"[RiskManager] Iniciado | Modo: {mode.value} | "
+            f"Leverage: {leverage}x | Max posiciones: {max_positions} | "
+            f"Posición: {position_pct*100:.0f}% | SL: {sl_pct*100:.0f}% de posición ({sl_pct*position_pct*100:.1f}% capital) | "
+            f"TP: {tp_multiple}x SL ({sl_pct*tp_multiple*position_pct*100:.1f}% capital) | "
+            f"R:R: {tp_multiple:.1f}:1 | Cooldown: {cooldown_minutes}min"
         )
 
-    # ──────────────────────────────────────────
-    #  ACTUALIZAR CAPITAL
-    # ──────────────────────────────────────────
     async def update_capital(self) -> CapitalState:
         if self.mode == BotMode.DRY_RUN:
             return self._capital
 
         try:
             balance = await self.api.fetch_balance()
-            total   = balance["total"]
+            total = balance["total"]
 
             if self._capital.day_start_balance == 0:
                 self._capital.day_start_balance = total
                 self.kill_switch.set_day_start(total)
-                logger.info(f"[Capital] Saldo inicial del día: ${total:.2f}")
+                logger.info(f"[Capital] Saldo inicial del día: {total:.2f} USDT")
 
             self._capital.total_balance = total
-            self._capital.available     = balance["free"]
-            self._capital.day_pnl       = total - self._capital.day_start_balance
-            self._capital.day_pnl_pct   = (
-                self._capital.day_pnl / self._capital.day_start_balance * 100
-                if self._capital.day_start_balance > 0 else 0
-            )
+            self._capital.available = balance["free"]
+            self._capital.day_pnl = total - self._capital.day_start_balance
+            self._capital.day_pnl_pct = (self._capital.day_pnl / self._capital.day_start_balance * 100) if self._capital.day_start_balance > 0 else 0
             self._capital.open_positions = len(self.positions)
 
             return self._capital
@@ -489,15 +420,12 @@ class RiskManager:
             return self._capital
 
     def set_initial_balance(self, balance: float):
-        self._capital.total_balance     = balance
-        self._capital.available         = balance
+        self._capital.total_balance = balance
+        self._capital.available = balance
         self._capital.day_start_balance = balance
         self.kill_switch.set_day_start(balance)
-        logger.info(f"[Capital] Balance DRY_RUN: ${balance:.2f}")
+        logger.info(f"[Capital] Balance DRY_RUN: {balance:.2f} USDT")
 
-    # ──────────────────────────────────────────
-    #  EVALUAR NUEVA ENTRADA (MEJORADO)
-    # ──────────────────────────────────────────
     async def evaluate_entry(
         self,
         signal,
@@ -505,172 +433,120 @@ class RiskManager:
         sl_structural: float,
         tp_structural: float,
     ) -> Optional[PositionSize]:
-        # ── Kill Switch ──
-        stopped, reason = self.kill_switch.check(
-            self._capital.total_balance
-        )
+        stopped, reason = self.kill_switch.check(self._capital.total_balance)
         if stopped:
             logger.warning(f"[RiskManager] Kill Switch activo: {reason}")
             return None
 
-        # ── Máximo de posiciones ──
         if len(self.positions) >= self.max_positions:
-            logger.debug(
-                f"[RiskManager] Máximo de posiciones alcanzado "
-                f"({self.max_positions})"
-            )
+            logger.debug(f"[RiskManager] Máximo de posiciones alcanzado ({self.max_positions})")
             return None
 
-        # ── Ya hay posición en este símbolo ──
         if signal.symbol in self.positions:
-            logger.debug(
-                f"[RiskManager] Ya hay posición abierta en {signal.symbol}"
-            )
+            logger.debug(f"[RiskManager] Ya hay posición en {signal.symbol}")
             return None
 
-        # ── NUEVO: Verificar cooldown post-cierre ──
         if signal.symbol in self._symbol_cooldown:
             elapsed = time.time() - self._symbol_cooldown[signal.symbol]
-            cooldown_seconds = self.cooldown_minutes * 60
-            if elapsed < cooldown_seconds:
-                remaining = (cooldown_seconds - elapsed) / 60
-                logger.debug(
-                    f"[RiskManager] {signal.symbol} en cooldown. "
-                    f"Restan {remaining:.1f} min para nueva entrada."
-                )
+            if elapsed < self.cooldown_minutes * 60:
                 return None
             else:
-                # Limpiar cooldown expirado
                 del self._symbol_cooldown[signal.symbol]
 
-        # ── NUEVO: Verificar límite diario por símbolo ──
         today = datetime.now(timezone.utc).date().isoformat()
         if self._last_entry_date.get(signal.symbol) != today:
             self._symbol_daily_entries[signal.symbol] = 0
             self._last_entry_date[signal.symbol] = today
 
         if self._symbol_daily_entries[signal.symbol] >= self.max_entries_daily:
-            logger.warning(
-                f"[RiskManager] {signal.symbol} alcanzó el límite diario de "
-                f"{self.max_entries_daily} entradas. Hoy no se opera más."
-            )
+            logger.warning(f"[RiskManager] {signal.symbol} límite diario alcanzado")
             return None
 
-        # ── Detectar apalancamiento máximo del mercado ──
+        timeframe = getattr(signal, 'timeframe', '15m')
+
         try:
             max_leverage = await self.api.get_max_leverage(signal.symbol)
             is_st = await self.api.is_st_asset(signal.symbol)
         except Exception as e:
-            logger.warning(f"[RiskManager] Error detectando apalancamiento para {signal.symbol}: {e}")
+            logger.warning(f"[RiskManager] Error detectando leverage para {signal.symbol}: {e}")
             max_leverage = self.leverage
             is_st = False
 
-        # ── Calcular apalancamiento efectivo ──
-        effective_leverage = min(self.leverage, max_leverage)
-        
-        if effective_leverage < self.leverage:
-            logger.info(
-                f"[RiskManager] {signal.symbol} apalancamiento limitado: "
-                f"{effective_leverage}x (máx mercado: {max_leverage}x)"
-            )
+        tf_config = PositionCalculator.get_config(timeframe)
+        effective_leverage = min(tf_config["leverage"], max_leverage)
 
-        # ── Calcular posición ──
         from market_scanner import SignalType
-        side = (PositionSide.LONG
-                if signal.signal_type in (
-                    SignalType.LONG_BREAKOUT,
-                    SignalType.LONG_REVERSAL
-                )
-                else PositionSide.SHORT)
+        side = PositionSide.LONG if signal.signal_type in (SignalType.LONG_BREAKOUT, SignalType.LONG_REVERSAL) else PositionSide.SHORT
 
         position_size = PositionCalculator.calculate(
-            symbol        = signal.symbol,
-            side          = side,
-            entry_price   = signal.entry_price,
-            sl_structural = 0.0,
-            tp_structural = 0.0,
-            balance       = self._capital.total_balance,
-            leverage      = effective_leverage,
-            max_leverage  = max_leverage,
-            is_st_asset   = is_st,
+            symbol=signal.symbol,
+            side=side,
+            entry_price=signal.entry_price,
+            sl_structural=0.0,
+            tp_structural=0.0,
+            balance=self._capital.total_balance,
+            leverage=effective_leverage,
+            max_leverage=max_leverage,
+            is_st_asset=is_st,
+            timeframe=timeframe,
         )
 
-        # Registrar que vamos a usar una entrada diaria
         self._symbol_daily_entries[signal.symbol] += 1
 
         logger.info(
-            f"[RiskManager] ✅ Entrada aprobada: "
-            f"{signal.symbol} {side.value} | "
-            f"${position_size.position_usd:.2f} | "
-            f"Riesgo: ${position_size.risk_usd:.2f} | "
-            f"SL: {position_size.stop_loss:.4f} | "
-            f"TP: {position_size.take_profit:.4f} | "
-            f"Entradas hoy: {self._symbol_daily_entries[signal.symbol]}/{self.max_entries_daily}"
+            f"[RiskManager] ✅ Entrada aprobada: {signal.symbol} {side.value} {timeframe} | "
+            f"{position_size.position_usd:.2f} USDT | Riesgo: {position_size.risk_usd:.2f} USDT"
         )
 
         return position_size
 
-    # ──────────────────────────────────────────
-    #  REGISTRAR POSICIÓN
-    # ──────────────────────────────────────────
     def register_position(
         self,
-        order_id:      str,
+        order_id: str,
         position_size: PositionSize,
-        pattern_id:    Optional[int] = None,
-        signal_type:   Optional[str] = None,
-        arrow_color:   Optional[str] = None,
-        score:         float = 0.0,
+        pattern_id: Optional[int] = None,
+        signal_type: Optional[str] = None,
+        arrow_color: Optional[str] = None,
+        score: float = 0.0,
     ) -> OpenPosition:
         pos = OpenPosition(
-            id           = order_id,
-            symbol       = position_size.symbol,
-            side         = position_size.side,
-            entry_price  = position_size.entry_price,
-            current_price= position_size.entry_price,
-            stop_loss    = position_size.stop_loss,
-            take_profit  = position_size.take_profit,
-            contracts    = position_size.contracts,
-            leverage     = position_size.leverage,
-            position_usd = position_size.position_usd,
-            risk_usd     = position_size.risk_usd,
-            pattern_id   = pattern_id,
-            highest_price= position_size.entry_price,
-            lowest_price = position_size.entry_price,
-            is_st_asset  = position_size.is_st_asset,
-            score        = score,
-            signal_type  = signal_type,
-            arrow_color  = arrow_color,
+            id=order_id,
+            symbol=position_size.symbol,
+            side=position_size.side,
+            entry_price=position_size.entry_price,
+            current_price=position_size.entry_price,
+            stop_loss=position_size.stop_loss,
+            take_profit=position_size.take_profit,
+            contracts=position_size.contracts,
+            leverage=position_size.leverage,
+            position_usd=position_size.position_usd,
+            risk_usd=position_size.risk_usd,
+            pattern_id=pattern_id,
+            timeframe=position_size.timeframe,
+            highest_price=position_size.entry_price,
+            lowest_price=position_size.entry_price,
+            is_st_asset=position_size.is_st_asset,
+            score=score,
+            signal_type=signal_type,
+            arrow_color=arrow_color,
         )
         self.positions[position_size.symbol] = pos
-        logger.info(
-            f"[RiskManager] 📝 Posición registrada: "
-            f"{pos.symbol} {pos.side.value} @ {pos.entry_price}"
-            f"{' (ST)' if pos.is_st_asset else ''}"
-        )
+        logger.info(f"[RiskManager] 📝 Posición registrada: {pos.symbol} {pos.side.value} {pos.timeframe}")
         return pos
 
-    # ──────────────────────────────────────────
-    #  MONITOREAR POSICIONES
-    # ──────────────────────────────────────────
-    async def monitor_positions(
-        self,
-        dfs: Dict[str, pd.DataFrame],
-    ) -> Dict[str, Tuple[bool, CloseReason, str]]:
+    async def monitor_positions(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, Tuple[bool, CloseReason, str]]:
         results = {}
 
         for symbol, position in list(self.positions.items()):
             if symbol not in dfs:
                 continue
 
-            df   = dfs[symbol]
-            df   = PositionCalculator._prepare_structural_df(df)
+            df = dfs[symbol]
+            df = PositionCalculator._prepare_structural_df(df)
             if df.empty or len(df) < 10:
-                logger.warning(f"[Monitor] Datos insuficientes para {symbol}, salto.")
                 continue
 
             last = df.iloc[-1]
-
             current = float(last["close"])
             position.current_price = current
 
@@ -682,52 +558,32 @@ class RiskManager:
                 position.lowest_price = min(position.lowest_price, current)
 
             position.unrealized_pnl_pct = pnl_pct * 100 * position.leverage
-            position.unrealized_pnl     = (
-                position.position_usd * pnl_pct * position.leverage
-            )
+            position.unrealized_pnl = position.position_usd * pnl_pct * position.leverage
 
-            # ── 1. Evaluar SL y TP fijos ──
+            # SL/TP fijos
             if position.side == PositionSide.LONG:
                 if current <= position.stop_loss:
-                    results[symbol] = (True, CloseReason.STOP_LOSS, 
-                                       f"SL fijo tocado {current:.4f}")
+                    results[symbol] = (True, CloseReason.STOP_LOSS, f"SL tocado {current:.4f}")
                     continue
                 if current >= position.take_profit:
-                    results[symbol] = (True, CloseReason.TAKE_PROFIT, 
-                                       f"TP fijo tocado {current:.4f}")
+                    results[symbol] = (True, CloseReason.TAKE_PROFIT, f"TP tocado {current:.4f}")
                     continue
-            else:  # SHORT
+            else:
                 if current >= position.stop_loss:
-                    results[symbol] = (True, CloseReason.STOP_LOSS, 
-                                       f"SL fijo tocado {current:.4f}")
+                    results[symbol] = (True, CloseReason.STOP_LOSS, f"SL tocado {current:.4f}")
                     continue
                 if current <= position.take_profit:
-                    results[symbol] = (True, CloseReason.TAKE_PROFIT, 
-                                       f"TP fijo tocado {current:.4f}")
+                    results[symbol] = (True, CloseReason.TAKE_PROFIT, f"TP tocado {current:.4f}")
                     continue
 
-            # ── 2. Evaluar reverso por estructura ──
-            should_close, reason, notes = StructureExitEngine.evaluate_exit(
-                position, df
-            )
-
+            # Reverso por estructura
+            should_close, reason, notes = StructureExitEngine.evaluate_exit(position, df)
             if should_close:
                 results[symbol] = (True, reason, notes)
-                logger.info(
-                    f"[Monitor] 🔔 {symbol} — cerrar por {reason.value}: {notes}"
-                )
 
         return results
 
-    # ──────────────────────────────────────────
-    #  CERRAR POSICIÓN (MEJORADO)
-    # ──────────────────────────────────────────
-    async def close_position(
-        self,
-        symbol:       str,
-        reason:       CloseReason,
-        current_price: float,
-    ) -> Optional[dict]:
+    async def close_position(self, symbol: str, reason: CloseReason, current_price: float) -> Optional[dict]:
         if symbol not in self.positions:
             return None
 
@@ -740,145 +596,94 @@ class RiskManager:
 
         pnl_usd = pos.position_usd * pnl_pct * pos.leverage
 
-        open_dt    = datetime.fromisoformat(pos.open_time)
-        now_dt     = datetime.now(timezone.utc)
+        open_dt = datetime.fromisoformat(pos.open_time)
+        now_dt = datetime.now(timezone.utc)
         duration_m = (now_dt - open_dt).total_seconds() / 60
 
+        # ✅ CORREGIDO: Mostrar USDT en lugar de $
         logger.info(
             f"[RiskManager] {'🟢' if pnl_usd > 0 else '🔴'} "
-            f"Cerrando {symbol} {pos.side.value} | "
-            f"PnL: ${pnl_usd:.2f} ({pnl_pct*100:.1f}%) | "
-            f"Razón: {reason.value} | "
-            f"Duración: {duration_m:.0f}min"
+            f"Cerrando {symbol} {pos.side.value} | PnL: {pnl_usd:.2f} USDT ({pnl_pct*100:.1f}%) | "
+            f"Razón: {reason.value} | Duración: {duration_m:.0f}min"
         )
 
-        # ── NUEVO: Registrar cooldown post-cierre ──
         self._symbol_cooldown[symbol] = time.time()
-        logger.info(
-            f"[RiskManager] {symbol} en cooldown por {self.cooldown_minutes} minutos "
-            f"(cerrado por {reason.value})"
-        )
 
         if pos.pattern_id:
             self._update_pattern_result(
-                pattern_id   = pos.pattern_id,
-                exit_price   = current_price,
-                exit_reason  = reason.value,
-                pnl_percent  = pnl_pct * 100,
-                pnl_usd      = pnl_usd,
-                duration_min = duration_m,
+                pattern_id=pos.pattern_id,
+                exit_price=current_price,
+                exit_reason=reason.value,
+                pnl_percent=pnl_pct * 100,
+                pnl_usd=pnl_usd,
+                duration_min=duration_m,
             )
 
         self._capital.total_balance += pnl_usd
-        self._capital.available     += pos.position_usd + pnl_usd
-        self._capital.day_pnl       += pnl_usd
+        self._capital.available += pos.position_usd + pnl_usd
+        self._capital.day_pnl += pnl_usd
 
         del self.positions[symbol]
 
         result = {
-            "symbol":       symbol,
-            "side":         pos.side.value,
-            "entry":        pos.entry_price,
-            "exit":         current_price,
-            "pnl_usd":      round(pnl_usd, 2),
-            "pnl_pct":      round(pnl_pct * 100, 2),
-            "reason":       reason.value,
+            "symbol": symbol,
+            "side": pos.side.value,
+            "entry": pos.entry_price,
+            "exit": current_price,
+            "pnl_usd": round(pnl_usd, 2),
+            "pnl_pct": round(pnl_pct * 100, 2),
+            "reason": reason.value,
             "duration_min": round(duration_m, 0),
-            "reverse":      reason == CloseReason.REVERSE,
-            "pattern_id":   pos.pattern_id,
-            "score":        pos.score,
-            "signal_type":  pos.signal_type,
-            "arrow_color":  pos.arrow_color,
+            "reverse": reason == CloseReason.REVERSE,
+            "timeframe": pos.timeframe,
         }
 
         if reason == CloseReason.REVERSE:
-            reverse_side = (
-                PositionSide.SHORT
-                if pos.side == PositionSide.LONG
-                else PositionSide.LONG
-            )
-            result["reverse_side"]  = reverse_side.value
+            reverse_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
+            result["reverse_side"] = reverse_side.value
             result["reverse_price"] = current_price
-            logger.info(
-                f"[RiskManager] 🔄 REVERSO: "
-                f"abrir {reverse_side.value} en {symbol} @ {current_price}"
-            )
+            logger.info(f"[RiskManager] 🔄 REVERSO: abrir {reverse_side.value} en {symbol} @ {current_price}")
 
         return result
 
-    # ──────────────────────────────────────────
-    #  ACTUALIZAR BD
-    # ──────────────────────────────────────────
-    def _update_pattern_result(
-        self,
-        pattern_id:   int,
-        exit_price:   float,
-        exit_reason:  str,
-        pnl_percent:  float,
-        pnl_usd:      float,
-        duration_min: float,
-    ):
+    def _update_pattern_result(self, pattern_id: int, exit_price: float, exit_reason: str, pnl_percent: float, pnl_usd: float, duration_min: float):
         trade_result = "WIN" if pnl_usd > 0 else "LOSS"
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
                     UPDATE patterns SET
-                        exit_price   = ?,
-                        exit_reason  = ?,
-                        pnl_percent  = ?,
-                        pnl_usd      = ?,
-                        duration_min = ?,
-                        trade_result = ?
-                    WHERE id = ?
-                """, (
-                    exit_price, exit_reason, pnl_percent,
-                    pnl_usd, duration_min, trade_result, pattern_id
-                ))
+                        exit_price=?, exit_reason=?, pnl_percent=?,
+                        pnl_usd=?, duration_min=?, trade_result=?
+                    WHERE id=?
+                """, (exit_price, exit_reason, pnl_percent, pnl_usd, duration_min, trade_result, pattern_id))
                 conn.commit()
         except Exception as e:
             logger.error(f"[BD] Error actualizando patrón {pattern_id}: {e}")
 
-    # ──────────────────────────────────────────
-    #  ESTADO DEL SISTEMA
-    # ──────────────────────────────────────────
     def get_status(self) -> dict:
         return {
-            "mode":              self.mode.value,
-            "balance":           self._capital.total_balance,
-            "available":         self._capital.available,
-            "day_start":         self._capital.day_start_balance,
-            "day_pnl":           self._capital.day_pnl,
-            "day_pnl_pct":       self._capital.day_pnl_pct,
-            "drawdown_pct":      self._capital.drawdown_pct,
-            "kill_switch":       self.kill_switch.active,
-            "kill_switch_reason":self.kill_switch.reason,
-            "open_positions":    len(self.positions),
-            "cooldown_symbols":  list(self._symbol_cooldown.keys()),
-            "daily_entries":     dict(self._symbol_daily_entries),
+            "mode": self.mode.value,
+            "balance": self._capital.total_balance,
+            "available": self._capital.available,
+            "day_start": self._capital.day_start_balance,
+            "day_pnl": self._capital.day_pnl,
+            "day_pnl_pct": self._capital.day_pnl_pct,
+            "drawdown_pct": self._capital.drawdown_pct if hasattr(self._capital, 'drawdown_pct') else 0.0,
+            "kill_switch": self.kill_switch.active,
+            "kill_switch_reason": self.kill_switch.reason,
+            "open_positions": len(self.positions),
             "positions": {
                 sym: {
-                    "side":        pos.side.value,
-                    "entry":       pos.entry_price,
-                    "current":     pos.current_price,
-                    "pnl_usd":     pos.unrealized_pnl,
-                    "pnl_pct":     pos.unrealized_pnl_pct,
-                    "sl":          pos.stop_loss,
-                    "tp":          pos.take_profit,
-                    "is_st":       pos.is_st_asset,
+                    "side": pos.side.value,
+                    "entry": pos.entry_price,
+                    "current": pos.current_price,
+                    "pnl_usd": pos.unrealized_pnl,
+                    "pnl_pct": pos.unrealized_pnl_pct,
+                    "sl": pos.stop_loss,
+                    "tp": pos.take_profit,
+                    "timeframe": pos.timeframe,
+                    "is_st": pos.is_st_asset,
                 }
                 for sym, pos in self.positions.items()
             },
         }
-
-
-async def main():
-    print("\n🔥 RiskManager v3.0 — Con cooldown y límite diario")
-    print("─" * 60)
-    print("  🛡️  Cooldown: 15 minutos entre entradas del mismo símbolo")
-    print("  📊  Límite diario: 3 entradas por símbolo")
-    print("  🔒  SL fijo: 4% del capital")
-    print("  🚀  TP fijo: 40% del capital")
-    print("─" * 60)
-
-if __name__ == "__main__":
-    asyncio.run(main())
