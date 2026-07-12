@@ -33,7 +33,7 @@ CONFIG: Dict[str, Any] = {
     # ─── ESTRATEGIA ───
     "SCANNER_ENABLED": True,
     "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "10.0")),
-    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.60")),
+    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.40")),   # ✅ CAMBIO: Bajado de 0.60 a 0.40 (menos estricto)
     "MIN_RR": float(os.getenv("MIN_RR", "3.0")),
     
     # ─── MÚLTIPLES TIMEFRAMES ───
@@ -41,7 +41,7 @@ CONFIG: Dict[str, Any] = {
     
     # ─── GESTIÓN DE RIESGO ───
     "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "3")),
-    "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.10")),
+    "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.50")), # ✅ CAMBIO: Subido de 0.10 a 0.50 (50% del capital para cubrir el mínimo de Bybit)
     "SL_PCT": float(os.getenv("SL_PCT", "0.40")),
     "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
     "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
@@ -118,7 +118,7 @@ class UnicoBot:
             mode=self.mode,
             db_path=config["DB_PATH"],
             max_positions=config["MAX_POSITIONS"],
-            position_pct=config.get("POSITION_PCT", 0.10),
+            position_pct=config.get("POSITION_PCT", 0.50), # Usa el nuevo 0.50
             sl_pct=config.get("SL_PCT", 0.40),
             tp_multiple=config.get("TP_MULTIPLE", 5.0),
             leverage=config.get("LEVERAGE", 10),
@@ -131,7 +131,7 @@ class UnicoBot:
             api_manager=self.api,
             watchlist=config["WATCHLIST"],
             scan_interval=config["SCAN_INTERVAL"],
-            min_score=config["MIN_SCORE"],
+            min_score=config["MIN_SCORE"], # Usa el nuevo 0.40
             min_rr=config["MIN_RR"],
             position_pct=config["POSITION_PCT"],
             db_path=config["DB_PATH"],
@@ -169,7 +169,7 @@ class UnicoBot:
             + f" Timeframes: {self.config.get('TIMEFRAMES', ['15m', '3m'])}\n"
             + f" Intervalo: {self.config['SCAN_INTERVAL']}s\n"
             + f" Máximo posiciones: {self.config['MAX_POSITIONS']}\n"
-            + f" Posición: {self.config['POSITION_PCT']*100:.0f}% capital\n"
+            + f" Posición: {self.config['POSITION_PCT']*100:.0f}% capital\n" # Mostrará 50%
             + f" SL: {self.config['SL_PCT']*100:.0f}% de posición\n"
             + f" TP: {self.config['TP_MULTIPLE']}x riesgo\n"
             + f" Cooldown: {self.config['COOLDOWN_MINUTES']}min\n"
@@ -224,7 +224,6 @@ class UnicoBot:
             for signal in signals:
                 await self._process_signal(signal)
         else:
-            # ⚠️ CAMBIO APLICADO: de debug a warning
             logger.warning("⏸️ Scanner en pausa o máximo de posiciones alcanzado.")
 
         # ── MONITOREO DE POSICIONES ──
@@ -299,7 +298,6 @@ class UnicoBot:
         )
         
         if not position_size:
-            # ⚠️ CAMBIO APLICADO: de debug a warning
             logger.warning(f"⏭️ Señal descartada por RiskManager: {signal.symbol}")
             return
 
@@ -458,7 +456,7 @@ if __name__ == "__main__":
 ║  python main.py --live        → Modo real (¡cuidado!)       ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  🛡️  SL: 4% del capital  |  🚀 TP: 20% del capital         ║
-║  📊 Posición: 10%        |  ⏱️  Cooldown: 15min            ║
+║  📊 Posición: 50%        |  ⏱️  Cooldown: 15min            ║
 ║  🔒 Límite diario: 3     |  🧠 Aprendizaje: ACTIVADO       ║
 ╚═══════════════════════════════════════════════════════════════╝
 """)
