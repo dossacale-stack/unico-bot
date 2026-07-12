@@ -224,7 +224,8 @@ class UnicoBot:
             for signal in signals:
                 await self._process_signal(signal)
         else:
-            logger.debug("⏸️ Scanner en pausa o máximo de posiciones alcanzado.")
+            # ⚠️ CAMBIO APLICADO: de debug a warning
+            logger.warning("⏸️ Scanner en pausa o máximo de posiciones alcanzado.")
 
         # ── MONITOREO DE POSICIONES ──
         if self.rm.positions:
@@ -298,7 +299,8 @@ class UnicoBot:
         )
         
         if not position_size:
-            logger.debug(f"⏭️ Señal descartada por RiskManager: {signal.symbol}")
+            # ⚠️ CAMBIO APLICADO: de debug a warning
+            logger.warning(f"⏭️ Señal descartada por RiskManager: {signal.symbol}")
             return
 
         open_side = "buy" if signal.signal_type.is_long() else "sell"
