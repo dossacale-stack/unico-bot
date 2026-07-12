@@ -217,16 +217,16 @@ class MarketScanner:
                 return "0.786_1.000"
             return "1.000_PLUS"
 
+        # ✅ CORRECCIÓN APLICADA AQUÍ:
         def bb_price_label(close: float, mid: float, lower: float, upper: float) -> str:
             if close >= upper:
                 return "UPPER"
             if close <= lower:
                 return "LOWER"
-            distance = abs(close - mid) / max(mid, 1e-6)
-            if distance < 0.03:
-                return "MID"
-            if close > mid:
+            # Se eliminó la condición distance < 0.03 que devolvía "MID" erróneamente
+            if close >= mid:
                 return "MID_TO_UPPER"
+            # Si el precio está por debajo de la media, debe ser LOWER para detectar LONG_REVERSAL
             return "LOWER"
 
         def bb_state_label(mid: float, upper: float, lower: float, recent: pd.DataFrame) -> str:
