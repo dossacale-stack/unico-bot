@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from bybit_api_manager import BybitAPIManager
-from market_scanner import MarketScanner, Signal
+from strategy_scanner import MarketScanner, Signal  # ✅ CAMBIO AQUÍ
 from order_executor import OrderExecutor
 from risk_manager import BotMode, CloseReason, RiskManager
 import seed_patterns
@@ -24,101 +24,67 @@ logger = logging.getLogger("UNICO")
 
 # ─── CONFIGURACIÓN PRINCIPAL ───
 CONFIG: Dict[str, Any] = {
-    # ─── CREDENCIALES (USANDO os.getenv PARA SEGURIDAD) ───
     "API_KEY": os.getenv("BYBIT_API_KEY", ""),
     "API_SECRET": os.getenv("BYBIT_API_SECRET", ""),
     "SANDBOX": os.getenv("BYBIT_SANDBOX", "false").lower() == "true",
     "MODE": os.getenv("BOT_MODE", "DRY_RUN"),
     
-    # ─── ESTRATEGIA ───
     "SCANNER_ENABLED": True,
     "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "10.0")),
-    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.40")),   # ✅ CAMBIO: Bajado de 0.60 a 0.40 (menos estricto)
+    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.40")),
     "MIN_RR": float(os.getenv("MIN_RR", "3.0")),
     
-    # ─── MÚLTIPLES TIMEFRAMES ───
     "TIMEFRAMES": ["15m", "3m"],
     
-    # ─── GESTIÓN DE RIESGO ───
     "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "3")),
-    "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.50")), # ✅ CAMBIO: Subido de 0.10 a 0.50 (50% del capital para cubrir el mínimo de Bybit)
+    "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.50")),
     "SL_PCT": float(os.getenv("SL_PCT", "0.40")),
     "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
     "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
     "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "15")),
     "MAX_ENTRIES_DAILY": int(os.getenv("MAX_ENTRIES_DAILY", "3")),
     
-    # ─── APRENDIZAJE ───
     "LEARNING_ENABLED": os.getenv("LEARNING_ENABLED", "true").lower() == "true",
     
-    # ─── BASE DE DATOS ───
     "DB_PATH": os.getenv("DB_PATH", "patterns.db"),
     "CAPITAL_FILE": os.getenv("CAPITAL_FILE", "capital_inicial.json"),
     
-    # ─── WATCHLIST (AMPLIADA) ───
     "WATCHLIST": [
-        # TOP 10
-        "BTCUSDT", "ETHUSDT", "SOLUSDT",
-        "BNBUSDT", "XRPUSDT", "DOGEUSDT",
-        "ADAUSDT", "LINKUSDT", "AVAXUSDT",
-        "DOTUSDT",
-        
-        # ALTCOINS
-        "ATOMUSDT", "NEARUSDT", "ARBUSDT",
-        "OPUSDT", "APTUSDT", "SUIUSDT",
-        "RNDRUSDT", "FETUSDT", "AGIXUSDT",
-        "OCEANUSDT", "POLUSDT",
-        
-        # ACTIVOS DE TUS IMÁGENES
-        "DEXEUSDT", "BRUSDT", "LIGHTUSDT",
-        "RESOLVUSDT", "OPGUSDT", "VELVETUSDT",
-        "BEATUSDT", "TSTBSCUSDT", "POPCATUSDT",
-        "HEIUSDT", "ALLOUSDT", "ABUSD",
-        
-        # MEMECOINS
-        "PEPEUSDT", "WIFUSDT", "BONKUSDT",
-        "SHIBUSDT",
-        
-        # DEFI
-        "AAVEUSDT", "MKRUSDT", "COMPUSDT",
-        "CRVUSDT", "LDOUSDT",
-        
-        # GAMING
-        "SANDUSDT", "MANAUSDT", "AXSUSDT",
-        "GALAUSDT", "BEAMUSDT", "CHZUSDT",
-        
-        # LAYER 1
-        "VETUSDT", "HBARUSDT", "ALGOUSDT",
-        "STXUSDT", "EGLDUSDT", "FTMUSDT",
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT",
+        "ADAUSDT", "LINKUSDT", "AVAXUSDT", "DOTUSDT",
+        "ATOMUSDT", "NEARUSDT", "ARBUSDT", "OPUSDT", "APTUSDT", "SUIUSDT",
+        "RNDRUSDT", "FETUSDT", "AGIXUSDT", "OCEANUSDT", "POLUSDT",
+        "DEXEUSDT", "BRUSDT", "LIGHTUSDT", "RESOLVUSDT", "OPGUSDT", "VELVETUSDT",
+        "BEATUSDT", "TSTBSCUSDT", "POPCATUSDT", "HEIUSDT", "ALLOUSDT", "ABUSD",
+        "PEPEUSDT", "WIFUSDT", "BONKUSDT", "SHIBUSDT",
+        "AAVEUSDT", "MKRUSDT", "COMPUSDT", "CRVUSDT", "LDOUSDT",
+        "SANDUSDT", "MANAUSDT", "AXSUSDT", "GALAUSDT", "BEAMUSDT", "CHZUSDT",
+        "VETUSDT", "HBARUSDT", "ALGOUSDT", "STXUSDT", "EGLDUSDT", "FTMUSDT",
     ],
 }
-
 
 class UnicoBot:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.mode = BotMode[config["MODE"]]
         
-        # ─── VALIDACIÓN DE CREDENCIALES ───
         if self.mode == BotMode.LIVE:
             if not config["API_KEY"] or not config["API_SECRET"]:
                 logger.critical("❌ BYBIT_API_KEY o BYBIT_API_SECRET no están configuradas")
                 raise ValueError("Faltan credenciales de Bybit")
         
-        # ─── API MANAGER ───
         self.api = BybitAPIManager(
             api_key=config["API_KEY"],
             api_secret=config["API_SECRET"],
             sandbox=config["SANDBOX"],
         )
         
-        # ─── RISK MANAGER ───
         self.rm = RiskManager(
             api_manager=self.api,
             mode=self.mode,
             db_path=config["DB_PATH"],
             max_positions=config["MAX_POSITIONS"],
-            position_pct=config.get("POSITION_PCT", 0.50), # Usa el nuevo 0.50
+            position_pct=config.get("POSITION_PCT", 0.50),
             sl_pct=config.get("SL_PCT", 0.40),
             tp_multiple=config.get("TP_MULTIPLE", 5.0),
             leverage=config.get("LEVERAGE", 10),
@@ -126,12 +92,11 @@ class UnicoBot:
             max_entries_daily=config.get("MAX_ENTRIES_DAILY", 3),
         )
         
-        # ─── SCANNER ───
         self.scanner = MarketScanner(
             api_manager=self.api,
             watchlist=config["WATCHLIST"],
             scan_interval=config["SCAN_INTERVAL"],
-            min_score=config["MIN_SCORE"], # Usa el nuevo 0.40
+            min_score=config["MIN_SCORE"],
             min_rr=config["MIN_RR"],
             position_pct=config["POSITION_PCT"],
             db_path=config["DB_PATH"],
@@ -139,10 +104,8 @@ class UnicoBot:
             timeframes=config.get("TIMEFRAMES", ["15m", "3m"]),
         )
         
-        # ─── ORDER EXECUTOR ───
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
         
-        # ─── ESTADO ───
         self.running = False
         self.stats = {
             "cycles": 0,
@@ -153,12 +116,10 @@ class UnicoBot:
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
         
-        # ─── SEÑALES ───
         signal.signal(signal.SIGINT, self._handle_shutdown)
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
     async def initialize(self) -> None:
-        """Inicializa el bot y muestra configuración."""
         logger.info(
             "\n" + "=" * 60 + "\n"
             + " 🚀 ÚNICO STRATEGY v4.0 — M15 + M3\n"
@@ -169,7 +130,7 @@ class UnicoBot:
             + f" Timeframes: {self.config.get('TIMEFRAMES', ['15m', '3m'])}\n"
             + f" Intervalo: {self.config['SCAN_INTERVAL']}s\n"
             + f" Máximo posiciones: {self.config['MAX_POSITIONS']}\n"
-            + f" Posición: {self.config['POSITION_PCT']*100:.0f}% capital\n" # Mostrará 50%
+            + f" Posición: {self.config['POSITION_PCT']*100:.0f}% capital\n"
             + f" SL: {self.config['SL_PCT']*100:.0f}% de posición\n"
             + f" TP: {self.config['TP_MULTIPLE']}x riesgo\n"
             + f" Cooldown: {self.config['COOLDOWN_MINUTES']}min\n"
@@ -177,7 +138,6 @@ class UnicoBot:
             + "=" * 60
         )
 
-        # ─── BALANCE INICIAL ───
         if self.mode == BotMode.DRY_RUN:
             logger.info("🔬 Modo DRY_RUN - Simulando balance de $10,000 USDT")
             self.rm.set_initial_balance(10000.0)
@@ -191,7 +151,6 @@ class UnicoBot:
                 raise
 
     async def run(self) -> None:
-        """Loop principal del bot."""
         await self.initialize()
         self.running = True
         logger.info("✅ Bot iniciado. Loop principal corriendo...")
@@ -206,10 +165,7 @@ class UnicoBot:
         await self.shutdown()
 
     async def _cycle(self) -> None:
-        """Ciclo principal de escaneo y monitoreo."""
         self.stats["cycles"] += 1
-
-        # ── CAPITAL Y KILL SWITCH ──
         capital = await self.rm.update_capital()
         stopped, reason = self.rm.kill_switch.check(capital.total_balance)
         if stopped:
@@ -217,7 +173,6 @@ class UnicoBot:
             self.running = False
             return
 
-        # ── SCANNER ──
         if self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
             signals = await self.scanner.scan_all()
             self.stats["signals"] += len(signals)
@@ -226,7 +181,6 @@ class UnicoBot:
         else:
             logger.warning("⏸️ Scanner en pausa o máximo de posiciones alcanzado.")
 
-        # ── MONITOREO DE POSICIONES ──
         if self.rm.positions:
             dfs = {}
             for symbol in list(self.rm.positions.keys()):
@@ -279,12 +233,10 @@ class UnicoBot:
                         )
                         logger.info(f"🔄 Reverso abierto {symbol} {reverse_side}")
 
-        # ── STATUS ──
         self._log_status(capital)
         await asyncio.sleep(self.config["SCAN_INTERVAL"])
 
     async def _process_signal(self, signal: Signal) -> None:
-        """Procesa una señal detectada por el scanner."""
         logger.info(
             f"📊 Señal {signal.signal_type.value} {signal.symbol} | "
             f"Score {signal.score:.2f} | Timeframe: {signal.timeframe}"
@@ -330,7 +282,6 @@ class UnicoBot:
         )
 
     def _log_status(self, capital: Any) -> None:
-        """Log del estado actual."""
         positions_info = []
         for sym, pos in self.rm.positions.items():
             positions_info.append(f"{sym}({pos.timeframe})")
@@ -345,12 +296,10 @@ class UnicoBot:
         )
 
     def _handle_shutdown(self, signum: int, frame: Any) -> None:
-        """Manejo de señales de cierre."""
         logger.info(f"🛑 Señal {signum} recibida, cerrando...")
         self.running = False
 
     async def shutdown(self) -> None:
-        """Cierre limpio del bot."""
         logger.info("🛑 Deteniendo bot...")
         if self.api:
             await self.api.close()
@@ -361,9 +310,6 @@ class UnicoBot:
         )
 
 
-# ─────────────────────────────────────────────
-#  FUNCIONES AUXILIARES
-# ─────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ÚNICO STRATEGY Bot")
     parser.add_argument("--status", action="store_true", help="Muestra el estado del bot")
@@ -390,19 +336,14 @@ def mostrar_estado() -> None:
     print("=" * 60)
 
 
-# ─────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────
 async def main() -> None:
     args = parse_args()
     
-    # ─── SOBREESCRIBIR MODO ───
     if args.dry_run:
         CONFIG["MODE"] = "DRY_RUN"
     if args.live:
         CONFIG["MODE"] = "LIVE"
 
-    # ─── INICIALIZAR DB ───
     if args.init_db:
         with sqlite3.connect(CONFIG['DB_PATH']) as conn:
             seed_patterns.init_db(conn)
@@ -410,12 +351,10 @@ async def main() -> None:
             seed_patterns.print_summary(conn)
         return
 
-    # ─── MOSTRAR ESTADO ───
     if args.status:
         mostrar_estado()
         return
 
-    # ─── VALIDAR CREDENCIALES ───
     if CONFIG["MODE"] == "LIVE":
         if not CONFIG["API_KEY"] or not CONFIG["API_SECRET"]:
             print("\n❌ ERROR: Faltan credenciales de Bybit")
@@ -426,7 +365,6 @@ async def main() -> None:
             print("   python main.py --dry-run\n")
             sys.exit(1)
 
-    # ─── INICIAR BOT ───
     bot = UnicoBot(CONFIG)
     
     try:
