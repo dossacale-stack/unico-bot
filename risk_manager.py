@@ -475,7 +475,8 @@ class RiskManager:
         tf_config = PositionCalculator.get_config(timeframe)
         effective_leverage = min(tf_config["leverage"], max_leverage)
 
-        from market_scanner import SignalType
+        # ✅ CAMBIO APLICADO AQUÍ: Ahora importa desde strategy_scanner
+        from strategy_scanner import SignalType
         side = PositionSide.LONG if signal.signal_type in (SignalType.LONG_BREAKOUT, SignalType.LONG_REVERSAL) else PositionSide.SHORT
 
         position_size = PositionCalculator.calculate(
