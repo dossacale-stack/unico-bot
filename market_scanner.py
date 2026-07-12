@@ -1,366 +1,464 @@
+import argparse
+import asyncio
 import logging
 import os
-import re
+import signal
 import sqlite3
-import time
-from dataclasses import dataclass
-from enum import Enum
-from typing import Any, Dict, List, Optional
-
-import numpy as np
-import pandas as pd
+import sys
+from datetime import datetime, timezone
+from typing import Any, Dict, List
 
 from bybit_api_manager import BybitAPIManager
+from market_scanner import MarketScanner, Signal
+from order_executor import OrderExecutor
+from risk_manager import BotMode, CloseReason, RiskManager
 import seed_patterns
 
-logger = logging.getLogger("MarketScanner")
+# ─── CONFIGURACIÓN DE LOGGING ───
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("UNICO")
+
+# ─── CONFIGURACIÓN PRINCIPAL ───
+CONFIG: Dict[str, Any] = {
+    # ─── CREDENCIALES (USANDO os.getenv PARA SEGURIDAD) ───
+    "API_KEY": os.getenv("BYBIT_API_KEY", ""),
+    "API_SECRET": os.getenv("BYBIT_API_SECRET", ""),
+    "SANDBOX": os.getenv("BYBIT_SANDBOX", "false").lower() == "true",
+    "MODE": os.getenv("BOT_MODE", "DRY_RUN"),
+    
+    # ─── ESTRATEGIA ───
+    "SCANNER_ENABLED": True,
+    "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "10.0")),
+    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.40")),   # ✅ Cambiado de 0.60 a 0.40
+    "MIN_RR": float(os.getenv("MIN_RR", "3.0")),
+    
+    # ─── MÚLTIPLES TIMEFRAMES ───
+    "TIMEFRAMES": ["15m", "3m"],
+    
+    # ─── GESTIÓN DE RIESGO ───
+    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "3")),
+    "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.50")), # ✅ Cambiado de 0.10 a 0.50 (50% del capital)
+    "SL_PCT": float(os.getenv("SL_PCT", "0.40")),
+    "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
+    "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
+    "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "15")),
+    "MAX_ENTRIES_DAILY": int(os.getenv("MAX_ENTRIES_DAILY", "3")),
+    
+    # ─── APRENDIZAJE ───
+    "LEARNING_ENABLED": os.getenv("LEARNING_ENABLED", "true").lower() == "true",
+    
+    # ─── BASE DE DATOS ───
+    "DB_PATH": os.getenv("DB_PATH", "patterns.db"),
+    "CAPITAL_FILE": os.getenv("CAPITAL_FILE", "capital_inicial.json"),
+    
+    # ─── WATCHLIST (AMPLIADA) ───
+    "WATCHLIST": [
+        # TOP 10
+        "BTCUSDT", "ETHUSDT", "SOLUSDT",
+        "BNBUSDT", "XRPUSDT", "DOGEUSDT",
+        "ADAUSDT", "LINKUSDT", "AVAXUSDT",
+        "DOTUSDT",
+        
+        # ALTCOINS
+        "ATOMUSDT", "NEARUSDT", "ARBUSDT",
+        "OPUSDT", "APTUSDT", "SUIUSDT",
+        "RNDRUSDT", "FETUSDT", "AGIXUSDT",
+        "OCEANUSDT", "POLUSDT",
+        
+        # ACTIVOS DE TUS IMÁGENES
+        "DEXEUSDT", "BRUSDT", "LIGHTUSDT",
+        "RESOLVUSDT", "OPGUSDT", "VELVETUSDT",
+        "BEATUSDT", "TSTBSCUSDT", "POPCATUSDT",
+        "HEIUSDT", "ALLOUSDT", "ABUSD",
+        
+        # MEMECOINS
+        "PEPEUSDT", "WIFUSDT", "BONKUSDT",
+        "SHIBUSDT",
+        
+        # DEFI
+        "AAVEUSDT", "MKRUSDT", "COMPUSDT",
+        "CRVUSDT", "LDOUSDT",
+        
+        # GAMING
+        "SANDUSDT", "MANAUSDT", "AXSUSDT",
+        "GALAUSDT", "BEAMUSDT", "CHZUSDT",
+        
+        # LAYER 1
+        "VETUSDT", "HBARUSDT", "ALGOUSDT",
+        "STXUSDT", "EGLDUSDT", "FTMUSDT",
+    ],
+}
 
 
-class SignalType(Enum):
-    LONG_BREAKOUT = "LONG_BREAKOUT"
-    SHORT_BREAKOUT = "SHORT_BREAKOUT"
-    LONG_REVERSAL = "LONG_REVERSAL"
-    SHORT_REVERSAL = "SHORT_REVERSAL"
+class UnicoBot:
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.mode = BotMode[config["MODE"]]
+        
+        # ─── VALIDACIÓN DE CREDENCIALES ───
+        if self.mode == BotMode.LIVE:
+            if not config["API_KEY"] or not config["API_SECRET"]:
+                logger.critical("❌ BYBIT_API_KEY o BYBIT_API_SECRET no están configuradas")
+                raise ValueError("Faltan credenciales de Bybit")
+        
+        # ─── API MANAGER ───
+        self.api = BybitAPIManager(
+            api_key=config["API_KEY"],
+            api_secret=config["API_SECRET"],
+            sandbox=config["SANDBOX"],
+        )
+        
+        # ─── RISK MANAGER ───
+        self.rm = RiskManager(
+            api_manager=self.api,
+            mode=self.mode,
+            db_path=config["DB_PATH"],
+            max_positions=config["MAX_POSITIONS"],
+            position_pct=config.get("POSITION_PCT", 0.50),
+            sl_pct=config.get("SL_PCT", 0.40),
+            tp_multiple=config.get("TP_MULTIPLE", 5.0),
+            leverage=config.get("LEVERAGE", 10),
+            cooldown_minutes=config.get("COOLDOWN_MINUTES", 15),
+            max_entries_daily=config.get("MAX_ENTRIES_DAILY", 3),
+        )
+        
+        # ─── SCANNER ───
+        self.scanner = MarketScanner(
+            api_manager=self.api,
+            watchlist=config["WATCHLIST"],
+            scan_interval=config["SCAN_INTERVAL"],
+            min_score=config["MIN_SCORE"],
+            min_rr=config["MIN_RR"],
+            position_pct=config["POSITION_PCT"],
+            db_path=config["DB_PATH"],
+            signal_cooldown_seconds=60,
+            timeframes=config.get("TIMEFRAMES", ["15m", "3m"]),
+        )
+        
+        # ─── ORDER EXECUTOR ───
+        self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
+        
+        # ─── ESTADO ───
+        self.running = False
+        self.stats = {
+            "cycles": 0,
+            "signals": 0,
+            "opened": 0,
+            "closed": 0,
+            "reversals": 0,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        
+        # ─── SEÑALES ───
+        signal.signal(signal.SIGINT, self._handle_shutdown)
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
 
-    def is_long(self) -> bool:
-        return self in {SignalType.LONG_BREAKOUT, SignalType.LONG_REVERSAL}
+    async def initialize(self) -> None:
+        """Inicializa el bot y muestra configuración."""
+        logger.info(
+            "\n" + "=" * 60 + "\n"
+            + " 🚀 ÚNICO STRATEGY v4.0 — M15 + M3\n"
+            + f" Modo: {self.mode.value}\n"
+            + f" Sandbox: {self.config['SANDBOX']}\n"
+            + f" Scanner: {'ON' if self.config['SCANNER_ENABLED'] else 'PAUSE'}\n"
+            + f" Watchlist: {len(self.config['WATCHLIST'])} símbolos\n"
+            + f" Timeframes: {self.config.get('TIMEFRAMES', ['15m', '3m'])}\n"
+            + f" Intervalo: {self.config['SCAN_INTERVAL']}s\n"
+            + f" Máximo posiciones: {self.config['MAX_POSITIONS']}\n"
+            + f" Posición: {self.config['POSITION_PCT']*100:.0f}% capital\n"
+            + f" SL: {self.config['SL_PCT']*100:.0f}% de posición\n"
+            + f" TP: {self.config['TP_MULTIPLE']}x riesgo\n"
+            + f" Cooldown: {self.config['COOLDOWN_MINUTES']}min\n"
+            + f" Límite diario: {self.config['MAX_ENTRIES_DAILY']}\n"
+            + "=" * 60
+        )
 
+        # ─── BALANCE INICIAL ───
+        if self.mode == BotMode.DRY_RUN:
+            logger.info("🔬 Modo DRY_RUN - Simulando balance de $10,000 USDT")
+            self.rm.set_initial_balance(10000.0)
+        else:
+            try:
+                balance = await self.api.fetch_balance()
+                self.rm.set_initial_balance(balance["total"])
+                logger.info(f"💰 Balance inicial: {balance['total']:.2f} USDT")
+            except Exception as e:
+                logger.error(f"❌ Error obteniendo balance: {e}")
+                raise
 
-@dataclass
-class Signal:
-    symbol: str
-    signal_type: SignalType
-    score: float
-    risk_reward: float
-    stop_loss: float
-    take_profit: float
-    entry_price: float
-    df: Optional[pd.DataFrame] = None
-    pattern_id: Optional[int] = None
-    timeframe: str = "15m"
+    async def run(self) -> None:
+        """Loop principal del bot."""
+        await self.initialize()
+        self.running = True
+        logger.info("✅ Bot iniciado. Loop principal corriendo...")
 
+        while self.running:
+            try:
+                await self._cycle()
+            except Exception as exc:
+                logger.exception(f"❌ Error en ciclo: {exc}")
+                await asyncio.sleep(5)
 
-MATCH_FIELDS = [
-    "ema21_vs_ema55",
-    "ema55_vs_ema144",
-    "ema144_vs_ema233",
-    "ema21_slope",
-    "ema144_slope",
-    "precio_vs_ema21",
-    "precio_vs_ema55",
-    "precio_vs_ema144",
-    "precio_vs_ema233",
-    "bb_estado",
-    "bb_precio",
-    "volumen",
-    "patron_vela",
-    "fib_zona",
-]
+        await self.shutdown()
 
+    async def _cycle(self) -> None:
+        """Ciclo principal de escaneo y monitoreo."""
+        self.stats["cycles"] += 1
 
-class MarketScanner:
-    def __init__(
-        self,
-        api_manager: BybitAPIManager,
-        watchlist: List[str],
-        scan_interval: float,
-        min_score: float,
-        min_rr: float,
-        position_pct: float,
-        db_path: str = "patterns.db",
-        signal_cooldown_seconds: int = 60,
-        timeframes: List[str] = None,
-    ):
-        self.api = api_manager
-        self.watchlist = watchlist
-        self.scan_interval = scan_interval
-        self.min_score = min_score
-        self.min_rr = min_rr
-        self.position_pct = position_pct
-        self.db_path = db_path
-        self.signal_cooldown_seconds = signal_cooldown_seconds
-        self.timeframes = timeframes or ["15m", "3m"]
-        self.patterns_by_tf = {}
-        self._signal_cooldown = {}
-        self._load_all_patterns()
-
-    def _normalize_symbol(self, symbol: str) -> str:
-        return re.sub(r"[^\w]", "", symbol).upper()
-
-    def _load_all_patterns(self) -> None:
-        if not os.path.exists(self.db_path):
-            logger.warning("[MarketScanner] No se encontró DB de patrones. Usando seed_patterns.")
-            for tf in self.timeframes:
-                self.patterns_by_tf[tf] = [p.copy() for p in seed_patterns.PATTERNS if p.get("timeframe") == tf]
+        # ── CAPITAL Y KILL SWITCH ──
+        capital = await self.rm.update_capital()
+        stopped, reason = self.rm.kill_switch.check(capital.total_balance)
+        if stopped:
+            logger.critical(f"🛑 Kill Switch activo: {reason}")
+            self.running = False
             return
 
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                for tf in self.timeframes:
-                    rows = conn.execute("""
-                        SELECT * FROM patterns
-                        WHERE timeframe = ? AND resultado != 'EVITAR'
-                    """, (tf,)).fetchall()
-                    self.patterns_by_tf[tf] = [dict(row) for row in rows]
-                    logger.info(f"[MarketScanner] Cargados {len(self.patterns_by_tf[tf])} patrones para {tf}")
-        except Exception as exc:
-            logger.warning(f"[MarketScanner] Error cargando patrones: {exc}. Usando seed_patterns.")
-            for tf in self.timeframes:
-                self.patterns_by_tf[tf] = [p.copy() for p in seed_patterns.PATTERNS if p.get("timeframe") == tf]
-
-    def _can_signal(self, symbol: str) -> bool:
-        now = time.time()
-        if symbol in self._signal_cooldown:
-            elapsed = now - self._signal_cooldown[symbol]
-            if elapsed < self.signal_cooldown_seconds:
-                return False
-        return True
-
-    async def scan_all(self) -> List[Signal]:
-        signals: List[Signal] = []
-        now = time.time()
-
-        for symbol in self.watchlist:
-            if symbol in self._signal_cooldown:
-                if now - self._signal_cooldown[symbol] < 300:
-                    continue
-
-            for timeframe in self.timeframes:
-                try:
-                    df = await self.api.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
-                    if df is None or len(df) < 40:
-                        continue
-
-                    behavior = self._describe_behavior(df)
-                    symbol_code = self._normalize_symbol(symbol)
-                    matches = self._match_patterns(symbol_code, behavior, timeframe)
-
-                    if not matches:
-                        continue
-
-                    best = max(matches, key=lambda item: (item["match_ratio"], item["pattern"].get("rb_real", 0.0)))
-                    signal = self._build_signal(symbol, df, behavior, best, timeframe)
-
-                    if signal and signal.score >= self.min_score:
-                        if self._can_signal(symbol):
-                            self._signal_cooldown[symbol] = now
-                            signals.append(signal)
-                            logger.debug(f"[MarketScanner] Señal {symbol} {timeframe} Score: {signal.score:.2f}")
-
-                except Exception as exc:
-                    logger.debug(f"[MarketScanner] Error en {symbol} {timeframe}: {exc}")
-
-        if not signals:
-            logger.info("[MarketScanner] Ninguna señal encontrada en este ciclo.")
+        # ── SCANNER ──
+        if self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
+            signals = await self.scanner.scan_all()
+            self.stats["signals"] += len(signals)
+            for signal in signals:
+                await self._process_signal(signal)
         else:
-            logger.info(f"[MarketScanner] {len(signals)} señales encontradas")
+            logger.warning("⏸️ Scanner en pausa o máximo de posiciones alcanzado.")
 
-        return signals
-
-    def _describe_behavior(self, df: pd.DataFrame) -> Dict[str, Any]:
-        df = df.copy()
-        df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
-        df["ema55"] = df["close"].ewm(span=55, adjust=False).mean()
-        df["ema144"] = df["close"].ewm(span=144, adjust=False).mean()
-        df["ema233"] = df["close"].ewm(span=233, adjust=False).mean()
-        df["bb_mid"] = df["close"].rolling(20).mean()
-        df["bb_std"] = df["close"].rolling(20).std()
-        df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
-        df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
-
-        current = df.iloc[-1]
-        prior = df.iloc[-2]
-
-        def slope_label(series: pd.Series) -> str:
-            delta = series.iloc[-1] - series.iloc[-4]
-            if abs(delta) / max(series.iloc[-1], 1e-6) < 0.002:
-                return "FLAT"
-            return "UP" if delta > 0 else "DOWN"
-
-        def position_label(price: float, target: float) -> str:
-            diff = price - target
-            pct = abs(diff / max(price, 1e-6))
-            if pct < 0.002:
-                return "TOUCHING"
-            if pct < 0.008:
-                return "NEAR"
-            return "ABOVE" if diff > 0 else "BELOW"
-
-        def ema_relation(fast: float, slow: float, prev_fast: float, prev_slow: float) -> str:
-            if fast > slow and prev_fast <= prev_slow:
-                return "CROSSING_UP"
-            if fast < slow and prev_fast >= prev_slow:
-                return "CROSSING_DOWN"
-            if abs(fast - slow) / max(slow, 1e-6) < 0.0015:
-                return "FLAT"
-            return "ABOVE" if fast > slow else "BELOW"
-
-        def fib_zone(close: float) -> str:
-            window = df.iloc[-40:-5]
-            if len(window) < 10:
-                return "N/A"
-            swing_high = float(window["high"].max())
-            swing_low = float(window["low"].min())
-            if swing_high <= swing_low or close <= swing_low:
-                return "N/A"
-            ratio = (close - swing_low) / max(swing_high - swing_low, 1e-6)
-            if ratio < 0.382:
-                return "0.0_0.382"
-            if ratio < 0.5:
-                return "0.382_0.500"
-            if ratio < 0.618:
-                return "0.500_0.618"
-            if ratio < 0.786:
-                return "0.618_0.786"
-            if ratio <= 1.0:
-                return "0.786_1.000"
-            return "1.000_PLUS"
-
-        # ✅ CORRECCIÓN APLICADA AQUÍ:
-        def bb_price_label(close: float, mid: float, lower: float, upper: float) -> str:
-            if close >= upper:
-                return "UPPER"
-            if close <= lower:
-                return "LOWER"
-            # Se eliminó la condición distance < 0.03 que devolvía "MID" erróneamente
-            if close >= mid:
-                return "MID_TO_UPPER"
-            # Si el precio está por debajo de la media, debe ser LOWER para detectar LONG_REVERSAL
-            return "LOWER"
-
-        def bb_state_label(mid: float, upper: float, lower: float, recent: pd.DataFrame) -> str:
-            width = (upper - lower) / max(mid, 1e-6)
-            previous_width = ((recent["bb_upper"] - recent["bb_lower"]) / recent["bb_mid"].replace(0, np.nan)).iloc[-5:-1].mean()
-            if width < 0.025:
-                return "MAX_SQUEEZE"
-            if width < 0.045:
-                return "SQUEEZE"
-            if width > 0.080:
-                return "EXPANDING"
-            return "CONTRACTING"
-
-        def volume_label(volume: float, average: float) -> str:
-            if volume >= average * 2.0:
-                return "HIGH"
-            if volume >= average * 1.2:
-                return "MEDIUM"
-            if volume < average * 0.35:
-                return "VERY_LOW"
-            return "LOW"
-
-        def candle_pattern(row: pd.Series) -> str:
-            body = abs(row["close"] - row["open"])
-            upper_wick = float(row["high"] - max(row["close"], row["open"]))
-            lower_wick = float(min(row["close"], row["open"]) - row["low"])
-            if body > 0 and row["close"] > row["open"] and body > upper_wick * 2:
-                return "STRONG_GREEN"
-            if body > 0 and row["close"] < row["open"] and body > lower_wick * 2:
-                return "STRONG_RED"
-            if upper_wick > body * 1.5 and row["close"] < row["open"]:
-                return "REJECTION"
-            if lower_wick > body * 1.5 and row["close"] > row["open"]:
-                return "HAMMER"
-            return "NEUTRAL"
-
-        volume_average = float(df["volume"].rolling(20).mean().iloc[-2] or 0.0)
-        price = float(current["close"])
-
-        return {
-            "ema21_vs_ema55": ema_relation(float(current["ema21"]), float(current["ema55"]),
-                                          float(prior["ema21"]), float(prior["ema55"])),
-            "ema55_vs_ema144": ema_relation(float(current["ema55"]), float(current["ema144"]),
-                                           float(prior["ema55"]), float(prior["ema144"])),
-            "ema144_vs_ema233": ema_relation(float(current["ema144"]), float(current["ema233"]),
-                                            float(prior["ema144"]), float(prior["ema233"])),
-            "ema21_slope": slope_label(df["ema21"]),
-            "ema144_slope": slope_label(df["ema144"]),
-            "precio_vs_ema21": position_label(price, float(current["ema21"])),
-            "precio_vs_ema55": position_label(price, float(current["ema55"])),
-            "precio_vs_ema144": position_label(price, float(current["ema144"])),
-            "precio_vs_ema233": position_label(price, float(current["ema233"])),
-            "bb_estado": bb_state_label(float(current["bb_mid"]), float(current["bb_upper"]),
-                                       float(current["bb_lower"]), df.iloc[-10:]),
-            "bb_precio": bb_price_label(price, float(current["bb_mid"]),
-                                       float(current["bb_lower"]), float(current["bb_upper"])),
-            "volumen": volume_label(float(current["volume"]), volume_average),
-            "patron_vela": candle_pattern(current),
-            "fib_zona": fib_zone(price),
-            "entry_price": price,
-        }
-
-    def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any], timeframe: str) -> List[Dict[str, Any]]:
-        matches = []
-        patterns = self.patterns_by_tf.get(timeframe, [])
-
-        for pattern in patterns:
-            if pattern.get("symbol") not in {symbol_code, "UNIVERSAL"}:
-                continue
-
-            if pattern.get("timeframe") != timeframe:
-                continue
-
-            score = 0
-            total = 0
-
-            for key in MATCH_FIELDS:
-                expected = pattern.get(key)
-                actual = behavior.get(key)
-                if expected is None or expected == "N/A":
+        # ── MONITOREO DE POSICIONES ──
+        if self.rm.positions:
+            dfs = {}
+            for symbol in list(self.rm.positions.keys()):
+                pos = self.rm.positions[symbol]
+                tf = getattr(pos, 'timeframe', '15m')
+                dfs[symbol] = await self.api.fetch_ohlcv(symbol, timeframe=tf, limit=100)
+            
+            closes = await self.rm.monitor_positions(dfs)
+            
+            for symbol, (should_close, reason, notes) in closes.items():
+                if not should_close:
                     continue
-                if actual is None:
+                    
+                pos = self.rm.positions.get(symbol)
+                if not pos:
+                    continue
+                    
+                close_side = "sell" if pos.side == "LONG" else "buy"
+                result = await self.executor.close_position(
+                    symbol=symbol,
+                    side=close_side,
+                    contracts=pos.contracts,
+                    current_price=pos.current_price,
+                    reason=reason,
+                )
+                if result is None:
                     continue
 
-                total += 1
-                if str(expected).upper() == str(actual).upper():
-                    score += 1
+                close_result = await self.rm.close_position(symbol, reason, pos.current_price)
+                self.stats["closed"] += 1
+                
+                if reason == CloseReason.REVERSE:
+                    self.stats["reversals"] += 1
+                    reverse_side = "sell" if pos.side == "LONG" else "buy"
+                    reverse_order = await self.executor.open_position(
+                        symbol=symbol,
+                        side=reverse_side,
+                        position_size=pos,
+                        stop_loss=pos.stop_loss,
+                        take_profit=pos.take_profit,
+                    )
+                    if reverse_order:
+                        self.rm.register_position(
+                            order_id=reverse_order["id"],
+                            position_size=pos,
+                            pattern_id=pos.pattern_id,
+                            signal_type=pos.signal_type,
+                            arrow_color=pos.arrow_color,
+                            score=pos.score,
+                        )
+                        logger.info(f"🔄 Reverso abierto {symbol} {reverse_side}")
 
-            if total == 0:
-                continue
+        # ── STATUS ──
+        self._log_status(capital)
+        await asyncio.sleep(self.config["SCAN_INTERVAL"])
 
-            match_ratio = score / total
-            if match_ratio >= 0.60:
-                matches.append({
-                    "pattern": pattern,
-                    "match_ratio": match_ratio,
-                    "score": score,
-                    "total": total,
-                })
-
-        return matches
-
-    def _build_signal(
-        self,
-        symbol: str,
-        df: pd.DataFrame,
-        behavior: Dict[str, Any],
-        matched: Dict[str, Any],
-        timeframe: str,
-    ) -> Optional[Signal]:
-        pattern = matched["pattern"]
-        signal_type_str = pattern["signal_type"]
-
-        if signal_type_str == "NO_SIGNAL":
-            return None
-
-        try:
-            signal_type = SignalType(signal_type_str)
-        except ValueError:
-            logger.warning(f"[MarketScanner] Tipo inválido '{signal_type_str}' para {symbol}")
-            return None
-
-        entry_price = float(behavior["entry_price"])
-        score = float(matched["match_ratio"])
-
-        return Signal(
-            symbol=symbol,
-            signal_type=signal_type,
-            score=score,
-            risk_reward=0.0,
-            stop_loss=0.0,
-            take_profit=0.0,
-            entry_price=entry_price,
-            df=df,
-            pattern_id=pattern.get("id"),
-            timeframe=timeframe,
+    async def _process_signal(self, signal: Signal) -> None:
+        """Procesa una señal detectada por el scanner."""
+        logger.info(
+            f"📊 Señal {signal.signal_type.value} {signal.symbol} | "
+            f"Score {signal.score:.2f} | Timeframe: {signal.timeframe}"
         )
+
+        position_size = await self.rm.evaluate_entry(
+            signal=signal,
+            df=signal.df,
+            sl_structural=signal.stop_loss,
+            tp_structural=signal.take_profit,
+        )
+        
+        if not position_size:
+            logger.warning(f"⏭️ Señal descartada por RiskManager: {signal.symbol}")
+            return
+
+        open_side = "buy" if signal.signal_type.is_long() else "sell"
+        order = await self.executor.open_position(
+            symbol=signal.symbol,
+            side=open_side,
+            position_size=position_size,
+            stop_loss=position_size.stop_loss,
+            take_profit=position_size.take_profit,
+            leverage=position_size.leverage,
+        )
+        
+        if not order:
+            logger.error(f"❌ Error abriendo posición en {signal.symbol}")
+            return
+
+        self.rm.register_position(
+            order_id=order["id"],
+            position_size=position_size,
+            pattern_id=signal.pattern_id,
+            signal_type=signal.signal_type.value,
+            arrow_color=None,
+            score=signal.score,
+        )
+        self.stats["opened"] += 1
+        logger.info(
+            f"✅ Posición abierta {signal.symbol} {open_side} {signal.timeframe} | "
+            f"SL: {position_size.stop_loss:.4f} TP: {position_size.take_profit:.4f}"
+        )
+
+    def _log_status(self, capital: Any) -> None:
+        """Log del estado actual."""
+        positions_info = []
+        for sym, pos in self.rm.positions.items():
+            positions_info.append(f"{sym}({pos.timeframe})")
+        
+        logger.info(
+            f"📊 Ciclo {self.stats['cycles']} | "
+            f"Balance: {capital.total_balance:.2f} USDT | "
+            f"Posiciones: {len(self.rm.positions)} {positions_info} | "
+            f"Señales: {self.stats['signals']} | "
+            f"Abiertas: {self.stats['opened']} | "
+            f"Cerradas: {self.stats['closed']}"
+        )
+
+    def _handle_shutdown(self, signum: int, frame: Any) -> None:
+        """Manejo de señales de cierre."""
+        logger.info(f"🛑 Señal {signum} recibida, cerrando...")
+        self.running = False
+
+    async def shutdown(self) -> None:
+        """Cierre limpio del bot."""
+        logger.info("🛑 Deteniendo bot...")
+        if self.api:
+            await self.api.close()
+        logger.info(
+            f"📊 Estadísticas finales: ciclos={self.stats['cycles']}, "
+            f"señales={self.stats['signals']}, abiertas={self.stats['opened']}, "
+            f"cerradas={self.stats['closed']}, reversos={self.stats['reversals']}"
+        )
+
+
+# ─────────────────────────────────────────────
+#  FUNCIONES AUXILIARES
+# ─────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="ÚNICO STRATEGY Bot")
+    parser.add_argument("--status", action="store_true", help="Muestra el estado del bot")
+    parser.add_argument("--init-db", action="store_true", help="Inicializa la base de datos de patrones")
+    parser.add_argument("--dry-run", action="store_true", help="Forzar modo DRY_RUN")
+    parser.add_argument("--live", action="store_true", help="Forzar modo LIVE")
+    return parser.parse_args()
+
+
+def mostrar_estado() -> None:
+    if not os.path.exists(CONFIG["DB_PATH"]):
+        print("\n⚠️  La base de datos de patrones no existe. Ejecuta --init-db.")
+        return
+    print("\n" + "=" * 60)
+    print("  🧠 ÚNICO STRATEGY v4.0 — M15 + M3")
+    print("=" * 60)
+    print(f"  Modo: {CONFIG['MODE']}")
+    print(f"  Sandbox: {CONFIG['SANDBOX']}")
+    print(f"  Watchlist: {len(CONFIG['WATCHLIST'])} símbolos")
+    print(f"  Timeframes: {CONFIG.get('TIMEFRAMES', ['15m', '3m'])}")
+    print(f"  DB: {CONFIG['DB_PATH']}")
+    print(f"  SL: {CONFIG['SL_PCT']*100:.0f}% de posición")
+    print(f"  TP: {CONFIG['TP_MULTIPLE']}x riesgo")
+    print("=" * 60)
+
+
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
+async def main() -> None:
+    args = parse_args()
+    
+    # ─── SOBREESCRIBIR MODO ───
+    if args.dry_run:
+        CONFIG["MODE"] = "DRY_RUN"
+    if args.live:
+        CONFIG["MODE"] = "LIVE"
+
+    # ─── INICIALIZAR DB ───
+    if args.init_db:
+        with sqlite3.connect(CONFIG['DB_PATH']) as conn:
+            seed_patterns.init_db(conn)
+            seed_patterns.insert_patterns(conn, seed_patterns.PATTERNS)
+            seed_patterns.print_summary(conn)
+        return
+
+    # ─── MOSTRAR ESTADO ───
+    if args.status:
+        mostrar_estado()
+        return
+
+    # ─── VALIDAR CREDENCIALES ───
+    if CONFIG["MODE"] == "LIVE":
+        if not CONFIG["API_KEY"] or not CONFIG["API_SECRET"]:
+            print("\n❌ ERROR: Faltan credenciales de Bybit")
+            print("   Asegúrate de configurar estas variables en Railway:")
+            print("   • BYBIT_API_KEY")
+            print("   • BYBIT_API_SECRET")
+            print("\n   También puedes usar el modo DRY_RUN para pruebas:")
+            print("   python main.py --dry-run\n")
+            sys.exit(1)
+
+    # ─── INICIAR BOT ───
+    bot = UnicoBot(CONFIG)
+    
+    try:
+        await bot.run()
+    except KeyboardInterrupt:
+        logger.info("⏹️ Interrupción manual.")
+    except Exception as exc:
+        logger.exception(f"💥 Error crítico: {exc}")
+    finally:
+        await bot.shutdown()
+
+
+if __name__ == "__main__":
+    print("""
+╔═══════════════════════════════════════════════════════════════╗
+║            🧠 ÚNICO STRATEGY v4.0 — M15 + M3               ║
+║         Futuros Perpetuos USDT-M — Bybit                    ║
+╠═══════════════════════════════════════════════════════════════╣
+║  TIMEFRAMES:                                                 ║
+║  📊 M15: SL 4% | TP 20% | Leverage 10x | R:R 5:1           ║
+║  ⚡ M3:  SL 4% | TP 20% | Leverage 10x | R:R 5:1           ║
+╠═══════════════════════════════════════════════════════════════╣
+║  COMANDOS:                                                   ║
+║  python main.py --init-db     → Inicializar base de datos   ║
+║  python main.py --status      → Ver estado del bot          ║
+║  python main.py --dry-run     → Modo simulación (seguro)    ║
+║  python main.py --live        → Modo real (¡cuidado!)       ║
+╠═══════════════════════════════════════════════════════════════╣
+║  🛡️  SL: 4% del capital  |  🚀 TP: 20% del capital         ║
+║  📊 Posición: 50%        |  ⏱️  Cooldown: 15min            ║
+║  🔒 Límite diario: 3     |  🧠 Aprendizaje: ACTIVADO       ║
+╚═══════════════════════════════════════════════════════════════╝
+""")
+    asyncio.run(main())
+    
