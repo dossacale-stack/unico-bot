@@ -42,7 +42,7 @@ CONFIG: Dict[str, Any] = {
     "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
     "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
     "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "15")),
-    "MAX_ENTRIES_DAILY": int(os.getenv("MAX_ENTRIES_DAILY", "3")),
+    "MAX_ENTRIES_DAILY": int(os.getenv("MAX_ENTRIES_DAILY", "999")),
     
     "LEARNING_ENABLED": os.getenv("LEARNING_ENABLED", "true").lower() == "true",
     
