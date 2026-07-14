@@ -53,8 +53,8 @@ class CircuitState(Enum):
 
 @dataclass
 class CircuitBreaker:
-    max_failures: int = 15  # ✅ CAMBIO: Aumentado de 5 a 15
-    recovery_timeout: float = 120.0
+    max_failures: int = 50       # ✅ CAMBIO: Antes 15, ahora 50 (mucho más tolerante)
+    recovery_timeout: float = 30.0  # ✅ CAMBIO: Antes 120, ahora 30 segundos
     state: CircuitState = CircuitState.CLOSED
     failure_count: int = 0
     last_failure_time: float = 0.0
@@ -135,8 +135,8 @@ class BybitAPIManager:
         sandbox: bool = True,
         dry_run: bool = False,
         cache_ttl_seconds: float = 60.0,
-        circuit_max_failures: int = 15,  # ✅ CAMBIO: Aumentado de 5 a 15
-        circuit_recovery_timeout: float = 120.0,
+        circuit_max_failures: int = 50,      # ✅ CAMBIO: Tolerancia máxima de 50 fallos
+        circuit_recovery_timeout: float = 30.0, # ✅ CAMBIO: Recuperación en 30 segundos
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -169,7 +169,8 @@ class BybitAPIManager:
         logger.info(
             f"[BybitAPIManager] Inicializado | "
             f"Modo: {'SANDBOX' if sandbox else 'LIVE'} | "
-            f"Circuit: {self.circuit.max_failures} fallos máx."
+            f"Circuit: {self.circuit.max_failures} fallos máx. | "
+            f"Recovery: {self.circuit.recovery_timeout}s"
         )
 
     def _init_exchange(self) -> ccxt.bybit:
@@ -282,7 +283,7 @@ class BybitAPIManager:
             if not self.dry_run:
                 opened = self.circuit.record_failure()
             if not opened:
-                await asyncio.sleep(30)
+                await asyncio.sleep(5) # Espera solo 5 segundos en errores de red antes de reintentar
             raise
 
         except ccxt.InvalidOrder as e:
