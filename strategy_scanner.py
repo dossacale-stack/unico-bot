@@ -217,7 +217,6 @@ class MarketScanner:
                 return "0.786_1.000"
             return "1.000_PLUS"
 
-        # ✅ CORRECCIÓN DE LAS BANDAS DE BOLLINGER
         def bb_price_label(close: float, mid: float, lower: float, upper: float) -> str:
             if close >= upper:
                 return "UPPER"
@@ -264,6 +263,15 @@ class MarketScanner:
         volume_average = float(df["volume"].rolling(20).mean().iloc[-2] or 0.0)
         price = float(current["close"])
 
+        # 🛡️ CÁLCULO DE LA VELA ANTERIOR (Para detectar rupturas masivas y evitar comprar en picos)
+        prev_candle = candle_pattern(prior)
+        prev_vol_ratio = float(prior["volume"]) / max(volume_average, 1e-9)
+        previous_breakout = "NO"
+        
+        # Si la vela anterior fue una vela verde fuerte y el volumen fue alto (más de 1.8 veces el promedio)
+        if prev_candle in ["STRONG_GREEN", "REJECTION", "GREEN"] and prev_vol_ratio >= 1.8:
+            previous_breakout = "YES"
+
         return {
             "ema21_vs_ema55": ema_relation(float(current["ema21"]), float(current["ema55"]),
                                           float(prior["ema21"]), float(prior["ema55"])),
@@ -285,17 +293,27 @@ class MarketScanner:
             "patron_vela": candle_pattern(current),
             "fib_zona": fib_zone(price),
             "entry_price": price,
+            "previous_breakout": previous_breakout, # ✅ Nueva bandera añadida
         }
 
     def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any], timeframe: str) -> List[Dict[str, Any]]:
         matches = []
         patterns = self.patterns_by_tf.get(timeframe, [])
 
+        # 🛡️ Obtener si la vela anterior fue un breakout
+        prev_breakout = behavior.get("previous_breakout", "NO")
+
         for pattern in patterns:
             if pattern.get("symbol") not in {symbol_code, "UNIVERSAL"}:
                 continue
 
             if pattern.get("timeframe") != timeframe:
+                continue
+
+            # ✅ FILTRO ANTI-PICO: Si la vela anterior fue un breakout masivo, 
+            # ignoramos los patrones LONG_BREAKOUT y LONG_REVERSAL para no comprar en el pico
+            signal_type = pattern.get("signal_type", "")
+            if prev_breakout == "YES" and signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"]:
                 continue
 
             score = 0
@@ -317,7 +335,7 @@ class MarketScanner:
                 continue
 
             match_ratio = score / total
-            if match_ratio >= 0.40:  # ✅ Bajado de 0.60 a 0.40 para ser menos estricto
+            if match_ratio >= 0.40:
                 matches.append({
                     "pattern": pattern,
                     "match_ratio": match_ratio,
@@ -361,4 +379,4 @@ class MarketScanner:
             df=df,
             pattern_id=pattern.get("id"),
             timeframe=timeframe,
-        )
+    )
