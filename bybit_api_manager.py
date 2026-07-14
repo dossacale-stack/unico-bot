@@ -53,8 +53,8 @@ class CircuitState(Enum):
 
 @dataclass
 class CircuitBreaker:
-    max_failures: int = 50       # ✅ CAMBIO: Antes 15, ahora 50 (mucho más tolerante)
-    recovery_timeout: float = 30.0  # ✅ CAMBIO: Antes 120, ahora 30 segundos
+    max_failures: int = 50       # ✅ Tolerancia máxima
+    recovery_timeout: float = 30.0  # ✅ Recuperación rápida
     state: CircuitState = CircuitState.CLOSED
     failure_count: int = 0
     last_failure_time: float = 0.0
@@ -135,8 +135,8 @@ class BybitAPIManager:
         sandbox: bool = True,
         dry_run: bool = False,
         cache_ttl_seconds: float = 60.0,
-        circuit_max_failures: int = 50,      # ✅ CAMBIO: Tolerancia máxima de 50 fallos
-        circuit_recovery_timeout: float = 30.0, # ✅ CAMBIO: Recuperación en 30 segundos
+        circuit_max_failures: int = 50,          # ✅ Cambiado a 50
+        circuit_recovery_timeout: float = 30.0,  # ✅ Cambiado a 30 segundos
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -283,7 +283,7 @@ class BybitAPIManager:
             if not self.dry_run:
                 opened = self.circuit.record_failure()
             if not opened:
-                await asyncio.sleep(5) # Espera solo 5 segundos en errores de red antes de reintentar
+                await asyncio.sleep(5)
             raise
 
         except ccxt.InvalidOrder as e:
@@ -486,6 +486,9 @@ class BybitAPIManager:
         await self.get_max_leverage(symbol)
         return symbol in self._st_assets
 
+    # ══════════════════════════════════════════════════════════
+    # ✅ SET LEVERAGE CORREGIDO (Maneja el error 110043)
+    # ══════════════════════════════════════════════════════════
     async def set_leverage(self, symbol: str, leverage: int) -> None:
         """Establece el apalancamiento para el símbolo."""
         try:
@@ -494,9 +497,17 @@ class BybitAPIManager:
                 endpoint_type="private",
             )
             logger.info(f"[Leverage] {symbol} apalancamiento ajustado a {leverage}x")
-        except Exception as e:
-            logger.error(f"[Leverage] Error al setear apalancamiento para {symbol}: {e}")
-            raise
+            
+        except ccxt.ExchangeError as e:
+            error_str = str(e)
+            # ✅ SOLUCIÓN: Detecta el error "leverage not modified" y lo trata como un éxito
+            if "retCode\":110043" in error_str or "leverage not modified" in error_str.lower():
+                logger.warning(f"[Leverage] {symbol} ya tenía el apalancamiento en {leverage}x. Error 110043 ignorado, continuando.")
+                # No lanzamos la excepción, permitimos que el bot siga con la orden
+            else:
+                # Si es cualquier otro error, sí lo lanzamos para que falle la operación
+                logger.error(f"[Leverage] Error al setear apalancamiento para {symbol}: {e}")
+                raise
 
     # ──────────────────────────────────────────
     #  COLOCAR ORDEN
@@ -524,131 +535,4 @@ class BybitAPIManager:
                 endpoint_type="private",
             )
             logger.info(
-                f"[Order] ✅ {side.upper()} {amount} {symbol} @ "
-                f"{'market' if not price else price} | ID: {order.get('id')}"
-            )
-            return order
-
-        except ccxt.InvalidOrder as e:
-            logger.warning(f"[InvalidOrder] Ajustando parámetros: {e}")
-            params.pop("stopLoss", None)
-            params.pop("takeProfit", None)
-            order = await self._safe_call(
-                lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
-                endpoint_type="private",
-            )
-            logger.warning(
-                f"[Order] ⚠️ Orden colocada SIN SL/TP por InvalidOrder. "
-                f"Requiere ajuste manual. ID: {order.get('id')}"
-            )
-            return order
-
-    async def cancel_order(self, order_id: str, symbol: str) -> Dict:
-        return await self._safe_call(
-            lambda: self.exchange.cancel_order(order_id, symbol),
-            endpoint_type="private",
-        )
-
-    # ──────────────────────────────────────────
-    #  WEBSOCKET
-    # ──────────────────────────────────────────
-    async def start_websocket(self, symbols: list, timeframe: str = "15m"):
-        self._ws_exchange = self._init_ws_exchange()
-        self._ws_running = True
-        self._ws_reconnect_attempts = 0
-        logger.info(f"[WebSocket] Iniciando stream para: {symbols}")
-        await self._ws_loop(symbols, timeframe)
-
-    async def _ws_loop(self, symbols: list, timeframe: str):
-        while self._ws_running:
-            try:
-                await self._ws_watch(symbols, timeframe)
-                self._ws_reconnect_attempts = 0
-
-            except (ccxt.NetworkError, asyncio.TimeoutError, ConnectionResetError) as e:
-                self._ws_reconnect_attempts += 1
-                if self._ws_reconnect_attempts > self._ws_max_reconnects:
-                    logger.critical(
-                        f"[WebSocket] Máximo de reconexiones alcanzado "
-                        f"({self._ws_max_reconnects}). Deteniendo stream."
-                    )
-                    self._ws_running = False
-                    break
-
-                delay = min(
-                    self._ws_base_delay ** self._ws_reconnect_attempts,
-                    120.0,
-                )
-                logger.warning(
-                    f"[WebSocket] Error de red: {e}. "
-                    f"Reconexión #{self._ws_reconnect_attempts} en {delay:.1f}s..."
-                )
-                await asyncio.sleep(delay)
-
-                try:
-                    await self._ws_exchange.close()
-                except Exception:
-                    pass
-                self._ws_exchange = self._init_ws_exchange()
-
-            except ccxt.AuthenticationError as e:
-                logger.critical(f"[WebSocket] Error de autenticación: {e}. Deteniendo.")
-                self._ws_running = False
-                break
-
-            except Exception as e:
-                logger.error(f"[WebSocket] Error inesperado: {e}")
-                await asyncio.sleep(5)
-
-    async def _ws_watch(self, symbols: list, timeframe: str):
-        tasks = [
-            self._ws_exchange.watch_ohlcv(symbol, timeframe)
-            for symbol in symbols
-        ]
-        while self._ws_running:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for symbol, result in zip(symbols, results):
-                if isinstance(result, Exception):
-                    raise result
-                if result:
-                    self._ws_data[symbol] = result
-                    df = self._format_ohlcv(result)
-                    self._ohlcv_cache[symbol].update(df)
-            tasks = [
-                self._ws_exchange.watch_ohlcv(symbol, timeframe)
-                for symbol in symbols
-            ]
-
-    def get_ws_data(self, symbol: str) -> Optional[pd.DataFrame]:
-        cache = self._ohlcv_cache.get(symbol)
-        return cache.data if cache and cache.is_valid else None
-
-    async def stop_websocket(self):
-        self._ws_running = False
-        if self._ws_exchange:
-            await self._ws_exchange.close()
-            logger.info("[WebSocket] Stream cerrado.")
-
-    def get_status(self) -> Dict:
-        return {
-            "circuit_state":      self.circuit.state.value,
-            "circuit_failures":   self.circuit.failure_count,
-            "ws_running":         self._ws_running,
-            "ws_reconnects":      self._ws_reconnect_attempts,
-            "cached_symbols":     [s for s, c in self._ohlcv_cache.items() if c.is_valid],
-            "rate_public_used":   len(self._RATE_LIMITS["public"].timestamps),
-            "rate_private_used":  len(self._RATE_LIMITS["private"].timestamps),
-            "sandbox_mode":       self.sandbox,
-            "st_assets":          list(self._st_assets),
-        }
-
-    async def close(self):
-        await self.stop_websocket()
-        if hasattr(self.exchange, "close"):
-            try:
-                result = self.exchange.close()
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception as e:
-                logger.warning(f"[BybitAPIManager] Error cerrando exchange: {e}")
-        logger.info("[BybitAPIManager] Conexiones cerradas.")
+                f"[Order] ✅ {side.upper()} {amount} {symbol} @ 
