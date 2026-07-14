@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from bybit_api_manager import BybitAPIManager
-from strategy_scanner import MarketScanner, Signal  # ✅ CAMBIO AQUÍ
+from strategy_scanner import MarketScanner, Signal
 from order_executor import OrderExecutor
 from risk_manager import BotMode, CloseReason, RiskManager
 import seed_patterns
@@ -49,18 +49,14 @@ CONFIG: Dict[str, Any] = {
     "DB_PATH": os.getenv("DB_PATH", "patterns.db"),
     "CAPITAL_FILE": os.getenv("CAPITAL_FILE", "capital_inicial.json"),
     
+    # ✅ WATCHLIST EXCLUSIVA (ACTIVOS DE LAS IMÁGENES - SIN BTC NI GRANDES CAPS)
     "WATCHLIST": [
-        "# ─── WATCHLIST (ACTUALIZADA CON ACTIVOS DE LAS NUEVAS IMÁGENES) ───
-"WATCHLIST": [
-    
-    "EVAASUSDT", "LABUSDT", "B3USDT", "SXTUSDT", 
-    "SKHYNIXUSDT", "SKHYUSDT", "AXTIUSDT", "LITUSDT", 
-    "KAITOUSDT", "HEIUSDT", "BLESSUSDT", "USUSDT", 
-    "CUSDT", "GRASSUSDT", "NAORISUSDT", 
-    "TRIAUSDT", "TACUSDT", "WOOUSDT", "AAOIUSDT", 
-    "BOTUSDT", "TOWNSUSDT", "EGLDUSDT", "CRWDUSDT", "BMNRUSDT",
-    
-],",
+        "EVAASUSDT", "LABUSDT", "B3USDT", "SXTUSDT", 
+        "SKHYNIXUSDT", "SKHYUSDT", "AXTIUSDT", "LITUSDT", 
+        "KAITOUSDT", "HEIUSDT", "BLESSUSDT", "USUSDT", 
+        "CUSDT", "GRASSUSDT", "NAORISUSDT", 
+        "TRIAUSDT", "TACUSDT", "WOOUSDT", "AAOIUSDT", 
+        "BOTUSDT", "TOWNSUSDT", "EGLDUSDT", "CRWDUSDT", "BMNRUSDT"
     ],
 }
 
@@ -396,7 +392,7 @@ if __name__ == "__main__":
 ╠═══════════════════════════════════════════════════════════════╣
 ║  🛡️  SL: 4% del capital  |  🚀 TP: 20% del capital         ║
 ║  📊 Posición: 50%        |  ⏱️  Cooldown: 15min            ║
-║  🔒 Límite diario: 3     |  🧠 Aprendizaje: ACTIVADO       ║
+║  🔒 Límite diario: 999   |  🧠 Aprendizaje: ACTIVADO       ║
 ╚═══════════════════════════════════════════════════════════════╝
 """)
     asyncio.run(main())
