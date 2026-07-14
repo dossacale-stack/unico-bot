@@ -53,7 +53,7 @@ class CircuitState(Enum):
 
 @dataclass
 class CircuitBreaker:
-    max_failures: int = 5
+    max_failures: int = 15  # ✅ CAMBIO: Aumentado de 5 a 15
     recovery_timeout: float = 120.0
     state: CircuitState = CircuitState.CLOSED
     failure_count: int = 0
@@ -135,7 +135,7 @@ class BybitAPIManager:
         sandbox: bool = True,
         dry_run: bool = False,
         cache_ttl_seconds: float = 60.0,
-        circuit_max_failures: int = 5,
+        circuit_max_failures: int = 15,  # ✅ CAMBIO: Aumentado de 5 a 15
         circuit_recovery_timeout: float = 120.0,
     ):
         self.api_key = api_key
