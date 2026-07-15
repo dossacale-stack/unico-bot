@@ -34,15 +34,14 @@ CONFIG: Dict[str, Any] = {
     "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.60")),
     "MIN_RR": float(os.getenv("MIN_RR", "3.0")),
     
-    # ✅ CAMBIO CLAVE: ELIMINADO EL 3m. AHORA SOLO OPERA EN 15m.
-    "TIMEFRAMES": ["15m"], 
+    "TIMEFRAMES": ["15m"],
     
-    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "2")),
+    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "1")),       # ✅ CAMBIO: Bajado de 2 a 1 (solo 1 operación a la vez)
     "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.30")),
-    "SL_PCT": float(os.getenv("SL_PCT", "0.40")),
+    "SL_PCT": float(os.getenv("SL_PCT", "0.60")),                 # ✅ CAMBIO: Aumentado de 0.40 a 0.60 (SL más amplio)
     "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
     "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
-    "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "15")),
+    "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "60")), # ✅ CAMBIO: Aumentado de 15 a 60 (1 hora de cooldown por símbolo)
     "MAX_ENTRIES_DAILY": int(os.getenv("MAX_ENTRIES_DAILY", "999")),
     
     "LEARNING_ENABLED": os.getenv("LEARNING_ENABLED", "true").lower() == "true",
@@ -52,7 +51,7 @@ CONFIG: Dict[str, Any] = {
     
     # ✅ WATCHLIST EXCLUSIVA
     "WATCHLIST": [
-        "EVAASUSDT", "B3USDT", "SXTUSDT", 
+        "EVAASUSDT", "LABUSDT", "B3USDT", "SXTUSDT", 
         "SKHYNIXUSDT", "SKHYUSDT", "AXTIUSDT", "LITUSDT", 
         "KAITOUSDT", "HEIUSDT", "BLESSUSDT", "USUSDT", 
         "CUSDT", "GRASSUSDT", "NAORISUSDT", 
@@ -83,10 +82,10 @@ class UnicoBot:
             db_path=config["DB_PATH"],
             max_positions=config["MAX_POSITIONS"],
             position_pct=config.get("POSITION_PCT", 0.30),
-            sl_pct=config.get("SL_PCT", 0.40),
+            sl_pct=config.get("SL_PCT", 0.60),
             tp_multiple=config.get("TP_MULTIPLE", 5.0),
             leverage=config.get("LEVERAGE", 10),
-            cooldown_minutes=config.get("COOLDOWN_MINUTES", 15),
+            cooldown_minutes=config.get("COOLDOWN_MINUTES", 60),
             max_entries_daily=config.get("MAX_ENTRIES_DAILY", 999),
         )
         
@@ -99,7 +98,7 @@ class UnicoBot:
             position_pct=config["POSITION_PCT"],
             db_path=config["DB_PATH"],
             signal_cooldown_seconds=60,
-            timeframes=config.get("TIMEFRAMES", ["15m"]), # Ahora solo 15m
+            timeframes=config.get("TIMEFRAMES", ["15m"]),
         )
         
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
@@ -171,6 +170,7 @@ class UnicoBot:
             self.running = False
             return
 
+        # Protección de saldo disponible
         min_available_to_trade = capital.total_balance * 0.15
         if capital.available < min_available_to_trade:
             logger.warning(f"⏸️ Saldo disponible muy bajo ({capital.available:.2f} USDT). Esperando liberación de capital...")
@@ -392,7 +392,7 @@ if __name__ == "__main__":
 ║         Futuros Perpetuos USDT-M — Bybit                    ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  TIMEFRAMES:                                                 ║
-║  📊 M15: SL 4% | TP 20% | Leverage 10x | R:R 5:1           ║
+║  📊 M15: SL 6% | TP 20% | Leverage 10x | R:R 5:1           ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  COMANDOS:                                                   ║
 ║  python main.py --init-db     → Inicializar base de datos   ║
@@ -400,8 +400,8 @@ if __name__ == "__main__":
 ║  python main.py --dry-run     → Modo simulación (seguro)    ║
 ║  python main.py --live        → Modo real (¡cuidado!)       ║
 ╠═══════════════════════════════════════════════════════════════╣
-║  🛡️  SL: 4% del capital  |  🚀 TP: 20% del capital         ║
-║  📊 Posición: 30%        |  ⏱️  Cooldown: 15min            ║
+║  🛡️  SL: 6% del capital  |  🚀 TP: 20% del capital         ║
+║  📊 Posición: 30%        |  ⏱️  Cooldown: 60min            ║
 ║  🔒 Límite diario: 999   |  🧠 Aprendizaje: ACTIVADO       ║
 ╚═══════════════════════════════════════════════════════════════╝
 """)
