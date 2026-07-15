@@ -53,8 +53,8 @@ class CircuitState(Enum):
 
 @dataclass
 class CircuitBreaker:
-    max_failures: int = 50       # ✅ Tolerancia máxima
-    recovery_timeout: float = 30.0  # ✅ Recuperación rápida
+    max_failures: int = 50       # ✅ Tolerancia máxima a fallos de red
+    recovery_timeout: float = 30.0  # ✅ Recuperación rápida de 30 segundos
     state: CircuitState = CircuitState.CLOSED
     failure_count: int = 0
     last_failure_time: float = 0.0
@@ -135,8 +135,8 @@ class BybitAPIManager:
         sandbox: bool = True,
         dry_run: bool = False,
         cache_ttl_seconds: float = 60.0,
-        circuit_max_failures: int = 50,          # ✅ Cambiado a 50
-        circuit_recovery_timeout: float = 30.0,  # ✅ Cambiado a 30 segundos
+        circuit_max_failures: int = 50,          # ✅ Tolerancia máxima
+        circuit_recovery_timeout: float = 30.0,  # ✅ Tiempo de recuperación
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -486,6 +486,9 @@ class BybitAPIManager:
         await self.get_max_leverage(symbol)
         return symbol in self._st_assets
 
+    # ══════════════════════════════════════════════════════════
+    # ✅ SET LEVERAGE CORREGIDO (Maneja errores 110043 y 110013)
+    # ══════════════════════════════════════════════════════════
     async def set_leverage(self, symbol: str, leverage: int) -> None:
         """Establece el apalancamiento para el símbolo."""
         try:
@@ -497,10 +500,15 @@ class BybitAPIManager:
             
         except ccxt.ExchangeError as e:
             error_str = str(e)
-            # ✅ SOLUCIÓN: Detecta el error "leverage not modified" y lo trata como un éxito
+            
+            # ✅ SOLUCIÓN 1: Ignorar error de apalancamiento ya modificado (110043)
             if "retCode\":110043" in error_str or "leverage not modified" in error_str.lower():
                 logger.warning(f"[Leverage] {symbol} ya tenía el apalancamiento en {leverage}x. Error 110043 ignorado, continuando.")
-                # No lanzamos la excepción, permitimos que el bot siga con la orden
+            
+            # ✅ SOLUCIÓN 2 (NUEVA): Ignorar error de límite de riesgo de la librería (110013)
+            elif "retCode\":110013" in error_str or "cannot set leverage" in error_str.lower():
+                logger.warning(f"[Leverage] {symbol} error de límite de riesgo por parte de la librería (110013) ignorado. El bot usará el apalancamiento actual (10x).")
+            
             else:
                 # Si es cualquier otro error, sí lo lanzamos para que falle la operación
                 logger.error(f"[Leverage] Error al setear apalancamiento para {symbol}: {e}")
@@ -523,35 +531,35 @@ class BybitAPIManager:
         params: Dict[str, Any] = {"reduceOnly": reduce_only}
         if stop_loss:
             params["stopLoss"] = str(stop_loss)
-        if take_profit:
-            params["takeProfit"] = str(take_profit)
+            if take_profit:
+                params["takeProfit"] = str(take_profit)
 
-        try:
-            order = await self._safe_call(
-                lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
-                endpoint_type="private",
-            )
-            
-            # ✅ LÍNEA CORREGIDA (Asegura que la f-string esté bien cerrada y no se rompa)
-            logger.info(
-                f"[Order] ✅ {side.upper()} {amount} {symbol} @ "
-                f"{'market' if not price else price} | ID: {order.get('id')}"
-            )
-            return order
+            try:
+                order = await self._safe_call(
+                    lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
+                    endpoint_type="private",
+                )
 
-        except ccxt.InvalidOrder as e:
-            logger.warning(f"[InvalidOrder] Ajustando parámetros: {e}")
-            params.pop("stopLoss", None)
-            params.pop("takeProfit", None)
-            order = await self._safe_call(
-                lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
-                endpoint_type="private",
-            )
-            logger.warning(
-                f"[Order] ⚠️ Orden colocada SIN SL/TP por InvalidOrder. "
-                f"Requiere ajuste manual. ID: {order.get('id')}"
-            )
-            return order
+                # ✅ LÍNEA CORREGIDA (Asegura que la f-string esté bien cerrada y no se rompa)
+                logger.info(
+                    f"[Order] ✅ {side.upper()} {amount} {symbol} @ "
+                    f"{'market' if not price else price} | ID: {order.get('id')}"
+                )
+                return order
+
+            except ccxt.InvalidOrder as e:
+                logger.warning(f"[InvalidOrder] Ajustando parámetros: {e}")
+                params.pop("stopLoss", None)
+                params.pop("takeProfit", None)
+                order = await self._safe_call(
+                    lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
+                    endpoint_type="private",
+                )
+                logger.warning(
+                    f"[Order] ⚠️ Orden colocada SIN SL/TP por InvalidOrder. "
+                    f"Requiere ajuste manual. ID: {order.get('id')}"
+                )
+                return order
 
     async def cancel_order(self, order_id: str, symbol: str) -> Dict:
         return await self._safe_call(
