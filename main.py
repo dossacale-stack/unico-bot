@@ -37,7 +37,7 @@ CONFIG: Dict[str, Any] = {
     "TIMEFRAMES": ["15m", "3m"],
     
     "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "3")),
-    "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.50")),
+    "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.30")),
     "SL_PCT": float(os.getenv("SL_PCT", "0.40")),
     "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
     "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
@@ -81,12 +81,12 @@ class UnicoBot:
             mode=self.mode,
             db_path=config["DB_PATH"],
             max_positions=config["MAX_POSITIONS"],
-            position_pct=config.get("POSITION_PCT", 0.50),
+            position_pct=config.get("POSITION_PCT", 0.30),
             sl_pct=config.get("SL_PCT", 0.40),
             tp_multiple=config.get("TP_MULTIPLE", 5.0),
             leverage=config.get("LEVERAGE", 10),
             cooldown_minutes=config.get("COOLDOWN_MINUTES", 15),
-            max_entries_daily=config.get("MAX_ENTRIES_DAILY", 3),
+            max_entries_daily=config.get("MAX_ENTRIES_DAILY", 999),
         )
         
         self.scanner = MarketScanner(
@@ -173,8 +173,20 @@ class UnicoBot:
         if self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
             signals = await self.scanner.scan_all()
             self.stats["signals"] += len(signals)
-            for signal in signals:
-                await self._process_signal(signal)
+            
+            # ✅ CAMBIO CLAVE PARA PRIORIZAR LAS MEJORES SEÑALES:
+            if signals:
+                # 1. Ordenar todas las señales de mayor a menor puntuación (Score)
+                signals.sort(key=lambda s: s.score, reverse=True)
+                
+                # 2. Calcular cuántas posiciones libres quedan
+                available_slots = self.config["MAX_POSITIONS"] - len(self.rm.positions)
+                
+                # 3. Procesar solo las mejores señales según el cupo disponible
+                signals_to_process = signals[:available_slots]
+                
+                for signal in signals_to_process:
+                    await self._process_signal(signal)
         else:
             logger.warning("⏸️ Scanner en pausa o máximo de posiciones alcanzado.")
 
@@ -391,7 +403,7 @@ if __name__ == "__main__":
 ║  python main.py --live        → Modo real (¡cuidado!)       ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  🛡️  SL: 4% del capital  |  🚀 TP: 20% del capital         ║
-║  📊 Posición: 50%        |  ⏱️  Cooldown: 15min            ║
+║  📊 Posición: 30%        |  ⏱️  Cooldown: 15min            ║
 ║  🔒 Límite diario: 999   |  🧠 Aprendizaje: ACTIVADO       ║
 ╚═══════════════════════════════════════════════════════════════╝
 """)
