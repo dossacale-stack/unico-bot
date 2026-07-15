@@ -1,735 +1,685 @@
 """
-RiskManager — Gestión de Riesgo UNIFICADA (M15 + M3)
-=========================================================
-- SL: 4% del capital (40% de la posición)
-- TP: 20% del capital (5x SL)
-- Leverage: 10x
-- R:R: 5:1
-- TODOS los valores en USDT
+BybitAPIManager - Módulo API Profesional para Bot de Futuros Perpetuos
+======================================================================
+Mejoras implementadas:
+  1. WebSocket con handler propio + reconnect backoff exponencial
+  2. Rate Limiter diferenciado por endpoint (público vs privado)
+  3. Circuit Breaker con contador máximo de reintentos
+  4. InvalidOrder como sub-error separado con lógica propia
+  5. Caché en memoria con TTL por símbolo para DataFrames M15
+  6. Ajuste de apalancamiento (set_leverage)
+  7. Detección automática de apalancamiento máximo por símbolo
+  8. Detección de activos ST (Special Treatment)
 """
 
+import ccxt
+try:
+    import ccxt.pro as ccxtpro
+except ImportError:
+    ccxtpro = None
 import asyncio
-import logging
-import sqlite3
-import time
-import json
 import os
-from datetime import datetime, timezone, time as dtime
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Tuple
-from enum import Enum
-from collections import defaultdict
-
+import time
+import logging
+import hashlib
+import hmac
 import pandas as pd
 import numpy as np
+from datetime import datetime, timezone
+from typing import Optional, Dict, Tuple, Any, List
+from collections import defaultdict
+from dataclasses import dataclass, field
+from enum import Enum
 
-logger = logging.getLogger("RiskManager")
-
-
-class PositionSide(Enum):
-    LONG = "LONG"
-    SHORT = "SHORT"
-    NONE = "NONE"
-
-
-class CloseReason(Enum):
-    STOP_LOSS = "SL"
-    TAKE_PROFIT = "TP"
-    STRUCTURE_BREAK = "STRUCTURE"
-    REVERSE = "REVERSE"
-    KILL_SWITCH = "KILL_SWITCH"
-    MANUAL = "MANUAL"
+# ─────────────────────────────────────────────
+#  LOGGING
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("BybitAPIManager")
 
 
-class BotMode(Enum):
-    DRY_RUN = "DRY_RUN"
-    LIVE = "LIVE"
-    BACKTEST = "BACKTEST"
-
-
-@dataclass
-class CapitalState:
-    total_balance: float = 0.0
-    available: float = 0.0
-    day_start_balance: float = 0.0
-    day_pnl: float = 0.0
-    day_pnl_pct: float = 0.0
-    open_positions: int = 0
-    kill_switch_active: bool = False
-    kill_switch_until: str = ""
+# ─────────────────────────────────────────────
+#  ENUMS Y DATACLASSES
+# ─────────────────────────────────────────────
+class CircuitState(Enum):
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
 
 
 @dataclass
-class PositionSize:
-    symbol: str
-    side: PositionSide
-    position_usd: float
-    risk_usd: float
-    entry_price: float
-    stop_loss: float
-    take_profit: float
-    contracts: float
-    leverage: int
-    sl_distance_pct: float
-    max_loss_usd: float
-    is_st_asset: bool = False
-    timeframe: str = "15m"
+class CircuitBreaker:
+    max_failures: int = 50
+    recovery_timeout: float = 30.0
+    state: CircuitState = CircuitState.CLOSED
+    failure_count: int = 0
+    last_failure_time: float = 0.0
+
+    def record_success(self):
+        self.failure_count = 0
+        self.state = CircuitState.CLOSED
+
+    def record_failure(self) -> bool:
+        self.failure_count += 1
+        self.last_failure_time = time.monotonic()
+        if self.failure_count >= self.max_failures:
+            self.state = CircuitState.OPEN
+            logger.critical(
+                f"[CircuitBreaker] ABIERTO tras {self.failure_count} fallos consecutivos. "
+                f"Bot pausado {self.recovery_timeout}s."
+            )
+            return True
+        return False
+
+    def can_attempt(self) -> bool:
+        if self.state == CircuitState.CLOSED:
+            return True
+        if self.state == CircuitState.OPEN:
+            elapsed = time.monotonic() - self.last_failure_time
+            if elapsed >= self.recovery_timeout:
+                self.state = CircuitState.HALF_OPEN
+                logger.warning("[CircuitBreaker] Estado HALF_OPEN: probando reconexión.")
+                return True
+            return False
+        return True
 
 
 @dataclass
-class OpenPosition:
-    id: str
-    symbol: str
-    side: PositionSide
-    entry_price: float
-    current_price: float
-    stop_loss: float
-    take_profit: float
-    contracts: float
-    leverage: int
-    position_usd: float
-    risk_usd: float
-    pattern_id: Optional[int] = None
-    timeframe: str = "15m"
-    open_time: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    unrealized_pnl: float = 0.0
-    unrealized_pnl_pct: float = 0.0
-    highest_price: float = 0.0
-    lowest_price: float = 0.0
-    is_st_asset: bool = False
-    score: float = 0.0
-    signal_type: Optional[str] = None
-    arrow_color: Optional[str] = None
+class RateLimiterSlot:
+    max_requests: int
+    window_seconds: float
+    timestamps: list = field(default_factory=list)
+
+    def acquire(self) -> float:
+        now = time.monotonic()
+        self.timestamps = [t for t in self.timestamps if now - t < self.window_seconds]
+        if len(self.timestamps) >= self.max_requests:
+            wait = self.window_seconds - (now - self.timestamps[0])
+            return max(wait, 0.0)
+        self.timestamps.append(now)
+        return 0.0
 
 
-class KillSwitch:
-    DAILY_DRAWDOWN_LIMIT = 25.0
-    WEEKLY_DRAWDOWN_LIMIT = 30.0
+@dataclass
+class OHLCVCache:
+    data: Optional[pd.DataFrame] = None
+    timestamp: float = 0.0
+    ttl_seconds: float = 60.0
 
-    def __init__(self):
-        self.active = False
-        self.reason = ""
-        self.day_start_balance = 0.0
-        self.week_start_balance = 0.0
-        self._reset_time: Optional[datetime] = None
+    @property
+    def is_valid(self) -> bool:
+        return self.data is not None and (time.monotonic() - self.timestamp) < self.ttl_seconds
 
-    def set_day_start(self, balance: float):
-        self.day_start_balance = balance
-        now = datetime.now(timezone.utc)
-        if now.weekday() == 0:
-            self.week_start_balance = balance
-        elif self.week_start_balance == 0:
-            self.week_start_balance = balance
-
-    def check(self, current_balance: float) -> Tuple[bool, str]:
-        if self.active and self._reset_time:
-            now = datetime.now(timezone.utc)
-            if now >= self._reset_time:
-                self.active = False
-                self.reason = ""
-                logger.info("[KillSwitch] Reset automático a las 00:00 UTC.")
-
-        if self.active:
-            return True, self.reason
-
-        if self.day_start_balance > 0:
-            daily_dd = ((self.day_start_balance - current_balance) / self.day_start_balance * 100)
-            if daily_dd >= self.DAILY_DRAWDOWN_LIMIT:
-                self._activate(f"Drawdown diario {daily_dd:.1f}% >= {self.DAILY_DRAWDOWN_LIMIT}%")
-                return True, self.reason
-
-        if self.week_start_balance > 0:
-            weekly_dd = ((self.week_start_balance - current_balance) / self.week_start_balance * 100)
-            if weekly_dd >= self.WEEKLY_DRAWDOWN_LIMIT:
-                self._activate(f"Drawdown semanal {weekly_dd:.1f}% >= {self.WEEKLY_DRAWDOWN_LIMIT}%", days=2)
-                return True, self.reason
-
-        return False, ""
-
-    def _activate(self, reason: str, days: int = 0):
-        self.active = True
-        self.reason = reason
-        now = datetime.now(timezone.utc)
-
-        if days > 0:
-            from datetime import timedelta
-            self._reset_time = now + timedelta(days=days)
-        else:
-            from datetime import timedelta
-            self._reset_time = datetime.combine(now.date() + timedelta(days=1), dtime(0, 0, 0), tzinfo=timezone.utc)
-
-        logger.critical(f"[KillSwitch] 🛑 ACTIVADO: {reason} | Reset: {self._reset_time.isoformat()}")
+    def update(self, df: pd.DataFrame):
+        self.data = df
+        self.timestamp = time.monotonic()
 
 
-class PositionCalculator:
-    POSITION_PCT = 0.30
-    SL_MAX_PCT = 0.40
-    TP_MULTIPLE = 5.0
-    LEVERAGE = 10
-    ST_REDUCTION = 0.50
-
-    TIMEFRAME_CONFIG = {
-        "15m": {
-            "position_pct": 0.30,
-            "sl_pct": 0.40,
-            "tp_multiple": 5.0,
-            "leverage": 10,
-        },
-        "3m": {
-            "position_pct": 0.30,
-            "sl_pct": 0.40,
-            "tp_multiple": 5.0,
-            "leverage": 10,
-        },
+# ─────────────────────────────────────────────
+#  BYBIT API MANAGER PRINCIPAL
+# ─────────────────────────────────────────────
+class BybitAPIManager:
+    _RATE_LIMITS = {
+        "public":  RateLimiterSlot(max_requests=100, window_seconds=5.0),
+        "private": RateLimiterSlot(max_requests=8,   window_seconds=1.0),
     }
 
-    @classmethod
-    def get_config(cls, timeframe: str):
-        return cls.TIMEFRAME_CONFIG.get(timeframe, cls.TIMEFRAME_CONFIG["15m"])
-
-    @classmethod
-    def calculate(
-        cls,
-        symbol: str,
-        side: PositionSide,
-        entry_price: float,
-        sl_structural: float,
-        tp_structural: float,
-        balance: float,
-        leverage: Optional[int] = None,
-        max_leverage: Optional[int] = None,
-        is_st_asset: bool = False,
-        timeframe: str = "15m",
-    ) -> PositionSize:
-        config = cls.get_config(timeframe)
-
-        position_pct = config["position_pct"]
-        sl_pct = config["sl_pct"]
-        tp_multiple = config["tp_multiple"]
-        leverage = leverage or config["leverage"]
-
-        if is_st_asset:
-            position_pct = position_pct * cls.ST_REDUCTION
-            logger.warning(f"[PositionCalc] {symbol} es ST, posición reducida")
-
-        if max_leverage and leverage > max_leverage:
-            logger.warning(f"[PositionCalc] Leverage {leverage}x > {max_leverage}x, usando {max_leverage}x")
-            leverage = max_leverage
-
-        position_usd = balance * position_pct
-        max_loss_usd = position_usd * sl_pct
-        sl_distance_pct = sl_pct / leverage
-
-        if side == PositionSide.LONG:
-            stop_loss = entry_price * (1 - sl_distance_pct)
-            take_profit = entry_price * (1 + sl_pct * tp_multiple / leverage)
-        else:
-            stop_loss = entry_price * (1 + sl_distance_pct)
-            take_profit = entry_price * (1 - sl_pct * tp_multiple / leverage)
-
-        contracts = (position_usd * leverage) / entry_price
-        risk_usd = position_usd * sl_distance_pct
-
-        logger.info(
-            f"[PositionCalc] {symbol} {side.value} {timeframe} | "
-            f"Posición: {position_usd:.2f} USDT | Riesgo: {risk_usd:.2f} USDT | "
-            f"SL: {stop_loss:.4f} ({sl_distance_pct*100:.1f}%) | "
-            f"TP: {take_profit:.4f} ({sl_pct*tp_multiple/leverage*100:.1f}%) | "
-            f"Leverage: {leverage}x | R:R: {tp_multiple:.1f}:1"
-        )
-
-        return PositionSize(
-            symbol=symbol,
-            side=side,
-            position_usd=round(position_usd, 2),
-            risk_usd=round(risk_usd, 2),
-            entry_price=entry_price,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            contracts=round(contracts, 4),
-            leverage=leverage,
-            sl_distance_pct=round(sl_distance_pct * 100, 3),
-            max_loss_usd=round(max_loss_usd, 2),
-            is_st_asset=is_st_asset,
-            timeframe=timeframe,
-        )
-
-    @staticmethod
-    def _prepare_structural_df(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
-        df["ema55"] = df["close"].ewm(span=55, adjust=False).mean()
-        df["ema144"] = df["close"].ewm(span=144, adjust=False).mean()
-        df["ema233"] = df["close"].ewm(span=233, adjust=False).mean()
-        df["bb_mid"] = df["close"].rolling(20).mean()
-        df["bb_std"] = df["close"].rolling(20).std()
-        df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
-        df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
-        df["vol_avg"] = df["volume"].rolling(20).mean()
-        df["vol_ratio"] = df["volume"] / df["vol_avg"].replace(0, 1e-9)
-        return df.dropna()
-
-
-class StructureExitEngine:
-    TRIPLE_LOOKBACK = 20
-
-    @classmethod
-    def evaluate_exit(cls, position: OpenPosition, df: pd.DataFrame, df_1h: Optional[pd.DataFrame] = None) -> Tuple[bool, CloseReason, str]:
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        ema21 = float(last["ema21"])
-        ema55 = float(last["ema55"])
-        ema21_prev = float(prev["ema21"])
-        ema55_prev = float(prev["ema55"])
-
-        if df_1h is not None and not df_1h.empty:
-            last_1h = df_1h.iloc[-1]
-            prev_1h = df_1h.iloc[-2]
-            
-            df_1h_copy = df_1h.copy()
-            df_1h_copy["ema233"] = df_1h_copy["close"].ewm(span=233, adjust=False).mean()
-            ema233_1h = float(df_1h_copy["ema233"].iloc[-1])
-            high_1h = float(last_1h["high"])
-            low_1h = float(last_1h["low"])
-            close_1h = float(last_1h["close"])
-            
-            if position.side == PositionSide.LONG:
-                if high_1h >= ema233_1h and close_1h < ema233_1h:
-                    return True, CloseReason.REVERSE, f"Rechazo en EMA233 (1H) detectado - Revertir a SHORT"
-            else:
-                if low_1h <= ema233_1h and close_1h > ema233_1h:
-                    return True, CloseReason.REVERSE, f"Rechazo en EMA233 (1H) detectado - Revertir a LONG"
-
-        if position.side == PositionSide.LONG:
-            cross_down = (ema21 < ema55) and (ema21_prev >= ema55_prev)
-            if cross_down:
-                if cls._detect_triple_top(df):
-                    return True, CloseReason.REVERSE, "Triple techo detectado — revertir a SHORT"
-        else:
-            cross_up = (ema21 > ema55) and (ema21_prev <= ema55_prev)
-            if cross_up:
-                if cls._detect_triple_bottom(df):
-                    return True, CloseReason.REVERSE, "Triple suelo detectado — revertir a LONG"
-
-        return False, CloseReason.MANUAL, ""
-
-    @classmethod
-    def _detect_triple_top(cls, df: pd.DataFrame) -> bool:
-        recent = df.tail(cls.TRIPLE_LOOKBACK)
-        highs = recent["high"].values
-        last = df.iloc[-1]
-
-        peaks = []
-        for i in range(1, len(highs) - 1):
-            if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
-                peaks.append(highs[i])
-
-        if len(peaks) < 2:
-            return False
-
-        max_peak = max(peaks)
-        similar = [p for p in peaks if abs(p - max_peak) / max_peak < 0.03]
-        if len(similar) < 2:
-            return False
-
-        last_high = float(last["high"])
-        last_close = float(last["close"])
-        fake_break = last_high > max_peak and last_close < max_peak
-        vol_ratio = float(last["vol_ratio"]) if "vol_ratio" in last else 1.0
-
-        return fake_break and vol_ratio >= 1.5
-
-    @classmethod
-    def _detect_triple_bottom(cls, df: pd.DataFrame) -> bool:
-        recent = df.tail(cls.TRIPLE_LOOKBACK)
-        lows = recent["low"].values
-        last = df.iloc[-1]
-
-        valleys = []
-        for i in range(1, len(lows) - 1):
-            if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
-                valleys.append(lows[i])
-
-        if len(valleys) < 2:
-            return False
-
-        min_valley = min(valleys)
-        similar = [v for v in valleys if abs(v - min_valley) / min_valley < 0.03]
-        if len(similar) < 2:
-            return False
-
-        last_low = float(last["low"])
-        last_close = float(last["close"])
-        fake_break = last_low < min_valley and last_close > min_valley
-        vol_ratio = float(last["vol_ratio"]) if "vol_ratio" in last else 1.0
-
-        return fake_break and vol_ratio >= 1.5
-
-
-class RiskManager:
     def __init__(
         self,
-        api_manager,
-        mode: BotMode = BotMode.DRY_RUN,
-        leverage: int = 10,
-        db_path: str = "patterns.db",
-        max_positions: int = 3,
-        position_pct: float = 0.30,
-        sl_pct: float = 0.40,
-        tp_multiple: float = 5.0,
-        st_reduction: float = 0.50,
-        cooldown_minutes: int = 15,
-        max_entries_daily: int = 3,
+        api_key: str,
+        api_secret: str,
+        sandbox: bool = True,
+        dry_run: bool = False,
+        cache_ttl_seconds: float = 60.0,
+        circuit_max_failures: int = 50,
+        circuit_recovery_timeout: float = 30.0,
     ):
-        self.api = api_manager
-        self.mode = mode
-        self.leverage = leverage
-        self.db_path = db_path
-        self.max_positions = max_positions
-        self.position_pct = position_pct
-        self.sl_pct = sl_pct
-        self.tp_multiple = tp_multiple
-        self.st_reduction = st_reduction
-        self.cooldown_minutes = cooldown_minutes
-        self.max_entries_daily = max_entries_daily
-        self.kill_switch = KillSwitch()
-        self.positions: Dict[str, OpenPosition] = {}
-        self._capital = CapitalState()
-        self._symbol_cooldown: Dict[str, float] = {}
-        self._symbol_daily_entries: Dict[str, int] = defaultdict(int)
-        self._last_entry_date: Dict[str, str] = {}
-        
-        # 🛡️ ARCHIVO DE MEMORIA PERSISTENTE PARA COOLDOWN
-        self.cooldown_file = "cooldowns.json"
-        self._load_cooldowns()
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.dry_run = dry_run
+        self.sandbox = sandbox or dry_run
+        self.proxy = os.getenv("BYBIT_PROXY", "")
 
-        logger.info(
-            f"[RiskManager] Iniciado | Modo: {mode.value} | "
-            f"Leverage: {leverage}x | Max posiciones: {max_positions} | "
-            f"Posición: {position_pct*100:.0f}% | SL: {sl_pct*100:.0f}% de posición | "
-            f"TP: {tp_multiple}x SL | Cooldown: {cooldown_minutes}min"
+        self.circuit = CircuitBreaker(
+            max_failures=circuit_max_failures,
+            recovery_timeout=circuit_recovery_timeout,
         )
 
-    def _load_cooldowns(self):
-        """Carga los cooldowns desde el archivo JSON para que sobrevivan a los reinicios."""
-        if os.path.exists(self.cooldown_file):
-            try:
-                with open(self.cooldown_file, 'r') as f:
-                    data = json.load(f)
-                    # Convertir los timestamps guardados como string a float
-                    self._symbol_cooldown = {k: float(v) for k, v in data.items()}
-                    logger.info(f"[RiskManager] Cargados {len(self._symbol_cooldown)} cooldowns desde archivo.")
-            except Exception as e:
-                logger.warning(f"[RiskManager] Error cargando cooldowns: {e}")
+        self._ohlcv_cache: Dict[str, OHLCVCache] = defaultdict(
+            lambda: OHLCVCache(ttl_seconds=cache_ttl_seconds)
+        )
 
-    def _save_cooldowns(self):
-        """Guarda los cooldowns en el archivo JSON."""
+        self._ws_exchange: Optional[Any] = None
+        self._ws_task: Optional[asyncio.Task] = None
+        self._ws_reconnect_attempts: int = 0
+        self._ws_max_reconnects: int = 10
+        self._ws_base_delay: float = 2.0
+        self._ws_data: Dict[str, Any] = {}
+        self._ws_running: bool = False
+
+        self.exchange = self._init_exchange()
+        self._market_symbols: Optional[set[str]] = None
+        self._leverage_cache: Dict[str, int] = {}  # Caché de apalancamiento
+        self._st_assets: set[str] = set()  # Activos ST detectados
+
+        logger.info(
+            f"[BybitAPIManager] Inicializado | "
+            f"Modo: {'SANDBOX' if sandbox else 'LIVE'} | "
+            f"Circuit: {self.circuit.max_failures} fallos máx. | "
+            f"Recovery: {self.circuit.recovery_timeout}s"
+        )
+
+    def _init_exchange(self) -> ccxt.bybit:
+        config = {
+            "apiKey":    self.api_key,
+            "secret":    self.api_secret,
+            "enableRateLimit": True,
+            "options": {
+                "defaultType": "linear",
+                "recvWindow": 5000,
+            },
+        }
+        if self.proxy:
+            config["proxies"] = {
+                "http": self.proxy,
+                "https": self.proxy,
+            }
+            logger.info(f"[Init] Usando proxy Bybit: {self.proxy}")
+
+        exchange = ccxt.bybit(config)
+        if self.sandbox:
+            exchange.set_sandbox_mode(True)
+            logger.info("[Init] Sandbox activado.")
+        return exchange
+
+    def _init_ws_exchange(self) -> Any:
+        if ccxtpro is None:
+            raise RuntimeError(
+                "ccxtpro no está disponible. Instala ccxtpro si necesitas WebSocket."
+            )
+        ws = ccxtpro.bybit({
+            "apiKey":  self.api_key,
+            "secret":  self.api_secret,
+            "options": {"defaultType": "linear"},
+        })
+        if self.sandbox:
+            ws.set_sandbox_mode(True)
+        return ws
+
+    async def _rate_limit_wait(self, endpoint_type: str = "public"):
+        slot = self._RATE_LIMITS.get(endpoint_type, self._RATE_LIMITS["public"])
+        wait = slot.acquire()
+        if wait > 0:
+            logger.debug(f"[RateLimiter] {endpoint_type} throttled {wait:.2f}s")
+            await asyncio.sleep(wait)
+
+    async def _ensure_markets(self) -> None:
+        if self._market_symbols is not None:
+            return
+
         try:
-            with open(self.cooldown_file, 'w') as f:
-                json.dump(self._symbol_cooldown, f, indent=2)
-        except Exception as e:
-            logger.error(f"[RiskManager] Error guardando cooldowns: {e}")
-
-    async def update_capital(self) -> CapitalState:
-        if self.mode == BotMode.DRY_RUN:
-            return self._capital
-
-        try:
-            balance = await self.api.fetch_balance()
-            total = balance["total"]
-
-            if self._capital.day_start_balance == 0:
-                self._capital.day_start_balance = total
-                self.kill_switch.set_day_start(total)
-                logger.info(f"[Capital] Saldo inicial del día: {total:.2f} USDT")
-
-            self._capital.total_balance = total
-            self._capital.available = balance["free"]
-            self._capital.day_pnl = total - self._capital.day_start_balance
-            self._capital.day_pnl_pct = (self._capital.day_pnl / self._capital.day_start_balance * 100) if self._capital.day_start_balance > 0 else 0
-            self._capital.open_positions = len(self.positions)
-
-            return self._capital
-
-        except Exception as e:
-            logger.error(f"[Capital] Error actualizando balance: {e}")
-            return self._capital
-
-    def set_initial_balance(self, balance: float):
-        self._capital.total_balance = balance
-        self._capital.available = balance
-        self._capital.day_start_balance = balance
-        self.kill_switch.set_day_start(balance)
-        logger.info(f"[Capital] Balance DRY_RUN: {balance:.2f} USDT")
-
-    async def evaluate_entry(
-        self,
-        signal,
-        df: pd.DataFrame,
-        sl_structural: float,
-        tp_structural: float,
-    ) -> Optional[PositionSize]:
-        stopped, reason = self.kill_switch.check(self._capital.total_balance)
-        if stopped:
-            logger.warning(f"[RiskManager] Kill Switch activo: {reason}")
-            return None
-
-        if len(self.positions) >= self.max_positions:
-            logger.debug(f"[RiskManager] Máximo de posiciones alcanzado ({self.max_positions})")
-            return None
-
-        if signal.symbol in self.positions:
-            logger.debug(f"[RiskManager] Ya hay posición en {signal.symbol}")
-            return None
-
-        if signal.symbol in self._symbol_cooldown:
-            elapsed = time.time() - self._symbol_cooldown[signal.symbol]
-            if elapsed < self.cooldown_minutes * 60:
-                logger.debug(f"[RiskManager] {signal.symbol} en cooldown por {int((self.cooldown_minutes*60 - elapsed)/60)} min más.")
-                return None
+            markets = await self._safe_call(
+                self.exchange.load_markets,
+                endpoint_type="public",
+            )
+            self._market_symbols = set(markets.keys())
+            logger.info(f"[BybitAPIManager] Cargados {len(self._market_symbols)} mercados de Bybit.")
+        except Exception as exc:
+            if self.dry_run:
+                logger.warning(
+                    "[BybitAPIManager] No se pudo cargar mercados en DRY_RUN. "
+                    "Se omite validación de símbolos y se usarán datos sintéticos."
+                )
+                self._market_symbols = set()
             else:
-                del self._symbol_cooldown[signal.symbol]
-                self._save_cooldowns()  # ✅ Guardar cambios en el archivo
+                raise
 
-        today = datetime.now(timezone.utc).date().isoformat()
-        if self._last_entry_date.get(signal.symbol) != today:
-            self._symbol_daily_entries[signal.symbol] = 0
-            self._last_entry_date[signal.symbol] = today
+    async def validate_symbols(self, symbols: List[str]) -> List[str]:
+        await self._ensure_markets()
+        if self._market_symbols is None:
+            return symbols
+        return [symbol for symbol in symbols if symbol not in self._market_symbols]
 
-        if self._symbol_daily_entries[signal.symbol] >= self.max_entries_daily:
-            logger.warning(f"[RiskManager] {signal.symbol} límite diario alcanzado")
-            return None
+    async def _safe_call(self, coro_or_callable, endpoint_type: str = "public"):
+        if not self.circuit.can_attempt():
+            raise RuntimeError(
+                "[CircuitBreaker] OPEN — bot pausado. Espera reconexión automática."
+            )
 
-        timeframe = getattr(signal, 'timeframe', '15m')
+        await self._rate_limit_wait(endpoint_type)
 
         try:
-            max_leverage = await self.api.get_max_leverage(signal.symbol)
-            is_st = await self.api.is_st_asset(signal.symbol)
-        except Exception as e:
-            logger.warning(f"[RiskManager] Error detectando leverage para {signal.symbol}: {e}")
-            max_leverage = self.leverage
-            is_st = False
+            if asyncio.iscoroutine(coro_or_callable):
+                result = await coro_or_callable
+            elif callable(coro_or_callable):
+                result = await asyncio.to_thread(coro_or_callable)
+            else:
+                result = coro_or_callable
+            self.circuit.record_success()
+            return result
 
-        tf_config = PositionCalculator.get_config(timeframe)
-        effective_leverage = min(tf_config["leverage"], max_leverage)
+        except ccxt.AuthenticationError as e:
+            logger.critical(f"[Auth] Error de autenticación: {e}. Deteniendo bot.")
+            self.circuit.failure_count = self.circuit.max_failures
+            self.circuit.state = CircuitState.OPEN
+            raise
 
-        from strategy_scanner import SignalType
-        side = PositionSide.LONG if signal.signal_type in (SignalType.LONG_BREAKOUT, SignalType.LONG_REVERSAL) else PositionSide.SHORT
+        except ccxt.RateLimitExceeded as e:
+            logger.error(f"[RateLimit/Access] {e}.")
+            opened = False
+            if not self.dry_run:
+                opened = self.circuit.record_failure()
+            if not opened:
+                await asyncio.sleep(30)
+            raise
 
-        position_size = PositionCalculator.calculate(
-            symbol=signal.symbol,
-            side=side,
-            entry_price=signal.entry_price,
-            sl_structural=0.0,
-            tp_structural=0.0,
-            balance=self._capital.total_balance,
-            leverage=effective_leverage,
-            max_leverage=max_leverage,
-            is_st_asset=is_st,
-            timeframe=timeframe,
+        except ccxt.NetworkError as e:
+            logger.warning(f"[Network] Error de red ({self.circuit.failure_count}/{self.circuit.max_failures}): {e}")
+            opened = False
+            if not self.dry_run:
+                opened = self.circuit.record_failure()
+            if not opened:
+                await asyncio.sleep(5)
+            raise
+
+        except ccxt.InvalidOrder as e:
+            logger.error(f"[InvalidOrder] Orden rechazada por Bybit: {e}")
+            raise
+
+        except ccxt.InsufficientFunds as e:
+            logger.error(f"[Funds] Saldo insuficiente: {e}. No se operará.")
+            raise
+
+        except ccxt.ExchangeError as e:
+            opened = False
+            if not self.dry_run:
+                opened = self.circuit.record_failure()
+            logger.error(f"[Exchange] Error del exchange ({self.circuit.failure_count}/{self.circuit.max_failures}): {e}")
+            raise
+
+    async def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "15m",
+        limit: int = 300,
+        force_refresh: bool = False,
+    ) -> pd.DataFrame:
+        cache = self._ohlcv_cache[symbol]
+        if cache.is_valid and not force_refresh:
+            logger.debug(f"[Cache] Hit para {symbol} — usando datos en memoria.")
+            return cache.data
+
+        try:
+            raw = await self._safe_call(
+                lambda: self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit),
+                endpoint_type="public",
+            )
+        except Exception as exc:
+            logger.warning(f"[OHLCV] Fallback sintético para {symbol} tras error de API: {exc}")
+            df = self._generate_synthetic_ohlcv(symbol, timeframe, limit)
+            cache.update(df)
+            return df
+
+        df = self._format_ohlcv(raw)
+        cache.update(df)
+        logger.debug(f"[OHLCV] {symbol} actualizado: {len(df)} velas.")
+        return df
+
+    def _generate_synthetic_ohlcv(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+        now = datetime.now(timezone.utc)
+        periods = limit + 1
+        freq = self._normalize_timeframe(timeframe)
+        try:
+            dates = pd.date_range(end=now, periods=periods, freq=freq)
+        except ValueError:
+            dates = pd.date_range(end=now, periods=periods, freq="15min")
+
+        close = pd.Series(100.0 + np.linspace(-1.0, 1.0, periods), index=dates)
+        open_ = close.shift(1).fillna(close.iloc[0])
+        high = pd.concat([open_, close], axis=1).max(axis=1) + 0.1
+        low = pd.concat([open_, close], axis=1).min(axis=1) - 0.1
+        volume = pd.Series(100.0, index=dates)
+        df = pd.DataFrame({
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+        })
+        df = df.iloc[:-1]
+        return df
+
+    def _normalize_timeframe(self, timeframe: str) -> str:
+        tf = timeframe.strip().lower()
+        if tf.endswith("m"):
+            return tf[:-1] + "min"
+        if tf.endswith("h"):
+            return tf[:-1] + "h"
+        if tf.endswith("d"):
+            return tf[:-1] + "d"
+        if tf.endswith("w"):
+            return tf[:-1] + "w"
+        return tf
+
+    def _format_ohlcv(self, raw: list) -> pd.DataFrame:
+        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df.set_index("datetime", inplace=True)
+        df.drop(columns=["timestamp"], inplace=True)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float64)
+        df = df.iloc[:-1]
+        df.dropna(inplace=True)
+        return df
+
+    async def fetch_balance(self) -> Dict[str, float]:
+        raw = await self._safe_call(
+            lambda: self.exchange.fetch_balance({"type": "linear"}),
+            endpoint_type="private",
         )
+        usdt = raw.get("USDT", {})
+        return {
+            "free":  float(usdt.get("free",  0.0)),
+            "used":  float(usdt.get("used",  0.0)),
+            "total": float(usdt.get("total", 0.0)),
+        }
 
-        self._symbol_daily_entries[signal.symbol] += 1
+    async def get_min_amount(self, symbol: str) -> float:
+        await self._ensure_markets()
+        market = getattr(self.exchange, "markets", {}).get(symbol)
+        if not market:
+            return 0.0
+
+        amount_limits = market.get("limits", {}).get("amount", {})
+        min_amount = amount_limits.get("min") if isinstance(amount_limits, dict) else 0.0
+        if min_amount:
+            return float(min_amount)
+        return float(market.get("limits", {}).get("price", {}).get("min", 0.0))
+
+    # ──────────────────────────────────────────
+    #  APALANCAMIENTO DINÁMICO (NUEVO)
+    # ──────────────────────────────────────────
+    async def get_max_leverage(self, symbol: str) -> int:
+        """
+        Obtiene el apalancamiento máximo permitido para un símbolo.
+        También detecta si es un activo "ST" (Special Treatment).
+        """
+        # Verificar caché
+        if symbol in self._leverage_cache:
+            return self._leverage_cache[symbol]
+
+        try:
+            # 1. Intentar obtener de la caché de mercados
+            await self._ensure_markets()
+            market = self.exchange.markets.get(symbol)
+            
+            # 2. Verificar si es activo ST
+            is_st_asset = False
+            if market and 'info' in market:
+                info = market['info']
+                # Buscar indicadores de ST
+                if (info.get('isST') or 
+                    info.get('special_treatment') or
+                    'ST' in symbol.upper()):
+                    is_st_asset = True
+                    self._st_assets.add(symbol)
+                    logger.warning(f"[Leverage] {symbol} es un activo ST (mayor riesgo)")
+            
+            # 3. Obtener apalancamiento máximo
+            max_lev = 10  # Default seguro
+            
+            if market:
+                limits = market.get('limits', {})
+                leverage_limit = limits.get('leverage', {})
+                if leverage_limit:
+                    max_lev = int(leverage_limit.get('max', 10))
+            
+            # 4. Si es ST, limitar aún más (opcional)
+            if is_st_asset and max_lev > 5:
+                logger.warning(
+                    f"[Leverage] {symbol} es ST, reduciendo apalancamiento de "
+                    f"{max_lev}x a 5x por seguridad"
+                )
+                max_lev = 5
+            
+            # 5. Intentar con API directa de Bybit para confirmar
+            try:
+                response = await self._safe_call(
+                    lambda: self.exchange.public_get_v5_market_instruments_info({
+                        'category': 'linear',
+                        'symbol': symbol
+                    }),
+                    endpoint_type="public"
+                )
+                
+                if response and 'result' in response:
+                    for item in response['result'].get('list', []):
+                        if item.get('symbol') == symbol:
+                            leverage_filter = item.get('leverageFilter', {})
+                            api_max = int(leverage_filter.get('maxLeverage', 10))
+                            
+                            # Usar el menor entre ambos
+                            max_lev = min(max_lev, api_max)
+                            logger.debug(f"[Leverage] {symbol} max leverage (API): {max_lev}x")
+                            break
+            except Exception as e:
+                logger.debug(f"[Leverage] API directa falló para {symbol}: {e}")
+            
+            # Guardar en caché
+            self._leverage_cache[symbol] = max_lev
+            logger.info(f"[Leverage] {symbol} apalancamiento efectivo: {max_lev}x")
+            return max_lev
+            
+        except Exception as e:
+            logger.error(f"[Leverage] Error obteniendo apalancamiento para {symbol}: {e}")
+            return 10  # Default seguro
+
+    async def is_st_asset(self, symbol: str) -> bool:
+        """Verifica si un símbolo es un activo ST."""
+        if symbol in self._st_assets:
+            return True
+        # Intentar detectar
+        await self.get_max_leverage(symbol)
+        return symbol in self._st_assets
+
+    # ══════════════════════════════════════════════════════════
+    # ✅ SET LEVERAGE CORREGIDO (Maneja errores 110043 y 110013)
+    # ══════════════════════════════════════════════════════════
+    async def set_leverage(self, symbol: str, leverage: int) -> None:
+        """Establece el apalancamiento para el símbolo."""
+        try:
+            await self._safe_call(
+                lambda: self.exchange.set_leverage(leverage, symbol),
+                endpoint_type="private",
+            )
+            logger.info(f"[Leverage] {symbol} apalancamiento ajustado a {leverage}x")
+            
+        except ccxt.ExchangeError as e:
+            error_str = str(e)
+            
+            # ✅ SOLUCIÓN 1: Ignorar error de apalancamiento ya modificado (110043)
+            if "retCode\":110043" in error_str or "leverage not modified" in error_str.lower():
+                logger.warning(f"[Leverage] {symbol} ya tenía el apalancamiento en {leverage}x. Error 110043 ignorado, continuando.")
+            
+            # ✅ SOLUCIÓN 2 (NUEVA): Ignorar error de límite de riesgo de la librería (110013)
+            elif "retCode\":110013" in error_str or "cannot set leverage" in error_str.lower():
+                logger.warning(f"[Leverage] {symbol} error de límite de riesgo por parte de la librería (110013) ignorado. El bot usará el apalancamiento actual (10x).")
+            
+            else:
+                # Si es cualquier otro error, sí lo lanzamos para que falle la operación
+                logger.error(f"[Leverage] Error al setear apalancamiento para {symbol}: {e}")
+                raise# ──────────────────────────────────────────
+#  COLOCAR ORDEN - CORREGIDO CON TIME_IN_FORCE
+# ──────────────────────────────────────────
+async def place_order(
+    self,
+    symbol: str,
+    side: str,
+    order_type: str,
+    amount: float,
+    price: Optional[float] = None,
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,
+    reduce_only: bool = False,
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"reduceOnly": reduce_only}
+    if stop_loss:
+        params["stopLoss"] = str(stop_loss)
+    if take_profit:
+        params["takeProfit"] = str(take_profit)
+
+    # 🛡️ CORRECCIÓN DE ÓRDENES COLGADAS:
+    # Si no nos pasan precio, usamos límite. PERO añadimos timeInForce='IOC' para que no se quede abierta.
+    if order_type == "market" or price is None:
+        ticker = await self._safe_call(
+            lambda: self.exchange.fetch_ticker(symbol),
+            endpoint_type="public"
+        )
+        # Calculamos el precio límite: 0.5% de margen
+        if side.lower() == "buy":
+            price = ticker["last"] * 1.005
+        else:
+            price = ticker["last"] * 0.995
+        order_type = "limit"
+        
+        # 🛡️ CLAVE: Si el precio se escapa, la orden se cancela sola.
+        params["timeInForce"] = "IOC"  # Immediate or Cancel
+
+    try:
+        order = await self._safe_call(
+            lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
+            endpoint_type="private",
+        )
 
         logger.info(
-            f"[RiskManager] ✅ Entrada aprobada: {signal.symbol} {side.value} {timeframe} | "
-            f"{position_size.position_usd:.2f} USDT | Riesgo: {position_size.risk_usd:.2f} USDT"
+            f"[Order] ✅ {side.upper()} {amount} {symbol} @ {price} | ID: {order.get('id')}"
         )
+        return order
 
-        return position_size
-
-    def register_position(
-        self,
-        order_id: str,
-        position_size: PositionSize,
-        pattern_id: Optional[int] = None,
-        signal_type: Optional[str] = None,
-        arrow_color: Optional[str] = None,
-        score: float = 0.0,
-    ) -> OpenPosition:
-        pos = OpenPosition(
-            id=order_id,
-            symbol=position_size.symbol,
-            side=position_size.side,
-            entry_price=position_size.entry_price,
-            current_price=position_size.entry_price,
-            stop_loss=position_size.stop_loss,
-            take_profit=position_size.take_profit,
-            contracts=position_size.contracts,
-            leverage=position_size.leverage,
-            position_usd=position_size.position_usd,
-            risk_usd=position_size.risk_usd,
-            pattern_id=pattern_id,
-            timeframe=position_size.timeframe,
-            highest_price=position_size.entry_price,
-            lowest_price=position_size.entry_price,
-            is_st_asset=position_size            is_st_asset=position_size.is_st_asset,
-            score=score,
-            signal_type=signal_type,
-            arrow_color=arrow_color,
+    except ccxt.InvalidOrder as e:
+        logger.warning(f"[InvalidOrder] Ajustando parámetros: {e}")
+        params.pop("stopLoss", None)
+        params.pop("takeProfit", None)
+        order = await self._safe_call(
+            lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
+            endpoint_type="private",
         )
-        self.positions[position_size.symbol] = pos
-        logger.info(f"[RiskManager] 📝 Posición registrada: {pos.symbol} {pos.side.value} {pos.timeframe}")
-        return pos
+        logger.warning(
+            f"[Order] ⚠️ Orden colocada SIN SL/TP por InvalidOrder. "
+            f"Requiere ajuste manual. ID: {order.get('id')}"
+        )
+        return order
 
-async def monitor_positions(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, Tuple[bool, CloseReason, str]]:
-    results = {}
-
-    for symbol, position in list(self.positions.items()):
-        if symbol not in dfs:
-            continue
-
-        df = dfs[symbol]
-        df = PositionCalculator._prepare_structural_df(df)
-        if df.empty or len(df) < 10:
-            continue
-
-        df_1h = None
-        try:
-            df_1h = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=100)
-        except Exception as e:
-            logger.warning(f"[RiskManager] No se pudo obtener 1h para {symbol}: {e}")
-
-        last = df.iloc[-1]
-        current = float(last["close"])
-        position.current_price = current
-
-        if position.side == PositionSide.LONG:
-            pnl_pct = (current - position.entry_price) / position.entry_price
-            position.highest_price = max(position.highest_price, current)
-        else:
-            pnl_pct = (position.entry_price - current) / position.entry_price
-            position.lowest_price = min(position.lowest_price, current)
-
-        position.unrealized_pnl_pct = pnl_pct * 100 * position.leverage
-        position.unrealized_pnl = position.position_usd * pnl_pct * position.leverage
-
-        # 1. SL/TP fijos
-        if position.side == PositionSide.LONG:
-            if current <= position.stop_loss:
-                results[symbol] = (True, CloseReason.STOP_LOSS, f"SL tocado {current:.4f}")
-                continue
-            if current >= position.take_profit:
-                results[symbol] = (True, CloseReason.TAKE_PROFIT, f"TP tocado {current:.4f}")
-                continue
-        else:
-            if current >= position.stop_loss:
-                results[symbol] = (True, CloseReason.STOP_LOSS, f"SL tocado {current:.4f}")
-                continue
-            if current <= position.take_profit:
-                results[symbol] = (True, CloseReason.TAKE_PROFIT, f"TP tocado {current:.4f}")
-                continue
-
-        # 2. Reverso por estructura
-        should_close, reason, notes = StructureExitEngine.evaluate_exit(position, df, df_1h)
-        if should_close:
-            results[symbol] = (True, reason, notes)
-
-    return results
-
-async def close_position(self, symbol: str, reason: CloseReason, current_price: float) -> Optional[dict]:
-    if symbol not in self.positions:
-        return None
-
-    pos = self.positions[symbol]
-
-    if pos.side == PositionSide.LONG:
-        pnl_pct = (current_price - pos.entry_price) / pos.entry_price
-    else:
-        pnl_pct = (pos.entry_price - current_price) / pos.entry_price
-
-    pnl_usd = pos.position_usd * pnl_pct * pos.leverage
-
-    open_dt = datetime.fromisoformat(pos.open_time)
-    now_dt = datetime.now(timezone.utc)
-    duration_m = (now_dt - open_dt).total_seconds() / 60
-
-    logger.info(
-        f"[RiskManager] {'🟢' if pnl_usd > 0 else '🔴'} "
-        f"Cerrando {symbol} {pos.side.value} | PnL: {pnl_usd:.2f} USDT ({pnl_pct*100:.1f}%) | "
-        f"Razón: {reason.value} | Duración: {duration_m:.0f}min"
+async def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
+    return await self._safe_call(
+        lambda: self.exchange.cancel_order(order_id, symbol),
+        endpoint_type="private",
     )
 
-    # ✅ ACTIVAR EL COOLDOWN Y GUARDARLO EN EL ARCHIVO
-    self._symbol_cooldown[symbol] = time.time()
-    self._save_cooldowns()
+# ──────────────────────────────────────────
+#  WEBSOCKET
+# ──────────────────────────────────────────
+async def start_websocket(self, symbols: list, timeframe: str = "15m"):
+    self._ws_exchange = self._init_ws_exchange()
+    self._ws_running = True
+    self._ws_reconnect_attempts = 0
+    logger.info(f"[WebSocket] Iniciando stream para: {symbols}")
+    await self._ws_loop(symbols, timeframe)
 
-    if pos.pattern_id:
-        self._update_pattern_result(
-            pattern_id=pos.pattern_id,
-            exit_price=current_price,
-            exit_reason=reason.value,
-            pnl_percent=pnl_pct * 100,
-            pnl_usd=pnl_usd,
-            duration_min=duration_m,
-        )
+async def _ws_loop(self, symbols: list, timeframe: str):
+    while self._ws_running:
+        try:
+            await self._ws_watch(symbols, timeframe)
+            self._ws_reconnect_attempts = 0
 
-    self._capital.total_balance += pnl_usd
-    self._capital.available += pos.position_usd + pnl_usd
-    self._capital.day_pnl += pnl_usd
+        except (ccxt.NetworkError, asyncio.TimeoutError, ConnectionResetError) as e:
+            self._ws_reconnect_attempts += 1
+            if self._ws_reconnect_attempts > self._ws_max_reconnects:
+                logger.critical(
+                    f"[WebSocket] Máximo de reconexiones alcanzado "
+                    f"({self._ws_max_reconnects}). Deteniendo stream."
+                )
+                self._ws_running = False
+                break
 
-    del self.positions[symbol]
+            delay = min(
+                self._ws_base_delay ** self._ws_reconnect_attempts,
+                120.0,
+            )
+            logger.warning(
+                f"[WebSocket] Error de red: {e}. "
+                f"Reconexión #{self._ws_reconnect_attempts} en {delay:.1f}s..."
+            )
+            await asyncio.sleep(delay)
 
-    result = {
-        "symbol": symbol,
-        "side": pos.side.value,
-        "entry": pos.entry_price,
-        "exit": current_price,
-        "pnl_usd": round(pnl_usd, 2),
-        "pnl_pct": round(pnl_pct * 100, 2),
-        "reason": reason.value,
-        "duration_min": round(duration_m, 0),
-        "reverse": reason == CloseReason.REVERSE,
-        "timeframe": pos.timeframe,
+            try:
+                await self._ws_exchange.close()
+            except Exception:
+                pass
+            self._ws_exchange = self._init_ws_exchange()
+
+        except ccxt.AuthenticationError as e:
+            logger.critical(f"[WebSocket] Error de autenticación: {e}. Deteniendo.")
+            self._ws_running = False
+            break
+
+        except Exception as e:
+            logger.error(f"[WebSocket] Error inesperado: {e}")
+            await asyncio.sleep(5)
+
+async def _ws_watch(self, symbols: list, timeframe: str):
+    tasks = [
+        self._ws_exchange.watch_ohlcv(symbol, timeframe)
+        for symbol in symbols
+    ]
+    while self._ws_running:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for symbol, result in zip(symbols, results):
+            if isinstance(result, Exception):
+                raise result
+            if result:
+                self._ws_data[symbol] = result
+                df = self._format_ohlcv(result)
+                self._ohlcv_cache[symbol].update(df)
+        tasks = [
+            self._ws_exchange.watch_ohlcv(symbol, timeframe)
+            for symbol in symbols
+        ]
+
+def get_ws_data(self, symbol: str) -> Optional[pd.DataFrame]:
+    cache = self._ohlcv_cache.get(symbol)
+    return cache.data if cache and cache.is_valid else None
+
+async def stop_websocket(self):
+    self._ws_running = False
+    if self._ws_exchange:
+        await self._ws_exchange.close()
+        logger.info("[WebSocket] Stream cerrado.")
+
+def get_status(self) -> Dict[str, Any]:
+    return {
+        "circuit_state":      self.circuit.state.value,
+        "circuit_failures":   self.circuit.failure_count,
+        "ws_running":         self._ws_running,
+        "ws_reconnects":      self._ws_reconnect_attempts,
+        "cached_symbols":     [s for s, c in self._ohlcv_cache.items() if c.is_valid],
+        "rate_public_used":   len(self._RATE_LIMITS["public"].timestamps),
+        "rate_private_used":  len(self._RATE_LIMITS["private"].timestamps),
+        "sandbox_mode":       self.sandbox,
+        "st_assets":          list(self._st_assets),
     }
 
-    if reason == CloseReason.REVERSE:
-        reverse_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
-        result["reverse_side"] = reverse_side.value
-        result["reverse_price"] = current_price
-        logger.info(f"[RiskManager] 🔄 REVERSO: abrir {reverse_side.value} en {symbol} @ {current_price}")
-
-    return result
-
-def _update_pattern_result(self, pattern_id: int, exit_price: float, exit_reason: str, pnl_percent: float, pnl_usd: float, duration_min: float):
-    trade_result = "WIN" if pnl_usd > 0 else "LOSS"
-    try:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                UPDATE patterns SET
-                    exit_price=?, exit_reason=?, pnl_percent=?,
-                    pnl_usd=?, duration_min=?, trade_result=?
-                WHERE id=?
-            """, (exit_price, exit_reason, pnl_percent, pnl_usd, duration_min, trade_result, pattern_id))
-            conn.commit()
-    except Exception as e:
-        logger.error(f"[BD] Error actualizando patrón {pattern_id}: {e}")
-
-def get_status(self) -> dict:
-    return {
-        "mode": self.mode.value,
-        "balance": self._capital.total_balance,
-        "available": self._capital.available,
-        "day_start": self._capital.day_start_balance,
-        "day_pnl": self._capital.day_pnl,
-        "day_pnl_pct": self._capital.day_pnl_pct,
-        "drawdown_pct": self._capital.drawdown_pct if hasattr(self._capital, 'drawdown_pct') else 0.0,
-        "kill_switch": self.kill_switch.active,
-        "kill_switch_reason": self.kill_switch.reason,
-        "open_positions": len(self.positions),
-        "positions": {
-            sym: {
-                "side": pos.side.value,
-                "entry": pos.entry_price,
-                "current": pos.current_price,
-                "pnl_usd": pos.unrealized_pnl,
-                "pnl_pct": pos.unrealized_pnl_pct,
-                "sl": pos.stop_loss,
-                "tp": pos.take_profit,
-                "timeframe": pos.timeframe,
-                "is_st": pos.is_st_asset,
-            }
-            for sym, pos in self.positions.items()
-        },
-}
+async def close(self):
+    await self.stop_websocket()
+    if hasattr(self.exchange, "close"):
+        try:
+            result = self.exchange.close()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as e:
+            logger.warning(f"[BybitAPIManager] Error cerrando exchange: {e}")
+    logger.info("[BybitAPIManager] Conexiones cerradas.")
