@@ -126,6 +126,24 @@ class MarketScanner:
                 if now - self._signal_cooldown[symbol] < 300:
                     continue
 
+            # ⚡ 1. OBTENER TENDENCIA MACRO (1 HORA) PARA FILTRAR ENTRADAS
+            macro_direction = "NEUTRAL"
+            try:
+                df_1h = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=100)
+                if df_1h is not None and len(df_1h) > 40:
+                    df_1h["ema55"] = df_1h["close"].ewm(span=55, adjust=False).mean()
+                    df_1h["ema144"] = df_1h["close"].ewm(span=144, adjust=False).mean()
+                    current_ema55 = df_1h["ema55"].iloc[-1]
+                    current_ema144 = df_1h["ema144"].iloc[-1]
+                    
+                    if current_ema55 > current_ema144:
+                        macro_direction = "BULLISH"
+                    elif current_ema55 < current_ema144:
+                        macro_direction = "BEARISH"
+            except Exception as exc:
+                logger.debug(f"[MarketScanner] No se pudo obtener macro 1h para {symbol}: {exc}")
+
+            # ⚡ 2. ANALIZAR TIMEFRAMES BAJOS (M3 y M15)
             for timeframe in self.timeframes:
                 try:
                     df = await self.api.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
@@ -134,7 +152,7 @@ class MarketScanner:
 
                     behavior = self._describe_behavior(df)
                     symbol_code = self._normalize_symbol(symbol)
-                    matches = self._match_patterns(symbol_code, behavior, timeframe)
+                    matches = self._match_patterns(symbol_code, behavior, timeframe, macro_direction)
 
                     if not matches:
                         continue
@@ -263,12 +281,10 @@ class MarketScanner:
         volume_average = float(df["volume"].rolling(20).mean().iloc[-2] or 0.0)
         price = float(current["close"])
 
-        # 🛡️ CÁLCULO DE LA VELA ANTERIOR (Para detectar rupturas masivas y evitar comprar en picos)
         prev_candle = candle_pattern(prior)
         prev_vol_ratio = float(prior["volume"]) / max(volume_average, 1e-9)
         previous_breakout = "NO"
         
-        # Si la vela anterior fue una vela verde fuerte y el volumen fue alto (más de 1.8 veces el promedio)
         if prev_candle in ["STRONG_GREEN", "REJECTION", "GREEN"] and prev_vol_ratio >= 1.8:
             previous_breakout = "YES"
 
@@ -293,14 +309,13 @@ class MarketScanner:
             "patron_vela": candle_pattern(current),
             "fib_zona": fib_zone(price),
             "entry_price": price,
-            "previous_breakout": previous_breakout, # ✅ Nueva bandera añadida
+            "previous_breakout": previous_breakout,
         }
 
-    def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any], timeframe: str) -> List[Dict[str, Any]]:
+    def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any], timeframe: str, macro_direction: str) -> List[Dict[str, Any]]:
         matches = []
         patterns = self.patterns_by_tf.get(timeframe, [])
 
-        # 🛡️ Obtener si la vela anterior fue un breakout
         prev_breakout = behavior.get("previous_breakout", "NO")
 
         for pattern in patterns:
@@ -310,9 +325,14 @@ class MarketScanner:
             if pattern.get("timeframe") != timeframe:
                 continue
 
-            # ✅ FILTRO ANTI-PICO: Si la vela anterior fue un breakout masivo, 
-            # ignoramos los patrones LONG_BREAKOUT y LONG_REVERSAL para no comprar en el pico
             signal_type = pattern.get("signal_type", "")
+
+            # ✅ NUEVO FILTRO DE CONFLUENCIA MACRO (1 HORA)
+            if macro_direction == "BULLISH" and signal_type in ["SHORT_BREAKOUT", "SHORT_REVERSAL"]:
+                continue
+            if macro_direction == "BEARISH" and signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"]:
+                continue
+
             if prev_breakout == "YES" and signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"]:
                 continue
 
@@ -335,6 +355,10 @@ class MarketScanner:
                 continue
 
             match_ratio = score / total
+            
+            if prev_breakout == "YES" and signal_type in ["LONG_BREAKOUT", "SHORT_BREAKOUT"]:
+                match_ratio *= 0.80
+
             if match_ratio >= 0.40:
                 matches.append({
                     "pattern": pattern,
@@ -379,4 +403,4 @@ class MarketScanner:
             df=df,
             pattern_id=pattern.get("id"),
             timeframe=timeframe,
-    )
+        )
