@@ -51,7 +51,7 @@ CONFIG: Dict[str, Any] = {
     
     # ✅ WATCHLIST EXCLUSIVA
     "WATCHLIST": [
-        "EVAASUSDT", "LABUSDT", "B3USDT", "SXTUSDT", 
+        "EVAASUSDT", "B3USDT", "SXTUSDT", 
         "SKHYNIXUSDT", "SKHYUSDT", "AXTIUSDT", "LITUSDT", 
         "KAITOUSDT", "HEIUSDT", "BLESSUSDT", "USUSDT", 
         "CUSDT", "GRASSUSDT", "NAORISUSDT", 
