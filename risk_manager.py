@@ -101,7 +101,7 @@ class OpenPosition:
 
 
 class KillSwitch:
-    DAILY_DRAWDOWN_LIMIT = 15.0
+    DAILY_DRAWDOWN_LIMIT = 25.0
     WEEKLY_DRAWDOWN_LIMIT = 30.0
 
     def __init__(self):
@@ -166,7 +166,7 @@ class PositionCalculator:
     #  TODOS los valores en USDT
     # ═══════════════════════════════════════════════════════════════
     
-    POSITION_PCT = 0.10      # 10% del capital
+    POSITION_PCT = 0.30      # ✅ CORREGIDO: 30% del capital
     SL_MAX_PCT = 0.40        # 40% de la posición = 4% capital
     TP_MULTIPLE = 5.0        # 5x SL = 20% capital
     LEVERAGE = 10            # 10x
@@ -174,13 +174,13 @@ class PositionCalculator:
 
     TIMEFRAME_CONFIG = {
         "15m": {
-            "position_pct": 0.10,
+            "position_pct": 0.30,  # ✅ CORREGIDO: Ahora usa el 30%
             "sl_pct": 0.40,
             "tp_multiple": 5.0,
             "leverage": 10,
         },
         "3m": {
-            "position_pct": 0.10,
+            "position_pct": 0.30,  # ✅ CORREGIDO: Ahora usa el 30%
             "sl_pct": 0.40,
             "tp_multiple": 5.0,
             "leverage": 10,
@@ -278,7 +278,7 @@ class StructureExitEngine:
     TRIPLE_LOOKBACK = 20
 
     @classmethod
-    def evaluate_exit(cls, position: OpenPosition, df: pd.DataFrame) -> Tuple[bool, CloseReason, str]:
+    def evaluate_exit(cls, position: OpenPosition, df: pd.DataFrame, df_1h: Optional[pd.DataFrame] = None) -> Tuple[bool, CloseReason, str]:
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
@@ -287,6 +287,26 @@ class StructureExitEngine:
         ema21_prev = float(prev["ema21"])
         ema55_prev = float(prev["ema55"])
 
+        # ✅ NUEVA LÓGICA: DETECCIÓN DE REVERSIÓN POR EMA233 DE 1H
+        if df_1h is not None and not df_1h.empty:
+            last_1h = df_1h.iloc[-1]
+            prev_1h = df_1h.iloc[-2]
+            
+            df_1h_copy = df_1h.copy()
+            df_1h_copy["ema233"] = df_1h_copy["close"].ewm(span=233, adjust=False).mean()
+            ema233_1h = float(df_1h_copy["ema233"].iloc[-1])
+            high_1h = float(last_1h["high"])
+            low_1h = float(last_1h["low"])
+            close_1h = float(last_1h["close"])
+            
+            if position.side == PositionSide.LONG:
+                if high_1h >= ema233_1h and close_1h < ema233_1h:
+                    return True, CloseReason.REVERSE, f"Rechazo en EMA233 (1H) detectado - Revertir a SHORT"
+            else:
+                if low_1h <= ema233_1h and close_1h > ema233_1h:
+                    return True, CloseReason.REVERSE, f"Rechazo en EMA233 (1H) detectado - Revertir a LONG"
+
+        # Lógica de cruce de EMAs rápida (triple techo/suelo en timeframe bajo)
         if position.side == PositionSide.LONG:
             cross_down = (ema21 < ema55) and (ema21_prev >= ema55_prev)
             if cross_down:
@@ -361,7 +381,7 @@ class RiskManager:
         leverage: int = 10,
         db_path: str = "patterns.db",
         max_positions: int = 3,
-        position_pct: float = 0.10,
+        position_pct: float = 0.30,   # ✅ Cambio de 0.10 a 0.30
         sl_pct: float = 0.40,
         tp_multiple: float = 5.0,
         st_reduction: float = 0.50,
@@ -475,7 +495,6 @@ class RiskManager:
         tf_config = PositionCalculator.get_config(timeframe)
         effective_leverage = min(tf_config["leverage"], max_leverage)
 
-        # ✅ CAMBIO APLICADO AQUÍ: Ahora importa desde strategy_scanner
         from strategy_scanner import SignalType
         side = PositionSide.LONG if signal.signal_type in (SignalType.LONG_BREAKOUT, SignalType.LONG_REVERSAL) else PositionSide.SHORT
 
@@ -547,6 +566,12 @@ class RiskManager:
             if df.empty or len(df) < 10:
                 continue
 
+            df_1h = None
+            try:
+                df_1h = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=100)
+            except Exception as e:
+                logger.warning(f"[RiskManager] No se pudo obtener 1h para {symbol}: {e}")
+
             last = df.iloc[-1]
             current = float(last["close"])
             position.current_price = current
@@ -561,7 +586,7 @@ class RiskManager:
             position.unrealized_pnl_pct = pnl_pct * 100 * position.leverage
             position.unrealized_pnl = position.position_usd * pnl_pct * position.leverage
 
-            # SL/TP fijos
+            # 1. SL/TP fijos
             if position.side == PositionSide.LONG:
                 if current <= position.stop_loss:
                     results[symbol] = (True, CloseReason.STOP_LOSS, f"SL tocado {current:.4f}")
@@ -577,8 +602,8 @@ class RiskManager:
                     results[symbol] = (True, CloseReason.TAKE_PROFIT, f"TP tocado {current:.4f}")
                     continue
 
-            # Reverso por estructura
-            should_close, reason, notes = StructureExitEngine.evaluate_exit(position, df)
+            # 2. Reverso por estructura
+            should_close, reason, notes = StructureExitEngine.evaluate_exit(position, df, df_1h)
             if should_close:
                 results[symbol] = (True, reason, notes)
 
@@ -601,7 +626,6 @@ class RiskManager:
         now_dt = datetime.now(timezone.utc)
         duration_m = (now_dt - open_dt).total_seconds() / 60
 
-        # ✅ CORREGIDO: Mostrar USDT en lugar de $
         logger.info(
             f"[RiskManager] {'🟢' if pnl_usd > 0 else '🔴'} "
             f"Cerrando {symbol} {pos.side.value} | PnL: {pnl_usd:.2f} USDT ({pnl_pct*100:.1f}%) | "
