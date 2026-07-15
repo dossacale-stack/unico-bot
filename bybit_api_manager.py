@@ -527,7 +527,7 @@ class BybitAPIManager:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         reduce_only: bool = False,
-    ) -> Dict:
+    ) -> Dict[str, Any]:
         params: Dict[str, Any] = {"reduceOnly": reduce_only}
         if stop_loss:
             params["stopLoss"] = str(stop_loss)
@@ -535,171 +535,153 @@ class BybitAPIManager:
             params["takeProfit"] = str(take_profit)
 
         # 🛡️ CORRECCIÓN DE ÓRDENES COLGADAS:
-        # Si no noasync def place_order(
-    self,
-    symbol: str,
-    side: str,
-    order_type: str,
-    amount: float,
-    price: Optional[float] = None,
-    stop_loss: Optional[float] = None,
-    take_profit: Optional[float] = None,
-    reduce_only: bool = False,
-) -> Dict:
-    params: Dict[str, Any] = {"reduceOnly": reduce_only}
-    if stop_loss:
-        params["stopLoss"] = str(stop_loss)
-    if take_profit:
-        params["takeProfit"] = str(take_profit)
+        # Si no nos pasan precio, usamos límite. PERO añadimos timeInForce='IOC' para que no se quede abierta.
+        if order_type == "market" or price is None:
+            ticker = await self._safe_call(
+                lambda: self.exchange.fetch_ticker(symbol),
+                endpoint_type="public"
+            )
+            # Calculamos el precio límite: 0.5% de margen
+            if side.lower() == "buy":
+                price = ticker["last"] * 1.005
+            else:
+                price = ticker["last"] * 0.995
+            order_type = "limit"
+            
+            # 🛡️ CLAVE: Si el precio se escapa, la orden se cancela sola.
+            params["timeInForce"] = "IOC"  # Immediate or Cancel
 
-    # 🛡️ CORRECCIÓN DE ÓRDENES COLGADAS:
-    # Si no nos pasan precio, usamos límite. PERO añadimos timeInForce='IOC' para que no se quede abierta.
-    if order_type == "market" or price is None:
-        ticker = await self._safe_call(
-            lambda: self.exchange.fetch_ticker(symbol),
-            endpoint_type="public"
-        )
-        # Calculamos el precio límite: 0.5% de margen
-        if side.lower() == "buy":
-            price = ticker["last"] * 1.005
-        else:
-            price = ticker["last"] * 0.995
-        order_type = "limit"
-        
-        # 🛡️ CLAVE: Si el precio se escapa, la orden se cancela sola.
-        params["timeInForce"] = "IOC"  # Immediate or Cancel
-
-    try:
-        order = await self._safe_call(
-            lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
-            endpoint_type="private",
-        )
-
-        logger.info(
-            f"[Order] ✅ {side.upper()} {amount} {symbol} @ {price} | ID: {order.get('id')}"
-        )
-        return order
-
-    except ccxt.InvalidOrder as e:
-        logger.warning(f"[InvalidOrder] Ajustando parámetros: {e}")
-        params.pop("stopLoss", None)
-        params.pop("takeProfit", None)
-        order = await self._safe_call(
-            lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
-            endpoint_type="private",
-        )
-        logger.warning(
-            f"[Order] ⚠️ Orden colocada SIN SL/TP por InvalidOrder. "
-            f"Requiere ajuste manual. ID: {order.get('id')}"
-        )
-        return order
-
-async def cancel_order(self, order_id: str, symbol: str) -> Dict:
-    return await self._safe_call(
-        lambda: self.exchange.cancel_order(order_id, symbol),
-        endpoint_type="private",
-    )
-
-# ──────────────────────────────────────────
-#  WEBSOCKET
-# ──────────────────────────────────────────
-async def start_websocket(self, symbols: list, timeframe: str = "15m"):
-    self._ws_exchange = self._init_ws_exchange()
-    self._ws_running = True
-    self._ws_reconnect_attempts = 0
-    logger.info(f"[WebSocket] Iniciando stream para: {symbols}")
-    await self._ws_loop(symbols, timeframe)
-
-async def _ws_loop(self, symbols: list, timeframe: str):
-    while self._ws_running:
         try:
-            await self._ws_watch(symbols, timeframe)
-            self._ws_reconnect_attempts = 0
+            order = await self._safe_call(
+                lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
+                endpoint_type="private",
+            )
 
-        except (ccxt.NetworkError, asyncio.TimeoutError, ConnectionResetError) as e:
-            self._ws_reconnect_attempts += 1
-            if self._ws_reconnect_attempts > self._ws_max_reconnects:
-                logger.critical(
-                    f"[WebSocket] Máximo de reconexiones alcanzado "
-                    f"({self._ws_max_reconnects}). Deteniendo stream."
+            logger.info(
+                f"[Order] ✅ {side.upper()} {amount} {symbol} @ {price} | ID: {order.get('id')}"
+            )
+            return order
+
+        except ccxt.InvalidOrder as e:
+            logger.warning(f"[InvalidOrder] Ajustando parámetros: {e}")
+            params.pop("stopLoss", None)
+            params.pop("takeProfit", None)
+            order = await self._safe_call(
+                lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
+                endpoint_type="private",
+            )
+            logger.warning(
+                f"[Order] ⚠️ Orden colocada SIN SL/TP por InvalidOrder. "
+                f"Requiere ajuste manual. ID: {order.get('id')}"
+            )
+            return order
+
+    async def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
+        return await self._safe_call(
+            lambda: self.exchange.cancel_order(order_id, symbol),
+            endpoint_type="private",
+        )
+
+    # ──────────────────────────────────────────
+    #  WEBSOCKET
+    # ──────────────────────────────────────────
+    async def start_websocket(self, symbols: list, timeframe: str = "15m"):
+        self._ws_exchange = self._init_ws_exchange()
+        self._ws_running = True
+        self._ws_reconnect_attempts = 0
+        logger.info(f"[WebSocket] Iniciando stream para: {symbols}")
+        await self._ws_loop(symbols, timeframe)
+
+    async def _ws_loop(self, symbols: list, timeframe: str):
+        while self._ws_running:
+            try:
+                await self._ws_watch(symbols, timeframe)
+                self._ws_reconnect_attempts = 0
+
+            except (ccxt.NetworkError, asyncio.TimeoutError, ConnectionResetError) as e:
+                self._ws_reconnect_attempts += 1
+                if self._ws_reconnect_attempts > self._ws_max_reconnects:
+                    logger.critical(
+                        f"[WebSocket] Máximo de reconexiones alcanzado "
+                        f"({self._ws_max_reconnects}). Deteniendo stream."
+                    )
+                    self._ws_running = False
+                    break
+
+                delay = min(
+                    self._ws_base_delay ** self._ws_reconnect_attempts,
+                    120.0,
                 )
+                logger.warning(
+                    f"[WebSocket] Error de red: {e}. "
+                    f"Reconexión #{self._ws_reconnect_attempts} en {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
+
+                try:
+                    await self._ws_exchange.close()
+                except Exception:
+                    pass
+                self._ws_exchange = self._init_ws_exchange()
+
+            except ccxt.AuthenticationError as e:
+                logger.critical(f"[WebSocket] Error de autenticación: {e}. Deteniendo.")
                 self._ws_running = False
                 break
 
-            delay = min(
-                self._ws_base_delay ** self._ws_reconnect_attempts,
-                120.0,
-            )
-            logger.warning(
-                f"[WebSocket] Error de red: {e}. "
-                f"Reconexión #{self._ws_reconnect_attempts} en {delay:.1f}s..."
-            )
-            await asyncio.sleep(delay)
+            except Exception as e:
+                logger.error(f"[WebSocket] Error inesperado: {e}")
+                await asyncio.sleep(5)
 
-            try:
-                await self._ws_exchange.close()
-            except Exception:
-                pass
-            self._ws_exchange = self._init_ws_exchange()
-
-        except ccxt.AuthenticationError as e:
-            logger.critical(f"[WebSocket] Error de autenticación: {e}. Deteniendo.")
-            self._ws_running = False
-            break
-
-        except Exception as e:
-            logger.error(f"[WebSocket] Error inesperado: {e}")
-            await asyncio.sleep(5)
-
-async def _ws_watch(self, symbols: list, timeframe: str):
-    tasks = [
-        self._ws_exchange.watch_ohlcv(symbol, timeframe)
-        for symbol in symbols
-    ]
-    while self._ws_running:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for symbol, result in zip(symbols, results):
-            if isinstance(result, Exception):
-                raise result
-            if result:
-                self._ws_data[symbol] = result
-                df = self._format_ohlcv(result)
-                self._ohlcv_cache[symbol].update(df)
+    async def _ws_watch(self, symbols: list, timeframe: str):
         tasks = [
             self._ws_exchange.watch_ohlcv(symbol, timeframe)
             for symbol in symbols
         ]
+        while self._ws_running:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for symbol, result in zip(symbols, results):
+                if isinstance(result, Exception):
+                    raise result
+                if result:
+                    self._ws_data[symbol] = result
+                    df = self._format_ohlcv(result)
+                    self._ohlcv_cache[symbol].update(df)
+            tasks = [
+                self._ws_exchange.watch_ohlcv(symbol, timeframe)
+                for symbol in symbols
+            ]
 
-def get_ws_data(self, symbol: str) -> Optional[pd.DataFrame]:
-    cache = self._ohlcv_cache.get(symbol)
-    return cache.data if cache and cache.is_valid else None
+    def get_ws_data(self, symbol: str) -> Optional[pd.DataFrame]:
+        cache = self._ohlcv_cache.get(symbol)
+        return cache.data if cache and cache.is_valid else None
 
-async def stop_websocket(self):
-    self._ws_running = False
-    if self._ws_exchange:
-        await self._ws_exchange.close()
-        logger.info("[WebSocket] Stream cerrado.")
+    async def stop_websocket(self):
+        self._ws_running = False
+        if self._ws_exchange:
+            await self._ws_exchange.close()
+            logger.info("[WebSocket] Stream cerrado.")
 
-def get_status(self) -> Dict:
-    return {
-        "circuit_state":      self.circuit.state.value,
-        "circuit_failures":   self.circuit.failure_count,
-        "ws_running":         self._ws_running,
-        "ws_reconnects":      self._ws_reconnect_attempts,
-        "cached_symbols":     [s for s, c in self._ohlcv_cache.items() if c.is_valid],
-        "rate_public_used":   len(self._RATE_LIMITS["public"].timestamps),
-        "rate_private_used":  len(self._RATE_LIMITS["private"].timestamps),
-        "sandbox_mode":       self.sandbox,
-        "st_assets":          list(self._st_assets),
-    }
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "circuit_state":      self.circuit.state.value,
+            "circuit_failures":   self.circuit.failure_count,
+            "ws_running":         self._ws_running,
+            "ws_reconnects":      self._ws_reconnect_attempts,
+            "cached_symbols":     [s for s, c in self._ohlcv_cache.items() if c.is_valid],
+            "rate_public_used":   len(self._RATE_LIMITS["public"].timestamps),
+            "rate_private_used":  len(self._RATE_LIMITS["private"].timestamps),
+            "sandbox_mode":       self.sandbox,
+            "st_assets":          list(self._st_assets),
+        }
 
-async def close(self):
-    await self.stop_websocket()
-    if hasattr(self.exchange, "close"):
-        try:
-            result = self.exchange.close()
-            if asyncio.iscoroutine(result):
-                await result
-        except Exception as e:
-            logger.warning(f"[BybitAPIManager] Error cerrando exchange: {e}")
-    logger.info("[BybitAPIManager] Conexiones cerradas.")
+    async def close(self):
+        await self.stop_websocket()
+        if hasattr(self.exchange, "close"):
+            try:
+                result = self.exchange.close()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.warning(f"[BybitAPIManager] Error cerrando exchange: {e}")
+        logger.info("[BybitAPIManager] Conexiones cerradas.")
