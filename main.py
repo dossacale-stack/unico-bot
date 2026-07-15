@@ -31,10 +31,11 @@ CONFIG: Dict[str, Any] = {
     
     "SCANNER_ENABLED": True,
     "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "10.0")),
-    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.60")), # ✅ AUMENTADO DE 0.40 A 0.60 (Mucho más exigente)
+    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.60")),
     "MIN_RR": float(os.getenv("MIN_RR", "3.0")),
     
-    "TIMEFRAMES": ["15m", "3m"],
+    # ✅ CAMBIO CLAVE: ELIMINADO EL 3m. AHORA SOLO OPERA EN 15m.
+    "TIMEFRAMES": ["15m"], 
     
     "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "2")),
     "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.30")),
@@ -93,12 +94,12 @@ class UnicoBot:
             api_manager=self.api,
             watchlist=config["WATCHLIST"],
             scan_interval=config["SCAN_INTERVAL"],
-            min_score=config["MIN_SCORE"], # Ahora usará 0.60
+            min_score=config["MIN_SCORE"],
             min_rr=config["MIN_RR"],
             position_pct=config["POSITION_PCT"],
             db_path=config["DB_PATH"],
             signal_cooldown_seconds=60,
-            timeframes=config.get("TIMEFRAMES", ["15m", "3m"]),
+            timeframes=config.get("TIMEFRAMES", ["15m"]), # Ahora solo 15m
         )
         
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
@@ -119,20 +120,19 @@ class UnicoBot:
     async def initialize(self) -> None:
         logger.info(
             "\n" + "=" * 60 + "\n"
-            + " 🚀 ÚNICO STRATEGY v4.0 — M15 + M3\n"
+            + " 🚀 ÚNICO STRATEGY v4.0 — M15 (SIN 3m)\n"
             + f" Modo: {self.mode.value}\n"
             + f" Sandbox: {self.config['SANDBOX']}\n"
             + f" Scanner: {'ON' if self.config['SCANNER_ENABLED'] else 'PAUSE'}\n"
             + f" Watchlist: {len(self.config['WATCHLIST'])} símbolos\n"
-            + f" Timeframes: {self.config.get('TIMEFRAMES', ['15m', '3m'])}\n"
+            + f" Timeframes: {self.config.get('TIMEFRAMES', ['15m'])}\n"
             + f" Intervalo: {self.config['SCAN_INTERVAL']}s\n"
-            + f" Score mínimo: {self.config['MIN_SCORE']} (Muy exigente)\n"
+            + f" Score mínimo: {self.config['MIN_SCORE']}\n"
             + f" Máximo posiciones: {self.config['MAX_POSITIONS']}\n"
             + f" Posición: {self.config['POSITION_PCT']*100:.0f}% capital\n"
             + f" SL: {self.config['SL_PCT']*100:.0f}% de posición\n"
             + f" TP: {self.config['TP_MULTIPLE']}x riesgo\n"
             + f" Cooldown: {self.config['COOLDOWN_MINUTES']}min\n"
-            + f" Límite diario: {self.config['MAX_ENTRIES_DAILY']}\n"
             + "=" * 60
         )
 
@@ -171,24 +171,16 @@ class UnicoBot:
             self.running = False
             return
 
-        # ✅ NUEVA VERIFICACIÓN DE CAPITAL DISPONIBLE
-        # Si el saldo disponible es menos del 15% del total, no operamos hasta que se libere capital.
         min_available_to_trade = capital.total_balance * 0.15
         if capital.available < min_available_to_trade:
             logger.warning(f"⏸️ Saldo disponible muy bajo ({capital.available:.2f} USDT). Esperando liberación de capital...")
-            # No corremos el scanner, simplemente monitoreamos las posiciones.
         elif self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
             signals = await self.scanner.scan_all()
             self.stats["signals"] += len(signals)
             
             if signals:
-                # Ordenar las señales de mayor a menor puntuación
                 signals.sort(key=lambda s: s.score, reverse=True)
-                
-                # Calcular cuántas posiciones libres quedan
                 available_slots = self.config["MAX_POSITIONS"] - len(self.rm.positions)
-                
-                # Procesar solo las mejores señales según el cupo disponible
                 signals_to_process = signals[:available_slots]
                 
                 for signal in signals_to_process:
@@ -340,12 +332,12 @@ def mostrar_estado() -> None:
         print("\n⚠️  La base de datos de patrones no existe. Ejecuta --init-db.")
         return
     print("\n" + "=" * 60)
-    print("  🧠 ÚNICO STRATEGY v4.0 — M15 + M3")
+    print("  🧠 ÚNICO STRATEGY v4.0 — M15 (SIN 3m)")
     print("=" * 60)
     print(f"  Modo: {CONFIG['MODE']}")
     print(f"  Sandbox: {CONFIG['SANDBOX']}")
     print(f"  Watchlist: {len(CONFIG['WATCHLIST'])} símbolos")
-    print(f"  Timeframes: {CONFIG.get('TIMEFRAMES', ['15m', '3m'])}")
+    print(f"  Timeframes: {CONFIG.get('TIMEFRAMES', ['15m'])}")
     print(f"  DB: {CONFIG['DB_PATH']}")
     print(f"  SL: {CONFIG['SL_PCT']*100:.0f}% de posición")
     print(f"  TP: {CONFIG['TP_MULTIPLE']}x riesgo")
@@ -396,12 +388,11 @@ async def main() -> None:
 if __name__ == "__main__":
     print("""
 ╔═══════════════════════════════════════════════════════════════╗
-║            🧠 ÚNICO STRATEGY v4.0 — M15 + M3               ║
+║            🧠 ÚNICO STRATEGY v4.0 — M15 (SIN 3m)            ║
 ║         Futuros Perpetuos USDT-M — Bybit                    ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  TIMEFRAMES:                                                 ║
 ║  📊 M15: SL 4% | TP 20% | Leverage 10x | R:R 5:1           ║
-║  ⚡ M3:  SL 4% | TP 20% | Leverage 10x | R:R 5:1           ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  COMANDOS:                                                   ║
 ║  python main.py --init-db     → Inicializar base de datos   ║
