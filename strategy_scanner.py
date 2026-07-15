@@ -327,10 +327,15 @@ class MarketScanner:
                 continue
 
             signal_type = pattern.get("signal_type", "")
+            
+            # Variables de comportamiento
             bb_price = behavior.get("bb_precio", "MID")
             bb_state = behavior.get("bb_estado", "CONTRACTING")
+            ema55_vs_ema144 = behavior.get("ema55_vs_ema144", "")
+            ema144_vs_ema233 = behavior.get("ema144_vs_ema233", "")
+            precio_vs_ema55 = behavior.get("precio_vs_ema55", "")
 
-            # 1. FILTRO MACRO (1 HORA): No operar en contra de la tendencia grande
+            # 1. FILTRO MACRO (1 HORA)
             if macro_direction == "BULLISH" and signal_type in ["SHORT_BREAKOUT", "SHORT_REVERSAL"]:
                 continue
             if macro_direction == "BEARISH" and signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"]:
@@ -338,25 +343,32 @@ class MarketScanner:
             if macro_direction == "NEUTRAL":
                 continue
 
-            # 2. NO COMPRAR EN LA ESTELA DE OTRA SUBA ANTERIOR (Vela anterior explosiva)
+            # 2. NO COMPRAR EN LA ESTELA DE OTRA SUBA ANTERIOR
             if prev_breakout == "YES" and signal_type in ["LONG_BREAKOUT", "SHORT_BREAKOUT"]:
                 continue
 
-            # 🛡️ REGLA DE ORO: SOLO OPERAR EN LOS BORDES DE LAS BANDAS (TUS FLECHAS VERDES/ROJAS)
-            # Si la BB está en UPPER, SOLO podemos vender (SHORT_REVERSAL)
-            if bb_price == "UPPER":
-                if signal_type != "SHORT_REVERSAL":
-                    continue # Bloquear cualquier compra o ruptura en el techo
-            
-            # Si la BB está en LOWER, SOLO podemos comprar (LONG_REVERSAL)
-            elif bb_price == "LOWER":
-                if signal_type != "LONG_REVERSAL":
-                    continue # Bloquear cualquier venta o ruptura en el suelo
-            
-            # Si está en la zona media, NO OPERAMOS (ni compra ni venta)
-            else:
-                continue
+            # 🛡️ NUEVA REGLA DE ORO: TENDENCIA MACRO + RETROCESO A EMA55
+            # Condiciones para COMPRA (LONG):
+            # 1. EMA55 está por encima de EMA144 (tendencia corta alcista)
+            # 2. EMA144 está por encima de EMA233 (tendencia larga alcista)
+            # 3. El precio está tocando o muy cerca de la EMA55 (PULLBACK)
+            if signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"]:
+                if not (ema55_vs_ema144 == "ABOVE" and ema144_vs_ema233 == "ABOVE"):
+                    continue
+                if precio_vs_ema55 not in ["TOUCHING", "NEAR"]:
+                    continue  # No entrar si el precio está lejos de la EMA55
 
+            # Condiciones para VENTA (SHORT):
+            # 1. EMA55 está por debajo de EMA144 (tendencia corta bajista)
+            # 2. EMA144 está por debajo de EMA233 (tendencia larga bajista)
+            # 3. El precio está tocando o muy cerca de la EMA55 (PULLBACK)
+            if signal_type in ["SHORT_BREAKOUT", "SHORT_REVERSAL"]:
+                if not (ema55_vs_ema144 == "BELOW" and ema144_vs_ema233 == "BELOW"):
+                    continue
+                if precio_vs_ema55 not in ["TOUCHING", "NEAR"]:
+                    continue  # No entrar si el precio está lejos de la EMA55
+
+            # Calcular puntaje del patrón
             score = 0
             total = 0
 
@@ -377,13 +389,15 @@ class MarketScanner:
 
             match_ratio = score / total
 
-            # 🟢 BONIFICACIONES PARA LAS ENTRADAS DE BAJO RIESGO
-            # Por ser una reversión en el borde de la banda, le damos +0.20
-            match_ratio += 0.20
-            
-            # Si encima hay un SQUEEZE, la entrada es aún más segura, +0.10 extra
-            if bb_state in ["MAX_SQUEEZE", "SQUEEZE"]:
-                match_ratio += 0.10
+            # 🟢 BONIFICACIÓN POR TOCAR LA EMA55
+            if precio_vs_ema55 == "TOUCHING":
+                match_ratio += 0.20  # Bono grande si toca justo la EMA55
+
+            # 🔴 PENALIZACIÓN POR COMPRAR EN LA PARTE ALTA DE UN SQUEEZE
+            if bb_state in ["MAX_SQUEEZE", "SQUEEZE"] and bb_price in ["MID_TO_UPPER", "UPPER"]:
+                if signal_type in ["LONG_BREAKOUT"]:
+                    match_ratio *= 0.60  # Penalización del 40%
+                    logger.debug(f"[MarketScanner] 🚫 Penalización fuerte por comprar en la parte alta de un SQUEEZE")
 
             if match_ratio >= 0.40:
                 matches.append({
