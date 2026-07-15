@@ -12,6 +12,8 @@ import asyncio
 import logging
 import sqlite3
 import time
+import json
+import os
 from datetime import datetime, timezone, time as dtime
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple
@@ -160,27 +162,21 @@ class KillSwitch:
 
 
 class PositionCalculator:
-    # ═══════════════════════════════════════════════════════════════
-    #  CONFIGURACIÓN UNIFICADA (M15 + M3)
-    #  SL: 4% del capital | TP: 20% del capital | Leverage: 10x
-    #  TODOS los valores en USDT
-    # ═══════════════════════════════════════════════════════════════
-    
-    POSITION_PCT = 0.30      # ✅ CORREGIDO: 30% del capital
-    SL_MAX_PCT = 0.40        # 40% de la posición = 4% capital
-    TP_MULTIPLE = 5.0        # 5x SL = 20% capital
-    LEVERAGE = 10            # 10x
-    ST_REDUCTION = 0.50      # 50% para activos ST
+    POSITION_PCT = 0.30
+    SL_MAX_PCT = 0.40
+    TP_MULTIPLE = 5.0
+    LEVERAGE = 10
+    ST_REDUCTION = 0.50
 
     TIMEFRAME_CONFIG = {
         "15m": {
-            "position_pct": 0.30,  # ✅ CORREGIDO: Ahora usa el 30%
+            "position_pct": 0.30,
             "sl_pct": 0.40,
             "tp_multiple": 5.0,
             "leverage": 10,
         },
         "3m": {
-            "position_pct": 0.30,  # ✅ CORREGIDO: Ahora usa el 30%
+            "position_pct": 0.30,
             "sl_pct": 0.40,
             "tp_multiple": 5.0,
             "leverage": 10,
@@ -287,7 +283,6 @@ class StructureExitEngine:
         ema21_prev = float(prev["ema21"])
         ema55_prev = float(prev["ema55"])
 
-        # ✅ NUEVA LÓGICA: DETECCIÓN DE REVERSIÓN POR EMA233 DE 1H
         if df_1h is not None and not df_1h.empty:
             last_1h = df_1h.iloc[-1]
             prev_1h = df_1h.iloc[-2]
@@ -306,7 +301,6 @@ class StructureExitEngine:
                 if low_1h <= ema233_1h and close_1h > ema233_1h:
                     return True, CloseReason.REVERSE, f"Rechazo en EMA233 (1H) detectado - Revertir a LONG"
 
-        # Lógica de cruce de EMAs rápida (triple techo/suelo en timeframe bajo)
         if position.side == PositionSide.LONG:
             cross_down = (ema21 < ema55) and (ema21_prev >= ema55_prev)
             if cross_down:
@@ -381,7 +375,7 @@ class RiskManager:
         leverage: int = 10,
         db_path: str = "patterns.db",
         max_positions: int = 3,
-        position_pct: float = 0.30,   # ✅ Cambio de 0.10 a 0.30
+        position_pct: float = 0.30,
         sl_pct: float = 0.40,
         tp_multiple: float = 5.0,
         st_reduction: float = 0.50,
@@ -405,14 +399,37 @@ class RiskManager:
         self._symbol_cooldown: Dict[str, float] = {}
         self._symbol_daily_entries: Dict[str, int] = defaultdict(int)
         self._last_entry_date: Dict[str, str] = {}
+        
+        # 🛡️ ARCHIVO DE MEMORIA PERSISTENTE PARA COOLDOWN
+        self.cooldown_file = "cooldowns.json"
+        self._load_cooldowns()
 
         logger.info(
             f"[RiskManager] Iniciado | Modo: {mode.value} | "
             f"Leverage: {leverage}x | Max posiciones: {max_positions} | "
-            f"Posición: {position_pct*100:.0f}% | SL: {sl_pct*100:.0f}% de posición ({sl_pct*position_pct*100:.1f}% capital) | "
-            f"TP: {tp_multiple}x SL ({sl_pct*tp_multiple*position_pct*100:.1f}% capital) | "
-            f"R:R: {tp_multiple:.1f}:1 | Cooldown: {cooldown_minutes}min"
+            f"Posición: {position_pct*100:.0f}% | SL: {sl_pct*100:.0f}% de posición | "
+            f"TP: {tp_multiple}x SL | Cooldown: {cooldown_minutes}min"
         )
+
+    def _load_cooldowns(self):
+        """Carga los cooldowns desde el archivo JSON para que sobrevivan a los reinicios."""
+        if os.path.exists(self.cooldown_file):
+            try:
+                with open(self.cooldown_file, 'r') as f:
+                    data = json.load(f)
+                    # Convertir los timestamps guardados como string a float
+                    self._symbol_cooldown = {k: float(v) for k, v in data.items()}
+                    logger.info(f"[RiskManager] Cargados {len(self._symbol_cooldown)} cooldowns desde archivo.")
+            except Exception as e:
+                logger.warning(f"[RiskManager] Error cargando cooldowns: {e}")
+
+    def _save_cooldowns(self):
+        """Guarda los cooldowns en el archivo JSON."""
+        try:
+            with open(self.cooldown_file, 'w') as f:
+                json.dump(self._symbol_cooldown, f, indent=2)
+        except Exception as e:
+            logger.error(f"[RiskManager] Error guardando cooldowns: {e}")
 
     async def update_capital(self) -> CapitalState:
         if self.mode == BotMode.DRY_RUN:
@@ -469,9 +486,11 @@ class RiskManager:
         if signal.symbol in self._symbol_cooldown:
             elapsed = time.time() - self._symbol_cooldown[signal.symbol]
             if elapsed < self.cooldown_minutes * 60:
+                logger.debug(f"[RiskManager] {signal.symbol} en cooldown por {int((self.cooldown_minutes*60 - elapsed)/60)} min más.")
                 return None
             else:
                 del self._symbol_cooldown[signal.symbol]
+                self._save_cooldowns()  # ✅ Guardar cambios en el archivo
 
         today = datetime.now(timezone.utc).date().isoformat()
         if self._last_entry_date.get(signal.symbol) != today:
@@ -545,7 +564,7 @@ class RiskManager:
             timeframe=position_size.timeframe,
             highest_price=position_size.entry_price,
             lowest_price=position_size.entry_price,
-            is_st_asset=position_size.is_st_asset,
+            is_st_asset=position_size            is_st_asset=position_size.is_st_asset,
             score=score,
             signal_type=signal_type,
             arrow_color=arrow_color,
@@ -554,161 +573,163 @@ class RiskManager:
         logger.info(f"[RiskManager] 📝 Posición registrada: {pos.symbol} {pos.side.value} {pos.timeframe}")
         return pos
 
-    async def monitor_positions(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, Tuple[bool, CloseReason, str]]:
-        results = {}
+async def monitor_positions(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, Tuple[bool, CloseReason, str]]:
+    results = {}
 
-        for symbol, position in list(self.positions.items()):
-            if symbol not in dfs:
-                continue
+    for symbol, position in list(self.positions.items()):
+        if symbol not in dfs:
+            continue
 
-            df = dfs[symbol]
-            df = PositionCalculator._prepare_structural_df(df)
-            if df.empty or len(df) < 10:
-                continue
+        df = dfs[symbol]
+        df = PositionCalculator._prepare_structural_df(df)
+        if df.empty or len(df) < 10:
+            continue
 
-            df_1h = None
-            try:
-                df_1h = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=100)
-            except Exception as e:
-                logger.warning(f"[RiskManager] No se pudo obtener 1h para {symbol}: {e}")
+        df_1h = None
+        try:
+            df_1h = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=100)
+        except Exception as e:
+            logger.warning(f"[RiskManager] No se pudo obtener 1h para {symbol}: {e}")
 
-            last = df.iloc[-1]
-            current = float(last["close"])
-            position.current_price = current
+        last = df.iloc[-1]
+        current = float(last["close"])
+        position.current_price = current
 
-            if position.side == PositionSide.LONG:
-                pnl_pct = (current - position.entry_price) / position.entry_price
-                position.highest_price = max(position.highest_price, current)
-            else:
-                pnl_pct = (position.entry_price - current) / position.entry_price
-                position.lowest_price = min(position.lowest_price, current)
-
-            position.unrealized_pnl_pct = pnl_pct * 100 * position.leverage
-            position.unrealized_pnl = position.position_usd * pnl_pct * position.leverage
-
-            # 1. SL/TP fijos
-            if position.side == PositionSide.LONG:
-                if current <= position.stop_loss:
-                    results[symbol] = (True, CloseReason.STOP_LOSS, f"SL tocado {current:.4f}")
-                    continue
-                if current >= position.take_profit:
-                    results[symbol] = (True, CloseReason.TAKE_PROFIT, f"TP tocado {current:.4f}")
-                    continue
-            else:
-                if current >= position.stop_loss:
-                    results[symbol] = (True, CloseReason.STOP_LOSS, f"SL tocado {current:.4f}")
-                    continue
-                if current <= position.take_profit:
-                    results[symbol] = (True, CloseReason.TAKE_PROFIT, f"TP tocado {current:.4f}")
-                    continue
-
-            # 2. Reverso por estructura
-            should_close, reason, notes = StructureExitEngine.evaluate_exit(position, df, df_1h)
-            if should_close:
-                results[symbol] = (True, reason, notes)
-
-        return results
-
-    async def close_position(self, symbol: str, reason: CloseReason, current_price: float) -> Optional[dict]:
-        if symbol not in self.positions:
-            return None
-
-        pos = self.positions[symbol]
-
-        if pos.side == PositionSide.LONG:
-            pnl_pct = (current_price - pos.entry_price) / pos.entry_price
+        if position.side == PositionSide.LONG:
+            pnl_pct = (current - position.entry_price) / position.entry_price
+            position.highest_price = max(position.highest_price, current)
         else:
-            pnl_pct = (pos.entry_price - current_price) / pos.entry_price
+            pnl_pct = (position.entry_price - current) / position.entry_price
+            position.lowest_price = min(position.lowest_price, current)
 
-        pnl_usd = pos.position_usd * pnl_pct * pos.leverage
+        position.unrealized_pnl_pct = pnl_pct * 100 * position.leverage
+        position.unrealized_pnl = position.position_usd * pnl_pct * position.leverage
 
-        open_dt = datetime.fromisoformat(pos.open_time)
-        now_dt = datetime.now(timezone.utc)
-        duration_m = (now_dt - open_dt).total_seconds() / 60
+        # 1. SL/TP fijos
+        if position.side == PositionSide.LONG:
+            if current <= position.stop_loss:
+                results[symbol] = (True, CloseReason.STOP_LOSS, f"SL tocado {current:.4f}")
+                continue
+            if current >= position.take_profit:
+                results[symbol] = (True, CloseReason.TAKE_PROFIT, f"TP tocado {current:.4f}")
+                continue
+        else:
+            if current >= position.stop_loss:
+                results[symbol] = (True, CloseReason.STOP_LOSS, f"SL tocado {current:.4f}")
+                continue
+            if current <= position.take_profit:
+                results[symbol] = (True, CloseReason.TAKE_PROFIT, f"TP tocado {current:.4f}")
+                continue
 
-        logger.info(
-            f"[RiskManager] {'🟢' if pnl_usd > 0 else '🔴'} "
-            f"Cerrando {symbol} {pos.side.value} | PnL: {pnl_usd:.2f} USDT ({pnl_pct*100:.1f}%) | "
-            f"Razón: {reason.value} | Duración: {duration_m:.0f}min"
+        # 2. Reverso por estructura
+        should_close, reason, notes = StructureExitEngine.evaluate_exit(position, df, df_1h)
+        if should_close:
+            results[symbol] = (True, reason, notes)
+
+    return results
+
+async def close_position(self, symbol: str, reason: CloseReason, current_price: float) -> Optional[dict]:
+    if symbol not in self.positions:
+        return None
+
+    pos = self.positions[symbol]
+
+    if pos.side == PositionSide.LONG:
+        pnl_pct = (current_price - pos.entry_price) / pos.entry_price
+    else:
+        pnl_pct = (pos.entry_price - current_price) / pos.entry_price
+
+    pnl_usd = pos.position_usd * pnl_pct * pos.leverage
+
+    open_dt = datetime.fromisoformat(pos.open_time)
+    now_dt = datetime.now(timezone.utc)
+    duration_m = (now_dt - open_dt).total_seconds() / 60
+
+    logger.info(
+        f"[RiskManager] {'🟢' if pnl_usd > 0 else '🔴'} "
+        f"Cerrando {symbol} {pos.side.value} | PnL: {pnl_usd:.2f} USDT ({pnl_pct*100:.1f}%) | "
+        f"Razón: {reason.value} | Duración: {duration_m:.0f}min"
+    )
+
+    # ✅ ACTIVAR EL COOLDOWN Y GUARDARLO EN EL ARCHIVO
+    self._symbol_cooldown[symbol] = time.time()
+    self._save_cooldowns()
+
+    if pos.pattern_id:
+        self._update_pattern_result(
+            pattern_id=pos.pattern_id,
+            exit_price=current_price,
+            exit_reason=reason.value,
+            pnl_percent=pnl_pct * 100,
+            pnl_usd=pnl_usd,
+            duration_min=duration_m,
         )
 
-        self._symbol_cooldown[symbol] = time.time()
+    self._capital.total_balance += pnl_usd
+    self._capital.available += pos.position_usd + pnl_usd
+    self._capital.day_pnl += pnl_usd
 
-        if pos.pattern_id:
-            self._update_pattern_result(
-                pattern_id=pos.pattern_id,
-                exit_price=current_price,
-                exit_reason=reason.value,
-                pnl_percent=pnl_pct * 100,
-                pnl_usd=pnl_usd,
-                duration_min=duration_m,
-            )
+    del self.positions[symbol]
 
-        self._capital.total_balance += pnl_usd
-        self._capital.available += pos.position_usd + pnl_usd
-        self._capital.day_pnl += pnl_usd
+    result = {
+        "symbol": symbol,
+        "side": pos.side.value,
+        "entry": pos.entry_price,
+        "exit": current_price,
+        "pnl_usd": round(pnl_usd, 2),
+        "pnl_pct": round(pnl_pct * 100, 2),
+        "reason": reason.value,
+        "duration_min": round(duration_m, 0),
+        "reverse": reason == CloseReason.REVERSE,
+        "timeframe": pos.timeframe,
+    }
 
-        del self.positions[symbol]
+    if reason == CloseReason.REVERSE:
+        reverse_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
+        result["reverse_side"] = reverse_side.value
+        result["reverse_price"] = current_price
+        logger.info(f"[RiskManager] 🔄 REVERSO: abrir {reverse_side.value} en {symbol} @ {current_price}")
 
-        result = {
-            "symbol": symbol,
-            "side": pos.side.value,
-            "entry": pos.entry_price,
-            "exit": current_price,
-            "pnl_usd": round(pnl_usd, 2),
-            "pnl_pct": round(pnl_pct * 100, 2),
-            "reason": reason.value,
-            "duration_min": round(duration_m, 0),
-            "reverse": reason == CloseReason.REVERSE,
-            "timeframe": pos.timeframe,
-        }
+    return result
 
-        if reason == CloseReason.REVERSE:
-            reverse_side = PositionSide.SHORT if pos.side == PositionSide.LONG else PositionSide.LONG
-            result["reverse_side"] = reverse_side.value
-            result["reverse_price"] = current_price
-            logger.info(f"[RiskManager] 🔄 REVERSO: abrir {reverse_side.value} en {symbol} @ {current_price}")
+def _update_pattern_result(self, pattern_id: int, exit_price: float, exit_reason: str, pnl_percent: float, pnl_usd: float, duration_min: float):
+    trade_result = "WIN" if pnl_usd > 0 else "LOSS"
+    try:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                UPDATE patterns SET
+                    exit_price=?, exit_reason=?, pnl_percent=?,
+                    pnl_usd=?, duration_min=?, trade_result=?
+                WHERE id=?
+            """, (exit_price, exit_reason, pnl_percent, pnl_usd, duration_min, trade_result, pattern_id))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"[BD] Error actualizando patrón {pattern_id}: {e}")
 
-        return result
-
-    def _update_pattern_result(self, pattern_id: int, exit_price: float, exit_reason: str, pnl_percent: float, pnl_usd: float, duration_min: float):
-        trade_result = "WIN" if pnl_usd > 0 else "LOSS"
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("""
-                    UPDATE patterns SET
-                        exit_price=?, exit_reason=?, pnl_percent=?,
-                        pnl_usd=?, duration_min=?, trade_result=?
-                    WHERE id=?
-                """, (exit_price, exit_reason, pnl_percent, pnl_usd, duration_min, trade_result, pattern_id))
-                conn.commit()
-        except Exception as e:
-            logger.error(f"[BD] Error actualizando patrón {pattern_id}: {e}")
-
-    def get_status(self) -> dict:
-        return {
-            "mode": self.mode.value,
-            "balance": self._capital.total_balance,
-            "available": self._capital.available,
-            "day_start": self._capital.day_start_balance,
-            "day_pnl": self._capital.day_pnl,
-            "day_pnl_pct": self._capital.day_pnl_pct,
-            "drawdown_pct": self._capital.drawdown_pct if hasattr(self._capital, 'drawdown_pct') else 0.0,
-            "kill_switch": self.kill_switch.active,
-            "kill_switch_reason": self.kill_switch.reason,
-            "open_positions": len(self.positions),
-            "positions": {
-                sym: {
-                    "side": pos.side.value,
-                    "entry": pos.entry_price,
-                    "current": pos.current_price,
-                    "pnl_usd": pos.unrealized_pnl,
-                    "pnl_pct": pos.unrealized_pnl_pct,
-                    "sl": pos.stop_loss,
-                    "tp": pos.take_profit,
-                    "timeframe": pos.timeframe,
-                    "is_st": pos.is_st_asset,
-                }
-                for sym, pos in self.positions.items()
-            },
-        }
+def get_status(self) -> dict:
+    return {
+        "mode": self.mode.value,
+        "balance": self._capital.total_balance,
+        "available": self._capital.available,
+        "day_start": self._capital.day_start_balance,
+        "day_pnl": self._capital.day_pnl,
+        "day_pnl_pct": self._capital.day_pnl_pct,
+        "drawdown_pct": self._capital.drawdown_pct if hasattr(self._capital, 'drawdown_pct') else 0.0,
+        "kill_switch": self.kill_switch.active,
+        "kill_switch_reason": self.kill_switch.reason,
+        "open_positions": len(self.positions),
+        "positions": {
+            sym: {
+                "side": pos.side.value,
+                "entry": pos.entry_price,
+                "current": pos.current_price,
+                "pnl_usd": pos.unrealized_pnl,
+                "pnl_pct": pos.unrealized_pnl_pct,
+                "sl": pos.stop_loss,
+                "tp": pos.take_profit,
+                "timeframe": pos.timeframe,
+                "is_st": pos.is_st_asset,
+            }
+            for sym, pos in self.positions.items()
+        },
+}
