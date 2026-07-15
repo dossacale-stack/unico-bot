@@ -135,8 +135,8 @@ class BybitAPIManager:
         sandbox: bool = True,
         dry_run: bool = False,
         cache_ttl_seconds: float = 60.0,
-        circuit_max_failures: int = 50,          # ✅ Tolerancia máxima
-        circuit_recovery_timeout: float = 30.0,  # ✅ Tiempo de recuperación
+        circuit_max_failures: int = 50,
+        circuit_recovery_timeout: float = 30.0,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -515,7 +515,7 @@ class BybitAPIManager:
                 raise
 
     # ──────────────────────────────────────────
-    #  COLOCAR ORDEN (CORREGIDO EL ERROR DE SINTAXIS EN LA LÍNEA 538)
+    #  COLOCAR ORDEN - CORREGIDO PARA EVITAR SLIPPAGE
     # ──────────────────────────────────────────
     async def place_order(
         self,
@@ -531,35 +531,47 @@ class BybitAPIManager:
         params: Dict[str, Any] = {"reduceOnly": reduce_only}
         if stop_loss:
             params["stopLoss"] = str(stop_loss)
-            if take_profit:
-                params["takeProfit"] = str(take_profit)
+        if take_profit:
+            params["takeProfit"] = str(take_profit)
 
-            try:
-                order = await self._safe_call(
-                    lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
-                    endpoint_type="private",
-                )
+        # 🛡️ SOLUCIÓN AL SLIPPAGE: Convertir Market Order en Limit Order con tolerancia del 0.5%
+        # Si no nos pasan precio o nos dicen 'market', nosotros forzamos un límite.
+        if order_type == "market" or price is None:
+            ticker = await self._safe_call(
+                lambda: self.exchange.fetch_ticker(symbol),
+                endpoint_type="public"
+            )
+            # Calculamos el precio límite: 0.5% de margen para asegurar que llene rápido pero no se deslice
+            if side.lower() == "buy":
+                price = ticker["last"] * 1.005  # +0.5% para compras
+            else:
+                price = ticker["last"] * 0.995  # -0.5% para ventas
+            order_type = "limit"
 
-                # ✅ LÍNEA CORREGIDA (Asegura que la f-string esté bien cerrada y no se rompa)
-                logger.info(
-                    f"[Order] ✅ {side.upper()} {amount} {symbol} @ "
-                    f"{'market' if not price else price} | ID: {order.get('id')}"
-                )
-                return order
+        try:
+            order = await self._safe_call(
+                lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
+                endpoint_type="private",
+            )
 
-            except ccxt.InvalidOrder as e:
-                logger.warning(f"[InvalidOrder] Ajustando parámetros: {e}")
-                params.pop("stopLoss", None)
-                params.pop("takeProfit", None)
-                order = await self._safe_call(
-                    lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
-                    endpoint_type="private",
-                )
-                logger.warning(
-                    f"[Order] ⚠️ Orden colocada SIN SL/TP por InvalidOrder. "
-                    f"Requiere ajuste manual. ID: {order.get('id')}"
-                )
-                return order
+            logger.info(
+                f"[Order] ✅ {side.upper()} {amount} {symbol} @ {price} | ID: {order.get('id')}"
+            )
+            return order
+
+        except ccxt.InvalidOrder as e:
+            logger.warning(f"[InvalidOrder] Ajustando parámetros: {e}")
+            params.pop("stopLoss", None)
+            params.pop("takeProfit", None)
+            order = await self._safe_call(
+                lambda: self.exchange.create_order(symbol, order_type, side, amount, price, params),
+                endpoint_type="private",
+            )
+            logger.warning(
+                f"[Order] ⚠️ Orden colocada SIN SL/TP por InvalidOrder. "
+                f"Requiere ajuste manual. ID: {order.get('id')}"
+            )
+            return order
 
     async def cancel_order(self, order_id: str, symbol: str) -> Dict:
         return await self._safe_call(
