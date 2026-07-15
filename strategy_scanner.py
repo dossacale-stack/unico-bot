@@ -79,7 +79,7 @@ class MarketScanner:
         self.position_pct = position_pct
         self.db_path = db_path
         self.signal_cooldown_seconds = signal_cooldown_seconds
-        self.timeframes = timeframes or ["15m", "3m"]
+        self.timeframes = timeframes or ["15m"]
         self.patterns_by_tf = {}
         self._signal_cooldown = {}
         self._load_all_patterns()
@@ -126,7 +126,7 @@ class MarketScanner:
                 if now - self._signal_cooldown[symbol] < 300:
                     continue
 
-            # ⚡ 1. OBTENER TENDENCIA MACRO (1 HORA) PARA FILTRAR ENTRADAS
+            # 1. OBTENER TENDENCIA MACRO (1 HORA) PARA NO IR A CONTRACORRIENTE
             macro_direction = "NEUTRAL"
             try:
                 df_1h = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=100)
@@ -143,7 +143,7 @@ class MarketScanner:
             except Exception as exc:
                 logger.debug(f"[MarketScanner] No se pudo obtener macro 1h para {symbol}: {exc}")
 
-            # ⚡ 2. ANALIZAR TIMEFRAMES BAJOS (M3 y M15)
+            # 2. ANALIZAR TIMEFRAME 15M
             for timeframe in self.timeframes:
                 try:
                     df = await self.api.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
@@ -153,17 +153,7 @@ class MarketScanner:
                     behavior = self._describe_behavior(df)
                     symbol_code = self._normalize_symbol(symbol)
                     
-                    # 🛡️ 3. FILTRO DE CONFLUENCIA: Si es 3m, obtener el 15m
-                    behavior_15m = None
-                    if timeframe == "3m":
-                        try:
-                            df_15m = await self.api.fetch_ohlcv(symbol, timeframe="15m", limit=100)
-                            if df_15m is not None and len(df_15m) > 40:
-                                behavior_15m = self._describe_behavior(df_15m)
-                        except Exception as exc:
-                            logger.debug(f"[MarketScanner] Error obteniendo 15m para confluencia en {symbol}: {exc}")
-
-                    matches = self._match_patterns(symbol_code, behavior, timeframe, macro_direction, behavior_15m)
+                    matches = self._match_patterns(symbol_code, behavior, timeframe, macro_direction)
 
                     if not matches:
                         continue
@@ -323,7 +313,7 @@ class MarketScanner:
             "previous_breakout": previous_breakout,
         }
 
-    def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any], timeframe: str, macro_direction: str, behavior_15m: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any], timeframe: str, macro_direction: str) -> List[Dict[str, Any]]:
         matches = []
         patterns = self.patterns_by_tf.get(timeframe, [])
 
@@ -337,14 +327,19 @@ class MarketScanner:
                 continue
 
             signal_type = pattern.get("signal_type", "")
+            bb_price = behavior.get("bb_precio", "MID")
+            bb_state = behavior.get("bb_estado", "CONTRACTING")
 
-            # 1. Filtro de tendencia macro (1h)
+            # 1. Filtro de tendencia macro (1h) - No operar en contra de la tendencia grande
             if macro_direction == "BULLISH" and signal_type in ["SHORT_BREAKOUT", "SHORT_REVERSAL"]:
                 continue
             if macro_direction == "BEARISH" and signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"]:
                 continue
+            if macro_direction == "NEUTRAL":
+                continue
 
-            if prev_breakout == "YES" and signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"]:
+            # 2. Penalización por vela anterior explosiva (si ya subió, no comprar en el pico siguiente)
+            if prev_breakout == "YES" and signal_type in ["LONG_BREAKOUT", "SHORT_BREAKOUT"]:
                 continue
 
             score = 0
@@ -366,22 +361,34 @@ class MarketScanner:
                 continue
 
             match_ratio = score / total
-            
-            # Penalización por vela anterior explosiva
-            if prev_breakout == "YES" and signal_type in ["LONG_BREAKOUT", "SHORT_BREAKOUT"]:
-                match_ratio *= 0.80
 
-            # 🛡️ NUEVO: Penalización por confluencia de 15m (para entradas de 3m)
-            if timeframe == "3m" and behavior_15m and signal_type in ["LONG_BREAKOUT", "SHORT_BREAKOUT"]:
-                bb_15m = behavior_15m.get("bb_precio", "MID")
-                # Si en 15m el precio está en la zona alta o tocando la banda superior, penalizamos un 30% el BREAKOUT en 3m
-                if signal_type == "LONG_BREAKOUT" and bb_15m in ["UPPER", "MID_TO_UPPER"]:
-                    match_ratio *= 0.70
-                    logger.debug(f"[MarketScanner] 🔻 Penalización por 15m alto ({bb_15m}) en señal LONG BREAKOUT de 3m")
-                # Si en 15m el precio está en la zona baja o tocando la banda inferior, penalizamos un 30% el SHORT BREAKOUT en 3m
-                elif signal_type == "SHORT_BREAKOUT" and bb_15m in ["LOWER"]:
-                    match_ratio *= 0.70
-                    logger.debug(f"[MarketScanner] 🔻 Penalización por 15m bajo ({bb_15m}) en señal SHORT BREAKOUT de 3m")
+            # 🚨 NUEVA REGLA PARA 15M: PROHIBIR RUPTURAS EN PICO. PRIORIZAR REBOTES EN LAS EMAS.
+            if timeframe == "15m":
+                
+                # Si es LONG_BREAKOUT (comprar en el pico de la vela verde), lo penalizamos un 90% (casi imposible).
+                if signal_type == "LONG_BREAKOUT":
+                    match_ratio *= 0.10 # Penalización brutal para que no entre en picos
+                    logger.debug(f"[MarketScanner] 🔻 Penalización del 90% a LONG_BREAKOUT en 15m para evitar picos")
+                
+                # Si es SHORT_BREAKOUT (vender en el suelo de una vela roja), lo penalizamos un 90%.
+                if signal_type == "SHORT_BREAKOUT":
+                    match_ratio *= 0.10
+
+                # 🟢 PRIORIZAR REVERSIÓN (Tus flechas verdes):
+                # Si es una reversión y el precio está en la zona baja de la BB, le damos una gran bonificación.
+                if signal_type in ["LONG_REVERSAL", "SHORT_REVERSAL"]:
+                    match_ratio += 0.15 # Bonificación base por ser reversión
+                    
+                    # Si además las BB están en compresión (SQUEEZE), la entrada es muy segura. Bonificación extra.
+                    if bb_state in ["MAX_SQUEEZE", "SQUEEZE"]:
+                        match_ratio += 0.10
+                        logger.debug(f"[MarketScanner] 🟢 Bonificación extra por SQUEEZE en 15m en entrada de reversión")
+                        
+                    # Si además está tocando el borde de la banda (LOWER para compras, UPPER para ventas), la entrada es la flecha verde exacta.
+                    if signal_type == "LONG_REVERSAL" and bb_price in ["LOWER"]:
+                        match_ratio += 0.15
+                    if signal_type == "SHORT_REVERSAL" and bb_price in ["UPPER"]:
+                        match_ratio += 0.15
 
             if match_ratio >= 0.40:
                 matches.append({
@@ -427,4 +434,4 @@ class MarketScanner:
             df=df,
             pattern_id=pattern.get("id"),
             timeframe=timeframe,
-        )
+    )
