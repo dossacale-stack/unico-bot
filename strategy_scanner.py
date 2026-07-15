@@ -152,7 +152,18 @@ class MarketScanner:
 
                     behavior = self._describe_behavior(df)
                     symbol_code = self._normalize_symbol(symbol)
-                    matches = self._match_patterns(symbol_code, behavior, timeframe, macro_direction)
+                    
+                    # 🛡️ 3. FILTRO DE CONFLUENCIA: Si es 3m, obtener el 15m
+                    behavior_15m = None
+                    if timeframe == "3m":
+                        try:
+                            df_15m = await self.api.fetch_ohlcv(symbol, timeframe="15m", limit=100)
+                            if df_15m is not None and len(df_15m) > 40:
+                                behavior_15m = self._describe_behavior(df_15m)
+                        except Exception as exc:
+                            logger.debug(f"[MarketScanner] Error obteniendo 15m para confluencia en {symbol}: {exc}")
+
+                    matches = self._match_patterns(symbol_code, behavior, timeframe, macro_direction, behavior_15m)
 
                     if not matches:
                         continue
@@ -312,7 +323,7 @@ class MarketScanner:
             "previous_breakout": previous_breakout,
         }
 
-    def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any], timeframe: str, macro_direction: str) -> List[Dict[str, Any]]:
+    def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any], timeframe: str, macro_direction: str, behavior_15m: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         matches = []
         patterns = self.patterns_by_tf.get(timeframe, [])
 
@@ -327,7 +338,7 @@ class MarketScanner:
 
             signal_type = pattern.get("signal_type", "")
 
-            # ✅ NUEVO FILTRO DE CONFLUENCIA MACRO (1 HORA)
+            # 1. Filtro de tendencia macro (1h)
             if macro_direction == "BULLISH" and signal_type in ["SHORT_BREAKOUT", "SHORT_REVERSAL"]:
                 continue
             if macro_direction == "BEARISH" and signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"]:
@@ -356,8 +367,21 @@ class MarketScanner:
 
             match_ratio = score / total
             
+            # Penalización por vela anterior explosiva
             if prev_breakout == "YES" and signal_type in ["LONG_BREAKOUT", "SHORT_BREAKOUT"]:
                 match_ratio *= 0.80
+
+            # 🛡️ NUEVO: Penalización por confluencia de 15m (para entradas de 3m)
+            if timeframe == "3m" and behavior_15m and signal_type in ["LONG_BREAKOUT", "SHORT_BREAKOUT"]:
+                bb_15m = behavior_15m.get("bb_precio", "MID")
+                # Si en 15m el precio está en la zona alta o tocando la banda superior, penalizamos un 30% el BREAKOUT en 3m
+                if signal_type == "LONG_BREAKOUT" and bb_15m in ["UPPER", "MID_TO_UPPER"]:
+                    match_ratio *= 0.70
+                    logger.debug(f"[MarketScanner] 🔻 Penalización por 15m alto ({bb_15m}) en señal LONG BREAKOUT de 3m")
+                # Si en 15m el precio está en la zona baja o tocando la banda inferior, penalizamos un 30% el SHORT BREAKOUT en 3m
+                elif signal_type == "SHORT_BREAKOUT" and bb_15m in ["LOWER"]:
+                    match_ratio *= 0.70
+                    logger.debug(f"[MarketScanner] 🔻 Penalización por 15m bajo ({bb_15m}) en señal SHORT BREAKOUT de 3m")
 
             if match_ratio >= 0.40:
                 matches.append({
