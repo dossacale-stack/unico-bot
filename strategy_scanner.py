@@ -126,7 +126,7 @@ class MarketScanner:
                 if now - self._signal_cooldown[symbol] < 300:
                     continue
 
-            # 1. OBTENER TENDENCIA MACRO (1 HORA) PARA NO IR A CONTRACORRIENTE
+            # 1. OBTENER TENDENCIA MACRO (1 HORA)
             macro_direction = "NEUTRAL"
             try:
                 df_1h = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=100)
@@ -330,7 +330,7 @@ class MarketScanner:
             bb_price = behavior.get("bb_precio", "MID")
             bb_state = behavior.get("bb_estado", "CONTRACTING")
 
-            # 1. Filtro de tendencia macro (1h) - No operar en contra de la tendencia grande
+            # 1. FILTRO MACRO (1 HORA): No operar en contra de la tendencia grande
             if macro_direction == "BULLISH" and signal_type in ["SHORT_BREAKOUT", "SHORT_REVERSAL"]:
                 continue
             if macro_direction == "BEARISH" and signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"]:
@@ -338,8 +338,23 @@ class MarketScanner:
             if macro_direction == "NEUTRAL":
                 continue
 
-            # 2. Penalización por vela anterior explosiva (si ya subió, no comprar en el pico siguiente)
+            # 2. NO COMPRAR EN LA ESTELA DE OTRA SUBA ANTERIOR (Vela anterior explosiva)
             if prev_breakout == "YES" and signal_type in ["LONG_BREAKOUT", "SHORT_BREAKOUT"]:
+                continue
+
+            # 🛡️ REGLA DE ORO: SOLO OPERAR EN LOS BORDES DE LAS BANDAS (TUS FLECHAS VERDES/ROJAS)
+            # Si la BB está en UPPER, SOLO podemos vender (SHORT_REVERSAL)
+            if bb_price == "UPPER":
+                if signal_type != "SHORT_REVERSAL":
+                    continue # Bloquear cualquier compra o ruptura en el techo
+            
+            # Si la BB está en LOWER, SOLO podemos comprar (LONG_REVERSAL)
+            elif bb_price == "LOWER":
+                if signal_type != "LONG_REVERSAL":
+                    continue # Bloquear cualquier venta o ruptura en el suelo
+            
+            # Si está en la zona media, NO OPERAMOS (ni compra ni venta)
+            else:
                 continue
 
             score = 0
@@ -362,33 +377,13 @@ class MarketScanner:
 
             match_ratio = score / total
 
-            # 🚨 NUEVA REGLA PARA 15M: PROHIBIR RUPTURAS EN PICO. PRIORIZAR REBOTES EN LAS EMAS.
-            if timeframe == "15m":
-                
-                # Si es LONG_BREAKOUT (comprar en el pico de la vela verde), lo penalizamos un 90% (casi imposible).
-                if signal_type == "LONG_BREAKOUT":
-                    match_ratio *= 0.10 # Penalización brutal para que no entre en picos
-                    logger.debug(f"[MarketScanner] 🔻 Penalización del 90% a LONG_BREAKOUT en 15m para evitar picos")
-                
-                # Si es SHORT_BREAKOUT (vender en el suelo de una vela roja), lo penalizamos un 90%.
-                if signal_type == "SHORT_BREAKOUT":
-                    match_ratio *= 0.10
-
-                # 🟢 PRIORIZAR REVERSIÓN (Tus flechas verdes):
-                # Si es una reversión y el precio está en la zona baja de la BB, le damos una gran bonificación.
-                if signal_type in ["LONG_REVERSAL", "SHORT_REVERSAL"]:
-                    match_ratio += 0.15 # Bonificación base por ser reversión
-                    
-                    # Si además las BB están en compresión (SQUEEZE), la entrada es muy segura. Bonificación extra.
-                    if bb_state in ["MAX_SQUEEZE", "SQUEEZE"]:
-                        match_ratio += 0.10
-                        logger.debug(f"[MarketScanner] 🟢 Bonificación extra por SQUEEZE en 15m en entrada de reversión")
-                        
-                    # Si además está tocando el borde de la banda (LOWER para compras, UPPER para ventas), la entrada es la flecha verde exacta.
-                    if signal_type == "LONG_REVERSAL" and bb_price in ["LOWER"]:
-                        match_ratio += 0.15
-                    if signal_type == "SHORT_REVERSAL" and bb_price in ["UPPER"]:
-                        match_ratio += 0.15
+            # 🟢 BONIFICACIONES PARA LAS ENTRADAS DE BAJO RIESGO
+            # Por ser una reversión en el borde de la banda, le damos +0.20
+            match_ratio += 0.20
+            
+            # Si encima hay un SQUEEZE, la entrada es aún más segura, +0.10 extra
+            if bb_state in ["MAX_SQUEEZE", "SQUEEZE"]:
+                match_ratio += 0.10
 
             if match_ratio >= 0.40:
                 matches.append({
@@ -434,4 +429,4 @@ class MarketScanner:
             df=df,
             pattern_id=pattern.get("id"),
             timeframe=timeframe,
-    )
+        )
