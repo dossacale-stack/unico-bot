@@ -31,12 +31,12 @@ CONFIG: Dict[str, Any] = {
     
     "SCANNER_ENABLED": True,
     "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "10.0")),
-    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.40")),
+    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.60")), # ✅ AUMENTADO DE 0.40 A 0.60 (Mucho más exigente)
     "MIN_RR": float(os.getenv("MIN_RR", "3.0")),
     
     "TIMEFRAMES": ["15m", "3m"],
     
-    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "3")),
+    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "2")),
     "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.30")),
     "SL_PCT": float(os.getenv("SL_PCT", "0.40")),
     "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
@@ -49,7 +49,7 @@ CONFIG: Dict[str, Any] = {
     "DB_PATH": os.getenv("DB_PATH", "patterns.db"),
     "CAPITAL_FILE": os.getenv("CAPITAL_FILE", "capital_inicial.json"),
     
-    # ✅ WATCHLIST EXCLUSIVA (ACTIVOS DE LAS IMÁGENES - SIN BTC NI GRANDES CAPS)
+    # ✅ WATCHLIST EXCLUSIVA
     "WATCHLIST": [
         "EVAASUSDT", "LABUSDT", "B3USDT", "SXTUSDT", 
         "SKHYNIXUSDT", "SKHYUSDT", "AXTIUSDT", "LITUSDT", 
@@ -93,7 +93,7 @@ class UnicoBot:
             api_manager=self.api,
             watchlist=config["WATCHLIST"],
             scan_interval=config["SCAN_INTERVAL"],
-            min_score=config["MIN_SCORE"],
+            min_score=config["MIN_SCORE"], # Ahora usará 0.60
             min_rr=config["MIN_RR"],
             position_pct=config["POSITION_PCT"],
             db_path=config["DB_PATH"],
@@ -126,6 +126,7 @@ class UnicoBot:
             + f" Watchlist: {len(self.config['WATCHLIST'])} símbolos\n"
             + f" Timeframes: {self.config.get('TIMEFRAMES', ['15m', '3m'])}\n"
             + f" Intervalo: {self.config['SCAN_INTERVAL']}s\n"
+            + f" Score mínimo: {self.config['MIN_SCORE']} (Muy exigente)\n"
             + f" Máximo posiciones: {self.config['MAX_POSITIONS']}\n"
             + f" Posición: {self.config['POSITION_PCT']*100:.0f}% capital\n"
             + f" SL: {self.config['SL_PCT']*100:.0f}% de posición\n"
@@ -170,25 +171,30 @@ class UnicoBot:
             self.running = False
             return
 
-        if self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
+        # ✅ NUEVA VERIFICACIÓN DE CAPITAL DISPONIBLE
+        # Si el saldo disponible es menos del 15% del total, no operamos hasta que se libere capital.
+        min_available_to_trade = capital.total_balance * 0.15
+        if capital.available < min_available_to_trade:
+            logger.warning(f"⏸️ Saldo disponible muy bajo ({capital.available:.2f} USDT). Esperando liberación de capital...")
+            # No corremos el scanner, simplemente monitoreamos las posiciones.
+        elif self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
             signals = await self.scanner.scan_all()
             self.stats["signals"] += len(signals)
             
-            # ✅ CAMBIO CLAVE PARA PRIORIZAR LAS MEJORES SEÑALES:
             if signals:
-                # 1. Ordenar todas las señales de mayor a menor puntuación (Score)
+                # Ordenar las señales de mayor a menor puntuación
                 signals.sort(key=lambda s: s.score, reverse=True)
                 
-                # 2. Calcular cuántas posiciones libres quedan
+                # Calcular cuántas posiciones libres quedan
                 available_slots = self.config["MAX_POSITIONS"] - len(self.rm.positions)
                 
-                # 3. Procesar solo las mejores señales según el cupo disponible
+                # Procesar solo las mejores señales según el cupo disponible
                 signals_to_process = signals[:available_slots]
                 
                 for signal in signals_to_process:
                     await self._process_signal(signal)
         else:
-            logger.warning("⏸️ Scanner en pausa o máximo de posiciones alcanzado.")
+            logger.debug("⏸️ Scanner en pausa o máximo de posiciones alcanzado.")
 
         if self.rm.positions:
             dfs = {}
@@ -298,6 +304,7 @@ class UnicoBot:
         logger.info(
             f"📊 Ciclo {self.stats['cycles']} | "
             f"Balance: {capital.total_balance:.2f} USDT | "
+            f"Disponible: {capital.available:.2f} USDT | "
             f"Posiciones: {len(self.rm.positions)} {positions_info} | "
             f"Señales: {self.stats['signals']} | "
             f"Abiertas: {self.stats['opened']} | "
