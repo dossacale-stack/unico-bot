@@ -65,7 +65,6 @@ CONFIG: Dict[str, Any] = {
         "AVAAIUSDT", "BLURUSDT", "MMTUSDT", "SKYAIUSDT", 
         "JSTUSDT", "SKLUSDT", "HEIUSDT"
 ],
-    ],
 }
 
 class UnicoBot:
