@@ -36,12 +36,12 @@ CONFIG: Dict[str, Any] = {
     
     "TIMEFRAMES": ["15m"],
     
-    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "1")),       # ✅ CAMBIO: Bajado de 2 a 1 (solo 1 operación a la vez)
+    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "1")),
     "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.30")),
-    "SL_PCT": float(os.getenv("SL_PCT", "0.60")),                 # ✅ CAMBIO: Aumentado de 0.40 a 0.60 (SL más amplio)
+    "SL_PCT": float(os.getenv("SL_PCT", "0.60")),
     "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
     "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
-    "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "60")), # ✅ CAMBIO: Aumentado de 15 a 60 (1 hora de cooldown por símbolo)
+    "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "60")),
     "MAX_ENTRIES_DAILY": int(os.getenv("MAX_ENTRIES_DAILY", "999")),
     
     "LEARNING_ENABLED": os.getenv("LEARNING_ENABLED", "true").lower() == "true",
@@ -49,8 +49,8 @@ CONFIG: Dict[str, Any] = {
     "DB_PATH": os.getenv("DB_PATH", "patterns.db"),
     "CAPITAL_FILE": os.getenv("CAPITAL_FILE", "capital_inicial.json"),
     
-    # ✅ WATCHLIST EXCLUSIVA
-        "WATCHLIST": [
+    # ✅ WATCHLIST FINAL (Activos de tus imágenes)
+    "WATCHLIST": [
         "LABUSDT", "B3USDT", "SXTUSDT", 
         "SKHYNIXUSDT", "SKHYUSDT", "AXTIUSDT", "LITUSDT", 
         "KAITOUSDT", "HEIUSDT", "BLESSUSDT", "USUSDT", 
@@ -126,7 +126,7 @@ class UnicoBot:
     async def initialize(self) -> None:
         logger.info(
             "\n" + "=" * 60 + "\n"
-            + " 🚀 ÚNICO STRATEGY v4.0 — M15 (SIN 3m)\n"
+            + " 🚀 ÚNICO STRATEGY v4.0 — M15\n"
             + f" Modo: {self.mode.value}\n"
             + f" Sandbox: {self.config['SANDBOX']}\n"
             + f" Scanner: {'ON' if self.config['SCANNER_ENABLED'] else 'PAUSE'}\n"
@@ -226,15 +226,16 @@ class UnicoBot:
                 close_result = await self.rm.close_position(symbol, reason, pos.current_price)
                 self.stats["closed"] += 1
                 
+                # ✅ CORRECCIÓN DEL REVERSO AQUÍ (Se eliminaron stop_loss y take_profit)
                 if reason == CloseReason.REVERSE:
                     self.stats["reversals"] += 1
                     reverse_side = "sell" if pos.side == "LONG" else "buy"
                     reverse_order = await self.executor.open_position(
                         symbol=symbol,
                         side=reverse_side,
-                        position_size=pos,
-                        stop_loss=pos.stop_loss,
-                        take_profit=pos.take_profit,
+                        position_size=pos, 
+                        # stop_loss=pos.stop_loss,  <-- ELIMINADO (Causaba error 10001)
+                        # take_profit=pos.take_profit, <-- ELIMINADO
                     )
                     if reverse_order:
                         self.rm.register_position(
@@ -339,7 +340,7 @@ def mostrar_estado() -> None:
         print("\n⚠️  La base de datos de patrones no existe. Ejecuta --init-db.")
         return
     print("\n" + "=" * 60)
-    print("  🧠 ÚNICO STRATEGY v4.0 — M15 (SIN 3m)")
+    print("  🧠 ÚNICO STRATEGY v4.0 — M15")
     print("=" * 60)
     print(f"  Modo: {CONFIG['MODE']}")
     print(f"  Sandbox: {CONFIG['SANDBOX']}")
@@ -395,7 +396,7 @@ async def main() -> None:
 if __name__ == "__main__":
     print("""
 ╔═══════════════════════════════════════════════════════════════╗
-║            🧠 ÚNICO STRATEGY v4.0 — M15 (SIN 3m)            ║
+║            🧠 ÚNICO STRATEGY v4.0 — M15                    ║
 ║         Futuros Perpetuos USDT-M — Bybit                    ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  TIMEFRAMES:                                                 ║
