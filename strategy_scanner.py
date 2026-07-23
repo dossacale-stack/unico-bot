@@ -83,6 +83,9 @@ class MarketScanner:
         self.patterns_by_tf = {}
         self._signal_cooldown = {}
         self._load_all_patterns()
+        
+        # 🧠 MEMORIA PARA EL CONTADOR DE TOQUES A LA EMA55
+        self.ema55_touch_counter = {}
 
     def _normalize_symbol(self, symbol: str) -> str:
         return re.sub(r"[^\w]", "", symbol).upper()
@@ -319,6 +322,22 @@ class MarketScanner:
 
         prev_breakout = behavior.get("previous_breakout", "NO")
 
+        # Variables de comportamiento
+        precio_vs_ema55 = behavior.get("precio_vs_ema55", "")
+        ema55_vs_ema144 = behavior.get("ema55_vs_ema144", "")
+        ema144_vs_ema233 = behavior.get("ema144_vs_ema233", "")
+        bb_state = behavior.get("bb_estado", "CONTRACTING")
+        bb_precio = behavior.get("bb_precio", "MID")
+
+        # 🧠 ACTUALIZAR CONTADOR DE TOQUES A LA EMA55
+        if precio_vs_ema55 in ["TOUCHING", "NEAR"]:
+            if symbol_code not in self.ema55_touch_counter:
+                self.ema55_touch_counter[symbol_code] = 0
+            self.ema55_touch_counter[symbol_code] += 1
+            logger.debug(f"[MarketScanner] 🧠 {symbol_code} tocó la EMA55. Contador: {self.ema55_touch_counter[symbol_code]}")
+
+        current_touches = self.ema55_touch_counter.get(symbol_code, 0)
+
         for pattern in patterns:
             if pattern.get("symbol") not in {symbol_code, "UNIVERSAL"}:
                 continue
@@ -327,48 +346,36 @@ class MarketScanner:
                 continue
 
             signal_type = pattern.get("signal_type", "")
-            
-            # Variables de comportamiento
-            bb_price = behavior.get("bb_precio", "MID")
-            bb_state = behavior.get("bb_estado", "CONTRACTING")
-            ema55_vs_ema144 = behavior.get("ema55_vs_ema144", "")
-            ema144_vs_ema233 = behavior.get("ema144_vs_ema233", "")
-            precio_vs_ema55 = behavior.get("precio_vs_ema55", "")
 
-            # 1. FILTRO MACRO (1 HORA)
-            if macro_direction == "BULLISH" and signal_type in ["SHORT_BREAKOUT", "SHORT_REVERSAL"]:
+            # 🛡️ REGLA 1: FILTRO MACRO OBLIGATORIO (144 vs 233)
+            if signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"] and ema144_vs_ema233 != "ABOVE":
                 continue
-            if macro_direction == "BEARISH" and signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"]:
+            if signal_type in ["SHORT_BREAKOUT", "SHORT_REVERSAL"] and ema144_vs_ema233 != "BELOW":
                 continue
             if macro_direction == "NEUTRAL":
                 continue
 
-            # 2. NO COMPRAR EN LA ESTELA DE OTRA SUBA ANTERIOR
-            if prev_breakout == "YES" and signal_type in ["LONG_BREAKOUT", "SHORT_BREAKOUT"]:
+            # 🛡️ REGLA 2: EVITAR FALSOS EN PICO ANTERIOR
+            if prev_breakout == "YES":
                 continue
 
-            # 🛡️ NUEVA REGLA DE ORO: TENDENCIA MACRO + RETROCESO A EMA55
-            # Condiciones para COMPRA (LONG):
-            # 1. EMA55 está por encima de EMA144 (tendencia corta alcista)
-            # 2. EMA144 está por encima de EMA233 (tendencia larga alcista)
-            # 3. El precio está tocando o muy cerca de la EMA55 (PULLBACK)
-            if signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"]:
-                if not (ema55_vs_ema144 == "ABOVE" and ema144_vs_ema233 == "ABOVE"):
-                    continue
-                if precio_vs_ema55 not in ["TOUCHING", "NEAR"]:
-                    continue  # No entrar si el precio está lejos de la EMA55
+            # 🛡️ REGLA 3: SISTEMA DE PRIORIDAD POR TOQUES A LA EMA55
+            if current_touches > 4:
+                precio_vs_ema144 = behavior.get("precio_vs_ema144", "")
+                precio_vs_ema233 = behavior.get("precio_vs_ema233", "")
+                
+                if signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"]:
+                    if precio_vs_ema144 not in ["TOUCHING", "NEAR"] and precio_vs_ema233 not in ["TOUCHING", "NEAR"]:
+                        continue
+                if signal_type in ["SHORT_BREAKOUT", "SHORT_REVERSAL"]:
+                    if precio_vs_ema144 not in ["TOUCHING", "NEAR"] and precio_vs_ema233 not in ["TOUCHING", "NEAR"]:
+                        continue
 
-            # Condiciones para VENTA (SHORT):
-            # 1. EMA55 está por debajo de EMA144 (tendencia corta bajista)
-            # 2. EMA144 está por debajo de EMA233 (tendencia larga bajista)
-            # 3. El precio está tocando o muy cerca de la EMA55 (PULLBACK)
-            if signal_type in ["SHORT_BREAKOUT", "SHORT_REVERSAL"]:
-                if not (ema55_vs_ema144 == "BELOW" and ema144_vs_ema233 == "BELOW"):
-                    continue
-                if precio_vs_ema55 not in ["TOUCHING", "NEAR"]:
-                    continue  # No entrar si el precio está lejos de la EMA55
+            # 🛡️ REGLA 4: EVITAR SQUEEZES (Bandas de Bollinger apretadas)
+            if bb_state in ["MAX_SQUEEZE", "SQUEEZE"]:
+                continue
 
-            # Calcular puntaje del patrón
+            # Calcular puntaje base del patrón
             score = 0
             total = 0
 
@@ -389,15 +396,25 @@ class MarketScanner:
 
             match_ratio = score / total
 
-            # 🟢 BONIFICACIÓN POR TOCAR LA EMA55
-            if precio_vs_ema55 == "TOUCHING":
-                match_ratio += 0.20  # Bono grande si toca justo la EMA55
+            # 🟢 BONIFICACIONES
+            # 1. Bonificación por toque temprano (Prioridad a la EMA55 en los primeros 3 toques)
+            if current_touches <= 3 and precio_vs_ema55 == "TOUCHING":
+                match_ratio += 0.20
 
-            # 🔴 PENALIZACIÓN POR COMPRAR EN LA PARTE ALTA DE UN SQUEEZE
-            if bb_state in ["MAX_SQUEEZE", "SQUEEZE"] and bb_price in ["MID_TO_UPPER", "UPPER"]:
-                if signal_type in ["LONG_BREAKOUT"]:
-                    match_ratio *= 0.60  # Penalización del 40%
-                    logger.debug(f"[MarketScanner] 🚫 Penalización fuerte por comprar en la parte alta de un SQUEEZE")
+            # 2. Bonificación por Fuerza Macrof (Cuando la 144 está muy por encima de la 233)
+            ema144_val = float(behavior.get("ema144_vs_ema233", {}))
+            ema233_val = float(behavior.get("ema144_vs_ema233", {}))
+            if ema144_val != 0 and ema233_val != 0:
+                distance_pct = abs(ema144_val - ema233_val) / ema233_val
+                if distance_pct > 0.015:
+                    match_ratio += 0.15
+                    logger.debug(f"[MarketScanner] 🔥 Bonificación por Fuerza Macrof en {symbol_code}")
+
+            # 🤖 IA DE PATRONES: Evaluar si el patrón actual tiene éxito histórico en la BD
+            ai_bonus = self._ai_evaluate_pattern(symbol_code, behavior, signal_type, timeframe)
+            if ai_bonus is not None:
+                match_ratio += ai_bonus
+                logger.debug(f"[MarketScanner] 🤖 IA evaluó {symbol_code} con bonificación de +{ai_bonus:.2f}")
 
             if match_ratio >= 0.40:
                 matches.append({
@@ -408,6 +425,69 @@ class MarketScanner:
                 })
 
         return matches
+
+    # 🤖 NUEVO SISTEMA DE INTELIGENCIA ARTIFICIAL BASADO EN BASE DE DATOS
+    def _ai_evaluate_pattern(self, symbol_code: str, behavior: Dict[str, Any], signal_type: str, timeframe: str) -> Optional[float]:
+        try:
+            # Conectar a la base de datos
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                
+                # Construir una consulta SQL para buscar patrones parecidos al actual (excluyendo el que se está evaluando)
+                # Buscamos patrones que hayan tenido el mismo signal_type y timeframe
+                query = """
+                    SELECT resultado, COUNT(*) as count 
+                    FROM patterns 
+                    WHERE signal_type = ? 
+                    AND timeframe = ?
+                    AND ema55_vs_ema144 = ?
+                    AND ema144_vs_ema233 = ?
+                    AND bb_precio = ?
+                    GROUP BY resultado
+                    ORDER BY count DESC
+                    LIMIT 5
+                """
+                
+                params = (
+                    signal_type,
+                    timeframe,
+                    behavior.get("ema55_vs_ema144", "FLAT"),
+                    behavior.get("ema144_vs_ema233", "FLAT"),
+                    behavior.get("bb_precio", "MID"),
+                )
+                
+                cursor = conn.execute(query, params)
+                rows = cursor.fetchall()
+                
+                if not rows:
+                    return None
+                
+                # Si encontramos patrones parecidos, calculamos la ratio de éxito
+                win_count = 0
+                loss_count = 0
+                
+                for row in rows:
+                    if row['resultado'] == 'WIN':
+                        win_count = row['count']
+                    elif row['resultado'] == 'LOSS':
+                        loss_count = row['count']
+                
+                total = win_count + loss_count
+                if total == 0:
+                    return None
+                
+                # Si el porcentaje de éxito es mayor al 60%, damos una bonificación
+                success_rate = win_count / total
+                if success_rate > 0.60:
+                    return 0.10  # Bonificación del 10%
+                elif success_rate < 0.40:
+                    return -0.10  # Penalización del 10% si tiene mal historial
+                
+                return None
+                
+        except Exception as e:
+            logger.debug(f"[MarketScanner] Error en IA de patrones para {symbol_code}: {e}")
+            return None
 
     def _build_signal(
         self,
