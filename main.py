@@ -8,6 +8,9 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
+import ccxt
+import pandas as pd
+
 from bybit_api_manager import BybitAPIManager
 from strategy_scanner import MarketScanner, Signal
 from order_executor import OrderExecutor
@@ -30,18 +33,18 @@ CONFIG: Dict[str, Any] = {
     "MODE": os.getenv("BOT_MODE", "DRY_RUN"),
     
     "SCANNER_ENABLED": True,
-    "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "10.0")),
+    "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "30.0")), # 30 segundos para dar tiempo a la API
     "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.60")),
     "MIN_RR": float(os.getenv("MIN_RR", "3.0")),
     
-    "TIMEFRAMES": ["15m"],
+    "TIMEFRAMES": ["15m", "3m"],
     
     "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "1")),
     "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.30")),
     "SL_PCT": float(os.getenv("SL_PCT", "0.60")),
     "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
     "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
-    "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "60")),
+    "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "15")),
     "MAX_ENTRIES_DAILY": int(os.getenv("MAX_ENTRIES_DAILY", "999")),
     
     "LEARNING_ENABLED": os.getenv("LEARNING_ENABLED", "true").lower() == "true",
@@ -49,29 +52,7 @@ CONFIG: Dict[str, Any] = {
     "DB_PATH": os.getenv("DB_PATH", "patterns.db"),
     "CAPITAL_FILE": os.getenv("CAPITAL_FILE", "capital_inicial.json"),
     
-    # ✅ WATCHLIST FINAL (Activos de tus imágenes)
-    "WATCHLIST": [
-        "LABUSDT", "B3USDT", "SXTUSDT", 
-        "SKHYNIXUSDT", "SKHYUSDT", "AXTIUSDT", "LITUSDT", 
-        "KAITOUSDT", "HEIUSDT", "BLESSUSDT", "USUSDT", 
-        "CUSDT", "GRASSUSDT", "NAORISUSDT", 
-        "TRIAUSDT", "TACUSDT", "WOOUSDT", "AAOIUSDT", 
-        "BOTUSDT", "TOWNSUSDT", "EGLDUSDT", "CRWDUSDT",
-        "AGLDUSDT", "CAPUSDT", "RECALLUSDT", "EDGEUSDT", 
-        "ALLOUSDT", "FLOCKUSDT", "CYSUSDT", "KATUSDT", 
-        "PYTHUSDT", "STABLEUSDT", "MANTAUSDT", 
-        "ORDIUSDT", "PARTIUSDT", "AERGOUSDT", "HOLOUSDT", 
-        "MYXUSDT", "REUSDT", "MITOUSDT", "GOOGLUSDT", 
-        "AVAAIUSDT", "BLURUSDT", "MMTUSDT", 
-        "JSTUSDT", "SKLUSDT","ESPORTSUSDT", "APRUSDT","LAUSDT",
-        "REUSDT","AKEUSDT","B2USDT",
-        "BANKUSDT","ROAMUSDT","CAPUSDT","XNYUSDT","HANAUSDT","SOXUSDT",
-        "BEATUSDT","BEAMUSDT","HOMEUSDT",
-        "ARXUSDT","EPICUSDT","SLXUSDT",
-        "PRLUSDT","EVAAUSDT","TAIKOUSDT",
-        "VANAUSDT","EDUUSDT","GMXUSDT",
-         "ALCHUSDT","BILLUSDT","BLESSUSDT"
-    ],
+    "WATCHLIST": [], # Ya no se usa. El bot generará su propia lista dinámica.
 }
 
 class UnicoBot:
@@ -99,20 +80,20 @@ class UnicoBot:
             sl_pct=config.get("SL_PCT", 0.60),
             tp_multiple=config.get("TP_MULTIPLE", 5.0),
             leverage=config.get("LEVERAGE", 10),
-            cooldown_minutes=config.get("COOLDOWN_MINUTES", 60),
+            cooldown_minutes=config.get("COOLDOWN_MINUTES", 15),
             max_entries_daily=config.get("MAX_ENTRIES_DAILY", 999),
         )
         
         self.scanner = MarketScanner(
             api_manager=self.api,
-            watchlist=config["WATCHLIST"],
+            watchlist=[],
             scan_interval=config["SCAN_INTERVAL"],
             min_score=config["MIN_SCORE"],
             min_rr=config["MIN_RR"],
             position_pct=config["POSITION_PCT"],
             db_path=config["DB_PATH"],
             signal_cooldown_seconds=60,
-            timeframes=config.get("TIMEFRAMES", ["15m"]),
+            timeframes=config.get("TIMEFRAMES", ["15m", "3m"]),
         )
         
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
@@ -130,17 +111,34 @@ class UnicoBot:
         signal.signal(signal.SIGINT, self._handle_shutdown)
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
+    async def generate_dynamic_watchlist(self) -> List[str]:
+        """Escanea Bybit y devuelve los TOP 30 activos con mayor subida en 24h."""
+        try:
+            exchange = ccxt.bybit()
+            exchange.options = {'defaultType': 'linear'}
+            tickers = await asyncio.to_thread(exchange.fetch_tickers)
+            
+            usdt_tickers = {k: v for k, v in tickers.items() 
+                           if k.endswith('/USDT') and v['quoteVolume'] and v['quoteVolume'] > 100000} # Mínimo 100k de volumen
+            
+            # Filtrar y ordenar por % de cambio (top gainers)
+            sorted_by_gain = sorted(usdt_tickers.items(), key=lambda x: x[1]['percentage'] or 0, reverse=True)
+            
+            # Tomamos los primeros 30
+            top_30 = [symbol.replace('/', '') for symbol, ticker in sorted_by_gain[:30]]
+            logger.info(f"🔍 Lista dinámica generada: {len(top_30)} activos (Top Alza 24h)")
+            return top_30
+        except Exception as e:
+            logger.error(f"❌ Error generando lista dinámica: {e}. Usando fallback.")
+            return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
     async def initialize(self) -> None:
         logger.info(
             "\n" + "=" * 60 + "\n"
-            + " 🚀 ÚNICO STRATEGY v4.0 — M15\n"
+            + " 🚀 ÚNICO STRATEGY v5.0 — M15 + M3 (REGLAS DE ORO)\n"
             + f" Modo: {self.mode.value}\n"
             + f" Sandbox: {self.config['SANDBOX']}\n"
             + f" Scanner: {'ON' if self.config['SCANNER_ENABLED'] else 'PAUSE'}\n"
-            + f" Watchlist: {len(self.config['WATCHLIST'])} símbolos\n"
-            + f" Timeframes: {self.config.get('TIMEFRAMES', ['15m'])}\n"
-            + f" Intervalo: {self.config['SCAN_INTERVAL']}s\n"
-            + f" Score mínimo: {self.config['MIN_SCORE']}\n"
             + f" Máximo posiciones: {self.config['MAX_POSITIONS']}\n"
             + f" Posición: {self.config['POSITION_PCT']*100:.0f}% capital\n"
             + f" SL: {self.config['SL_PCT']*100:.0f}% de posición\n"
@@ -148,6 +146,10 @@ class UnicoBot:
             + f" Cooldown: {self.config['COOLDOWN_MINUTES']}min\n"
             + "=" * 60
         )
+        
+        # Generar la Watchlist Dinámica al iniciar
+        self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
+        self.scanner.watchlist = self.config["WATCHLIST"]
 
         if self.mode == BotMode.DRY_RUN:
             logger.info("🔬 Modo DRY_RUN - Simulando balance de $10,000 USDT")
@@ -184,11 +186,16 @@ class UnicoBot:
             self.running = False
             return
 
-        # Protección de saldo disponible
-        min_available_to_trade = capital.total_balance * 0.15
+        # Regla de capital disponible
+        min_available_to_trade = capital.total_balance * 0.05
         if capital.available < min_available_to_trade:
             logger.warning(f"⏸️ Saldo disponible muy bajo ({capital.available:.2f} USDT). Esperando liberación de capital...")
         elif self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
+            # Refrescar la Watchlist cada 30 ciclos (aprox 15 minutos) para cazar nuevas olas
+            if self.stats["cycles"] % 30 == 0:
+                self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
+                self.scanner.watchlist = self.config["WATCHLIST"]
+                
             signals = await self.scanner.scan_all()
             self.stats["signals"] += len(signals)
             
@@ -233,16 +240,13 @@ class UnicoBot:
                 close_result = await self.rm.close_position(symbol, reason, pos.current_price)
                 self.stats["closed"] += 1
                 
-                # ✅ CORRECCIÓN DEL REVERSO AQUÍ (Se eliminaron stop_loss y take_profit)
                 if reason == CloseReason.REVERSE:
                     self.stats["reversals"] += 1
                     reverse_side = "sell" if pos.side == "LONG" else "buy"
                     reverse_order = await self.executor.open_position(
                         symbol=symbol,
                         side=reverse_side,
-                        position_size=pos, 
-                        # stop_loss=pos.stop_loss,  <-- ELIMINADO (Causaba error 10001)
-                        # take_profit=pos.take_profit, <-- ELIMINADO
+                        position_size=pos,
                     )
                     if reverse_order:
                         self.rm.register_position(
@@ -347,12 +351,10 @@ def mostrar_estado() -> None:
         print("\n⚠️  La base de datos de patrones no existe. Ejecuta --init-db.")
         return
     print("\n" + "=" * 60)
-    print("  🧠 ÚNICO STRATEGY v4.0 — M15")
+    print("  🧠 ÚNICO STRATEGY v5.0 — REGLAS DE ORO")
     print("=" * 60)
     print(f"  Modo: {CONFIG['MODE']}")
     print(f"  Sandbox: {CONFIG['SANDBOX']}")
-    print(f"  Watchlist: {len(CONFIG['WATCHLIST'])} símbolos")
-    print(f"  Timeframes: {CONFIG.get('TIMEFRAMES', ['15m'])}")
     print(f"  DB: {CONFIG['DB_PATH']}")
     print(f"  SL: {CONFIG['SL_PCT']*100:.0f}% de posición")
     print(f"  TP: {CONFIG['TP_MULTIPLE']}x riesgo")
@@ -403,20 +405,14 @@ async def main() -> None:
 if __name__ == "__main__":
     print("""
 ╔═══════════════════════════════════════════════════════════════╗
-║            🧠 ÚNICO STRATEGY v4.0 — M15                    ║
+║            🧠 ÚNICO STRATEGY v5.0 — REGLAS DE ORO           ║
 ║         Futuros Perpetuos USDT-M — Bybit                    ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  TIMEFRAMES:                                                 ║
-║  📊 M15: SL 6% | TP 20% | Leverage 10x | R:R 5:1           ║
+║  📊 M15: Entorno | ⚡ M3: Entrada                           ║
 ╠═══════════════════════════════════════════════════════════════╣
-║  COMANDOS:                                                   ║
-║  python main.py --init-db     → Inicializar base de datos   ║
-║  python main.py --status      → Ver estado del bot          ║
-║  python main.py --dry-run     → Modo simulación (seguro)    ║
-║  python main.py --live        → Modo real (¡cuidado!)       ║
-╠═══════════════════════════════════════════════════════════════╣
-║  🛡️  SL: 6% del capital  |  🚀 TP: 20% del capital         ║
-║  📊 Posición: 30%        |  ⏱️  Cooldown: 60min            ║
+║  🛡️  SL: 6% del capital  |  🚀 TP: 30% del capital         ║
+║  📊 Posición: 30%        |  ⏱️  Cooldown: 15min            ║
 ║  🔒 Límite diario: 999   |  🧠 Aprendizaje: ACTIVADO       ║
 ╚═══════════════════════════════════════════════════════════════╝
 """)
