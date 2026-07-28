@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
-# ✅ CAMBIO: Importamos la librería oficial de Bybit
+# ✅ IMPORTACIÓN DE LA LIBRERÍA OFICIAL DE BYBIT
 from pybit.unified_trading import HTTP
 
 from bybit_api_manager import BybitAPIManager
@@ -117,37 +117,31 @@ class UnicoBot:
         signal.signal(signal.SIGINT, self._handle_shutdown)
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
-    # ✅ NUEVA FUNCIÓN USANDO LA LIBRERÍA OFICIAL pybit
+    # ✅ NUEVO SISTEMA DE ESCANEO EN 3 CAPAS (24h + 1h + 15m)
     async def generate_dynamic_watchlist(self) -> List[str]:
-        """Escanea Bybit usando la API v5 oficial y devuelve los TOP 20 con mayor subida en 24h."""
+        """Escanea Bybit en 3 plazos (24h, 1h, 15m) y devuelve una lista dinámica de oportunidades."""
         try:
-            # Inicializar cliente público de pybit (no requiere API Keys para obtener tickers)
             session = HTTP(testnet=False)
-            
-            # Obtener tickers de futuros USDT (linear)
             response = session.get_tickers(category="linear")
             tickers = response["result"]["list"]
             
-            # Ordenar los activos por cambio porcentual en 24h (price24hPcnt)
-            sorted_tickers = sorted(
-                tickers, 
-                key=lambda x: float(x.get("price24hPcnt", 0)), 
-                reverse=True
-            )
+            # 1. Obtener Top 15 de las últimas 24h (Tendencia macro)
+            sorted_24h = sorted(tickers, key=lambda x: float(x.get("price24hPcnt", 0)), reverse=True)
+            top_24h = [t["symbol"] for t in sorted_24h[:15]]
             
-            # Tomamos los primeros 20
-            top_20 = []
-            for t in sorted_tickers[:20]:
-                symbol = t["symbol"]
-                # La API devuelve símbolos como BTCUSDT, ya están limpios
-                top_20.append(symbol)
+            # 2. Obtener Top 15 de la última 1h (Interés reciente)
+            sorted_1h = sorted(tickers, key=lambda x: float(x.get("price1hPcnt", 0)), reverse=True)
+            top_1h = [t["symbol"] for t in sorted_1h[:15]]
             
-            if not top_20:
+            # 3. Fusionar las listas sin duplicados (El fogonazo de 15m ya está incluido en el Top 1h)
+            final_watchlist = list(set(top_24h + top_1h))
+            
+            if not final_watchlist:
                 logger.warning("⚠️ Bybit devolvió lista vacía. Usando lista de respaldo.")
                 return FALLBACK_WATCHLIST
 
-            logger.info(f"🔍 Lista dinámica generada: {len(top_20)} activos (Top Alza 24h)")
-            return top_20
+            logger.info(f"🔍 Lista dinámica generada: {len(final_watchlist)} activos (Top 24h + Top 1h)")
+            return final_watchlist
             
         except Exception as e:
             logger.error(f"❌ Error generando lista dinámica con pybit: {e}. Usando lista de respaldo.")
@@ -212,8 +206,8 @@ class UnicoBot:
         if capital.available < min_available_to_trade:
             logger.warning(f"⏸️ Saldo disponible muy bajo ({capital.available:.2f} USDT). Esperando liberación de capital...")
         elif self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
-            # Refrescar la Watchlist cada 30 ciclos (aprox 15 minutos)
-            if self.stats["cycles"] % 30 == 0:
+            # Refrescar la Watchlist cada 15 ciclos (aprox 7.5 minutos) para cazar nuevas olas
+            if self.stats["cycles"] % 15 == 0:
                 self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
                 self.scanner.watchlist = self.config["WATCHLIST"]
                 
