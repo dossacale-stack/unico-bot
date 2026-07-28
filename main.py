@@ -33,7 +33,7 @@ CONFIG: Dict[str, Any] = {
     "MODE": os.getenv("BOT_MODE", "DRY_RUN"),
     
     "SCANNER_ENABLED": True,
-    "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "30.0")), # 30 segundos para dar tiempo a la API
+    "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "30.0")),
     "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.60")),
     "MIN_RR": float(os.getenv("MIN_RR", "3.0")),
     
@@ -111,26 +111,42 @@ class UnicoBot:
         signal.signal(signal.SIGINT, self._handle_shutdown)
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
+    # ✅ CORRECCIÓN DEL ERROR adjust_suffix APLICADA AQUÍ
     async def generate_dynamic_watchlist(self) -> List[str]:
-        """Escanea Bybit y devuelve los TOP 30 activos con mayor subida en 24h."""
+        """Escanea Bybit y devuelve los TOP 20 activos con mayor subida en 24h."""
         try:
-            exchange = ccxt.bybit()
-            exchange.options = {'defaultType': 'linear'}
+            # Usamos un exchange limpio sin opciones complejas para evitar errores de 'adjust_suffix'
+            exchange = ccxt.bybit({
+                'enableRateLimit': True,
+                'options': {
+                    'defaultType': 'linear',
+                }
+            })
+            
+            # Cargar mercados de forma segura
+            await asyncio.to_thread(exchange.load_markets)
             tickers = await asyncio.to_thread(exchange.fetch_tickers)
             
-            usdt_tickers = {k: v for k, v in tickers.items() 
-                           if k.endswith('/USDT') and v['quoteVolume'] and v['quoteVolume'] > 100000} # Mínimo 100k de volumen
+            usdt_tickers = {}
+            for symbol, ticker in tickers.items():
+                # Filtro estricto: solo pares USDT con volumen suficiente
+                if symbol.endswith('/USDT') and ticker['quoteVolume'] and ticker['quoteVolume'] > 50000:
+                    clean_symbol = symbol.replace('/', '')
+                    # Eliminar posibles sufijos de contrato perpetuo (ej: /USDT:USDT)
+                    if ':USDT' in clean_symbol:
+                        clean_symbol = clean_symbol.replace(':USDT', '')
+                    usdt_tickers[clean_symbol] = ticker
             
             # Filtrar y ordenar por % de cambio (top gainers)
             sorted_by_gain = sorted(usdt_tickers.items(), key=lambda x: x[1]['percentage'] or 0, reverse=True)
             
-            # Tomamos los primeros 30
-            top_30 = [symbol.replace('/', '') for symbol, ticker in sorted_by_gain[:30]]
-            logger.info(f"🔍 Lista dinámica generada: {len(top_30)} activos (Top Alza 24h)")
-            return top_30
+            # Tomamos los primeros 20 para no sobrecargar y evitar límites de API
+            top_20 = [symbol for symbol, ticker in sorted_by_gain[:20]]
+            logger.info(f"🔍 Lista dinámica generada: {len(top_20)} activos (Top Alza 24h)")
+            return top_20
         except Exception as e:
-            logger.error(f"❌ Error generando lista dinámica: {e}. Usando fallback.")
-            return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+            logger.error(f"❌ Error generando lista dinámica: {e}. Usando lista de emergencia.")
+            return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT"]
 
     async def initialize(self) -> None:
         logger.info(
