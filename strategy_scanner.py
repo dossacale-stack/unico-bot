@@ -79,13 +79,10 @@ class MarketScanner:
         self.position_pct = position_pct
         self.db_path = db_path
         self.signal_cooldown_seconds = signal_cooldown_seconds
-        self.timeframes = timeframes or ["15m"]
+        self.timeframes = timeframes or ["15m", "3m"]
         self.patterns_by_tf = {}
         self._signal_cooldown = {}
         self._load_all_patterns()
-        
-        # 🧠 MEMORIA PARA EL CONTADOR DE TOQUES A LA EMA55
-        self.ema55_touch_counter = {}
 
     def _normalize_symbol(self, symbol: str) -> str:
         return re.sub(r"[^\w]", "", symbol).upper()
@@ -129,24 +126,25 @@ class MarketScanner:
                 if now - self._signal_cooldown[symbol] < 300:
                     continue
 
-            # 1. OBTENER TENDENCIA MACRO (1 HORA)
-            macro_direction = "NEUTRAL"
+            # 1. OBTENER TENDENCIA MACRO (1 HORA) - Para ver el "Océano Verde/Rojo"
+            macro_angle = "FLAT"
             try:
                 df_1h = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=100)
                 if df_1h is not None and len(df_1h) > 40:
-                    df_1h["ema55"] = df_1h["close"].ewm(span=55, adjust=False).mean()
                     df_1h["ema144"] = df_1h["close"].ewm(span=144, adjust=False).mean()
-                    current_ema55 = df_1h["ema55"].iloc[-1]
-                    current_ema144 = df_1h["ema144"].iloc[-1]
+                    df_1h["ema233"] = df_1h["close"].ewm(span=233, adjust=False).mean()
                     
-                    if current_ema55 > current_ema144:
-                        macro_direction = "BULLISH"
-                    elif current_ema55 < current_ema144:
-                        macro_direction = "BEARISH"
+                    ema144_slope_1h = df_1h["ema144"].iloc[-1] - df_1h["ema144"].iloc[-5]
+                    ema233_slope_1h = df_1h["ema233"].iloc[-1] - df_1h["ema233"].iloc[-5]
+                    
+                    if ema144_slope_1h > 0 and ema233_slope_1h > 0:
+                        macro_angle = "BULLISH"
+                    elif ema144_slope_1h < 0 and ema233_slope_1h < 0:
+                        macro_angle = "BEARISH"
             except Exception as exc:
                 logger.debug(f"[MarketScanner] No se pudo obtener macro 1h para {symbol}: {exc}")
 
-            # 2. ANALIZAR TIMEFRAME 15M
+            # 2. ANALIZAR TIMEFRAMES (15M para entorno, 3M para entrada precisa)
             for timeframe in self.timeframes:
                 try:
                     df = await self.api.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
@@ -156,7 +154,7 @@ class MarketScanner:
                     behavior = self._describe_behavior(df)
                     symbol_code = self._normalize_symbol(symbol)
                     
-                    matches = self._match_patterns(symbol_code, behavior, timeframe, macro_direction)
+                    matches = self._match_patterns(symbol_code, behavior, timeframe, macro_angle)
 
                     if not matches:
                         continue
@@ -285,13 +283,6 @@ class MarketScanner:
         volume_average = float(df["volume"].rolling(20).mean().iloc[-2] or 0.0)
         price = float(current["close"])
 
-        prev_candle = candle_pattern(prior)
-        prev_vol_ratio = float(prior["volume"]) / max(volume_average, 1e-9)
-        previous_breakout = "NO"
-        
-        if prev_candle in ["STRONG_GREEN", "REJECTION", "GREEN"] and prev_vol_ratio >= 1.8:
-            previous_breakout = "YES"
-
         return {
             "ema21_vs_ema55": ema_relation(float(current["ema21"]), float(current["ema55"]),
                                           float(prior["ema21"]), float(prior["ema55"])),
@@ -313,30 +304,63 @@ class MarketScanner:
             "patron_vela": candle_pattern(current),
             "fib_zona": fib_zone(price),
             "entry_price": price,
-            "previous_breakout": previous_breakout,
         }
 
-    def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any], timeframe: str, macro_direction: str) -> List[Dict[str, Any]]:
+    # 📊 EVALUACIÓN DE LAS 5 REGLAS DE ORO (BASE DE DATOS DE PRECISIÓN)
+    def _evaluate_golden_rules(self, behavior: Dict[str, Any], macro_angle: str, timeframe: str) -> float:
+        score = 0.0
+        bb_price = behavior.get("bb_precio", "MID")
+        ema144_slope = behavior.get("ema144_slope", "FLAT")
+        volumen = behavior.get("volumen", "LOW")
+        precio_vs_ema144 = behavior.get("precio_vs_ema144", "")
+        precio_vs_ema55 = behavior.get("precio_vs_ema55", "")
+        precio_vs_ema233 = behavior.get("precio_vs_ema233", "")
+
+        # FILTRO BASE: Si no hay volumen alto, no operamos (Regla de Interés)
+        if volumen != "HIGH":
+            return 0.0
+
+        # --- REGLA 1: COMPRA DE BAJO RIESGO (BANDA INFERIOR) ---
+        # Contexto: Anclaje alcista en 1h, precio tocando la banda inferior en M15/M3
+        if macro_angle == "BULLISH":
+            if bb_price == "LOWER":
+                score += 25.0  # Puntuación alta por tocar la banda inferior en tendencia macro alcista
+
+        # --- REGLA 2: VENTA DE CONTINUACIÓN (BANDA SUPERIOR O MEDIA EN BAJISTA) ---
+        # Contexto: Anclaje bajista en 1h, precio tocando la banda superior o media
+        if macro_angle == "BEARISH":
+            if bb_price in ["UPPER", "MID_TO_UPPER"]:
+                score += 20.0
+
+        # --- REGLA 3: COMPRA EN M3 (ANCLAJE A EMA55) ---
+        # Contexto: Para entradas en 3m, prioridad si la EMA144 tiene pendiente positiva
+        if timeframe == "3m" and ema144_slope == "UP":
+            if precio_vs_ema55 in ["TOUCHING", "NEAR"]:
+                score += 25.0  # Entrada quirúrgica en M3
+
+        # --- REGLA 4: RECHAZO EN BANDA SUPERIOR (TRAMPA DE TECHO) ---
+        if bb_price == "UPPER":
+            candle = behavior.get("patron_vela", "NEUTRAL")
+            if candle in ["REJECTION", "STRONG_RED"]:
+                score += 15.0
+
+        # --- REGLA 5: ANCLAJE MACRO (Filtro de seguridad) ---
+        # Penalización si el precio está en la zona media y las EMAs están planas
+        if bb_price == "MID" and macro_angle == "FLAT":
+            score -= 20.0  # Fuerte penalización en mercados laterales
+
+        return max(0.0, score)  # Asegurar que el score no sea negativo
+
+    def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any], timeframe: str, macro_angle: str) -> List[Dict[str, Any]]:
         matches = []
         patterns = self.patterns_by_tf.get(timeframe, [])
-
-        prev_breakout = behavior.get("previous_breakout", "NO")
-
-        # Variables de comportamiento
-        precio_vs_ema55 = behavior.get("precio_vs_ema55", "")
-        ema55_vs_ema144 = behavior.get("ema55_vs_ema144", "")
-        ema144_vs_ema233 = behavior.get("ema144_vs_ema233", "")
-        bb_state = behavior.get("bb_estado", "CONTRACTING")
-        bb_precio = behavior.get("bb_precio", "MID")
-
-        # 🧠 ACTUALIZAR CONTADOR DE TOQUES A LA EMA55
-        if precio_vs_ema55 in ["TOUCHING", "NEAR"]:
-            if symbol_code not in self.ema55_touch_counter:
-                self.ema55_touch_counter[symbol_code] = 0
-            self.ema55_touch_counter[symbol_code] += 1
-            logger.debug(f"[MarketScanner] 🧠 {symbol_code} tocó la EMA55. Contador: {self.ema55_touch_counter[symbol_code]}")
-
-        current_touches = self.ema55_touch_counter.get(symbol_code, 0)
+        
+        # 1. Aplicar las Reglas de Oro y obtener una puntuación base
+        golden_score = self._evaluate_golden_rules(behavior, macro_angle, timeframe)
+        
+        # Si el entorno de subasta no cumple las condiciones, descartar
+        if golden_score < 15.0:
+            return matches
 
         for pattern in patterns:
             if pattern.get("symbol") not in {symbol_code, "UNIVERSAL"}:
@@ -347,35 +371,7 @@ class MarketScanner:
 
             signal_type = pattern.get("signal_type", "")
 
-            # 🛡️ REGLA 1: FILTRO MACRO OBLIGATORIO (144 vs 233)
-            if signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"] and ema144_vs_ema233 != "ABOVE":
-                continue
-            if signal_type in ["SHORT_BREAKOUT", "SHORT_REVERSAL"] and ema144_vs_ema233 != "BELOW":
-                continue
-            if macro_direction == "NEUTRAL":
-                continue
-
-            # 🛡️ REGLA 2: EVITAR FALSOS EN PICO ANTERIOR
-            if prev_breakout == "YES":
-                continue
-
-            # 🛡️ REGLA 3: SISTEMA DE PRIORIDAD POR TOQUES A LA EMA55
-            if current_touches > 4:
-                precio_vs_ema144 = behavior.get("precio_vs_ema144", "")
-                precio_vs_ema233 = behavior.get("precio_vs_ema233", "")
-                
-                if signal_type in ["LONG_BREAKOUT", "LONG_REVERSAL"]:
-                    if precio_vs_ema144 not in ["TOUCHING", "NEAR"] and precio_vs_ema233 not in ["TOUCHING", "NEAR"]:
-                        continue
-                if signal_type in ["SHORT_BREAKOUT", "SHORT_REVERSAL"]:
-                    if precio_vs_ema144 not in ["TOUCHING", "NEAR"] and precio_vs_ema233 not in ["TOUCHING", "NEAR"]:
-                        continue
-
-            # 🛡️ REGLA 4: EVITAR SQUEEZES (Bandas de Bollinger apretadas)
-            if bb_state in ["MAX_SQUEEZE", "SQUEEZE"]:
-                continue
-
-            # Calcular puntaje base del patrón
+            # 2. Integrar la puntuación de las Reglas de Oro
             score = 0
             total = 0
 
@@ -395,99 +391,20 @@ class MarketScanner:
                 continue
 
             match_ratio = score / total
+            
+            # 3. Sumar el puntaje de las Reglas de Oro al ratio de coincidencia del patrón
+            final_score = match_ratio + (golden_score / 100.0) * 0.5  # Ponderación del 50% para las reglas de oro
+            final_score = min(final_score, 1.0)  # No superar 1.0
 
-            # 🟢 BONIFICACIONES
-            # 1. Bonificación por toque temprano (Prioridad a la EMA55 en los primeros 3 toques)
-            if current_touches <= 3 and precio_vs_ema55 == "TOUCHING":
-                match_ratio += 0.20
-
-            # 2. Bonificación por Fuerza Macrof (Cuando la 144 está muy por encima de la 233)
-            ema144_val = float(behavior.get("ema144_vs_ema233", {}))
-            ema233_val = float(behavior.get("ema144_vs_ema233", {}))
-            if ema144_val != 0 and ema233_val != 0:
-                distance_pct = abs(ema144_val - ema233_val) / ema233_val
-                if distance_pct > 0.015:
-                    match_ratio += 0.15
-                    logger.debug(f"[MarketScanner] 🔥 Bonificación por Fuerza Macrof en {symbol_code}")
-
-            # 🤖 IA DE PATRONES: Evaluar si el patrón actual tiene éxito histórico en la BD
-            ai_bonus = self._ai_evaluate_pattern(symbol_code, behavior, signal_type, timeframe)
-            if ai_bonus is not None:
-                match_ratio += ai_bonus
-                logger.debug(f"[MarketScanner] 🤖 IA evaluó {symbol_code} con bonificación de +{ai_bonus:.2f}")
-
-            if match_ratio >= 0.40:
+            if final_score >= 0.40:
                 matches.append({
                     "pattern": pattern,
-                    "match_ratio": match_ratio,
+                    "match_ratio": final_score,
                     "score": score,
                     "total": total,
                 })
 
         return matches
-
-    # 🤖 NUEVO SISTEMA DE INTELIGENCIA ARTIFICIAL BASADO EN BASE DE DATOS
-    def _ai_evaluate_pattern(self, symbol_code: str, behavior: Dict[str, Any], signal_type: str, timeframe: str) -> Optional[float]:
-        try:
-            # Conectar a la base de datos
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                
-                # Construir una consulta SQL para buscar patrones parecidos al actual (excluyendo el que se está evaluando)
-                # Buscamos patrones que hayan tenido el mismo signal_type y timeframe
-                query = """
-                    SELECT resultado, COUNT(*) as count 
-                    FROM patterns 
-                    WHERE signal_type = ? 
-                    AND timeframe = ?
-                    AND ema55_vs_ema144 = ?
-                    AND ema144_vs_ema233 = ?
-                    AND bb_precio = ?
-                    GROUP BY resultado
-                    ORDER BY count DESC
-                    LIMIT 5
-                """
-                
-                params = (
-                    signal_type,
-                    timeframe,
-                    behavior.get("ema55_vs_ema144", "FLAT"),
-                    behavior.get("ema144_vs_ema233", "FLAT"),
-                    behavior.get("bb_precio", "MID"),
-                )
-                
-                cursor = conn.execute(query, params)
-                rows = cursor.fetchall()
-                
-                if not rows:
-                    return None
-                
-                # Si encontramos patrones parecidos, calculamos la ratio de éxito
-                win_count = 0
-                loss_count = 0
-                
-                for row in rows:
-                    if row['resultado'] == 'WIN':
-                        win_count = row['count']
-                    elif row['resultado'] == 'LOSS':
-                        loss_count = row['count']
-                
-                total = win_count + loss_count
-                if total == 0:
-                    return None
-                
-                # Si el porcentaje de éxito es mayor al 60%, damos una bonificación
-                success_rate = win_count / total
-                if success_rate > 0.60:
-                    return 0.10  # Bonificación del 10%
-                elif success_rate < 0.40:
-                    return -0.10  # Penalización del 10% si tiene mal historial
-                
-                return None
-                
-        except Exception as e:
-            logger.debug(f"[MarketScanner] Error en IA de patrones para {symbol_code}: {e}")
-            return None
 
     def _build_signal(
         self,
