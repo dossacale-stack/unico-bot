@@ -8,8 +8,8 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
-import ccxt
-import pandas as pd
+# ✅ CAMBIO: Importamos la librería oficial de Bybit
+from pybit.unified_trading import HTTP
 
 from bybit_api_manager import BybitAPIManager
 from strategy_scanner import MarketScanner, Signal
@@ -52,8 +52,14 @@ CONFIG: Dict[str, Any] = {
     "DB_PATH": os.getenv("DB_PATH", "patterns.db"),
     "CAPITAL_FILE": os.getenv("CAPITAL_FILE", "capital_inicial.json"),
     
-    "WATCHLIST": [], # Ya no se usa. El bot generará su propia lista dinámica.
+    "WATCHLIST": [],
 }
+
+# 🛡️ LISTA DE RESPALDO (Por si la API de Bybit falla totalmente)
+FALLBACK_WATCHLIST = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", 
+    "ADAUSDT", "LINKUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT"
+]
 
 class UnicoBot:
     def __init__(self, config: Dict[str, Any]):
@@ -111,42 +117,41 @@ class UnicoBot:
         signal.signal(signal.SIGINT, self._handle_shutdown)
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
-    # ✅ CORRECCIÓN DEL ERROR adjust_suffix APLICADA AQUÍ
+    # ✅ NUEVA FUNCIÓN USANDO LA LIBRERÍA OFICIAL pybit
     async def generate_dynamic_watchlist(self) -> List[str]:
-        """Escanea Bybit y devuelve los TOP 20 activos con mayor subida en 24h."""
+        """Escanea Bybit usando la API v5 oficial y devuelve los TOP 20 con mayor subida en 24h."""
         try:
-            # Usamos un exchange limpio sin opciones complejas para evitar errores de 'adjust_suffix'
-            exchange = ccxt.bybit({
-                'enableRateLimit': True,
-                'options': {
-                    'defaultType': 'linear',
-                }
-            })
+            # Inicializar cliente público de pybit (no requiere API Keys para obtener tickers)
+            session = HTTP(testnet=False)
             
-            # Cargar mercados de forma segura
-            await asyncio.to_thread(exchange.load_markets)
-            tickers = await asyncio.to_thread(exchange.fetch_tickers)
+            # Obtener tickers de futuros USDT (linear)
+            response = session.get_tickers(category="linear")
+            tickers = response["result"]["list"]
             
-            usdt_tickers = {}
-            for symbol, ticker in tickers.items():
-                # Filtro estricto: solo pares USDT con volumen suficiente
-                if symbol.endswith('/USDT') and ticker['quoteVolume'] and ticker['quoteVolume'] > 50000:
-                    clean_symbol = symbol.replace('/', '')
-                    # Eliminar posibles sufijos de contrato perpetuo (ej: /USDT:USDT)
-                    if ':USDT' in clean_symbol:
-                        clean_symbol = clean_symbol.replace(':USDT', '')
-                    usdt_tickers[clean_symbol] = ticker
+            # Ordenar los activos por cambio porcentual en 24h (price24hPcnt)
+            sorted_tickers = sorted(
+                tickers, 
+                key=lambda x: float(x.get("price24hPcnt", 0)), 
+                reverse=True
+            )
             
-            # Filtrar y ordenar por % de cambio (top gainers)
-            sorted_by_gain = sorted(usdt_tickers.items(), key=lambda x: x[1]['percentage'] or 0, reverse=True)
+            # Tomamos los primeros 20
+            top_20 = []
+            for t in sorted_tickers[:20]:
+                symbol = t["symbol"]
+                # La API devuelve símbolos como BTCUSDT, ya están limpios
+                top_20.append(symbol)
             
-            # Tomamos los primeros 20 para no sobrecargar y evitar límites de API
-            top_20 = [symbol for symbol, ticker in sorted_by_gain[:20]]
+            if not top_20:
+                logger.warning("⚠️ Bybit devolvió lista vacía. Usando lista de respaldo.")
+                return FALLBACK_WATCHLIST
+
             logger.info(f"🔍 Lista dinámica generada: {len(top_20)} activos (Top Alza 24h)")
             return top_20
+            
         except Exception as e:
-            logger.error(f"❌ Error generando lista dinámica: {e}. Usando lista de emergencia.")
-            return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT"]
+            logger.error(f"❌ Error generando lista dinámica con pybit: {e}. Usando lista de respaldo.")
+            return FALLBACK_WATCHLIST
 
     async def initialize(self) -> None:
         logger.info(
@@ -207,7 +212,7 @@ class UnicoBot:
         if capital.available < min_available_to_trade:
             logger.warning(f"⏸️ Saldo disponible muy bajo ({capital.available:.2f} USDT). Esperando liberación de capital...")
         elif self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
-            # Refrescar la Watchlist cada 30 ciclos (aprox 15 minutos) para cazar nuevas olas
+            # Refrescar la Watchlist cada 30 ciclos (aprox 15 minutos)
             if self.stats["cycles"] % 30 == 0:
                 self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
                 self.scanner.watchlist = self.config["WATCHLIST"]
