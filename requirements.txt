@@ -2,3 +2,4 @@ ccxt
 ccxtpro
 pandas
 numpy
+pybit
