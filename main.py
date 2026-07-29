@@ -1,445 +1,549 @@
-import argparse
-import asyncio
 import logging
 import os
-import signal
+import re
 import sqlite3
-import sys
-from datetime import datetime, timezone
-from typing import Any, Dict, List
+import time
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
-# ✅ IMPORTACIÓN DE LA LIBRERÍA OFICIAL DE BYBIT
-from pybit.unified_trading import HTTP
+import numpy as np
+import pandas as pd
 
 from bybit_api_manager import BybitAPIManager
-from strategy_scanner import MarketScanner, Signal
-from order_executor import OrderExecutor
-from risk_manager import BotMode, CloseReason, RiskManager
 import seed_patterns
 
-# ─── CONFIGURACIÓN DE LOGGING ───
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("UNICO")
+logger = logging.getLogger("MarketScanner")
 
-# ─── CONFIGURACIÓN PRINCIPAL ───
-CONFIG: Dict[str, Any] = {
-    "API_KEY": os.getenv("BYBIT_API_KEY", ""),
-    "API_SECRET": os.getenv("BYBIT_API_SECRET", ""),
-    "SANDBOX": os.getenv("BYBIT_SANDBOX", "false").lower() == "true",
-    "MODE": os.getenv("BOT_MODE", "DRY_RUN"),
-    
-    "SCANNER_ENABLED": True,
-    "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "30.0")),
-    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.60")),
-    "MIN_RR": float(os.getenv("MIN_RR", "3.0")),
-    
-    "TIMEFRAMES": ["15m", "3m"],
-    
-    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "1")),
-    "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.30")),
-    "SL_PCT": float(os.getenv("SL_PCT", "0.60")),
-    "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
-    "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
-    "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "15")),
-    "MAX_ENTRIES_DAILY": int(os.getenv("MAX_ENTRIES_DAILY", "999")),
-    
-    "LEARNING_ENABLED": os.getenv("LEARNING_ENABLED", "true").lower() == "true",
-    
-    "DB_PATH": os.getenv("DB_PATH", "patterns.db"),
-    "CAPITAL_FILE": os.getenv("CAPITAL_FILE", "capital_inicial.json"),
-    
-    "WATCHLIST": [],
-}
 
-# 🛡️ LISTA DE RESPALDO (Por si la API de Bybit falla totalmente)
-FALLBACK_WATCHLIST = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", 
-    "ADAUSDT", "LINKUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT"
+class SignalType(Enum):
+    LONG_BREAKOUT = "LONG_BREAKOUT"
+    SHORT_BREAKOUT = "SHORT_BREAKOUT"
+    LONG_REVERSAL = "LONG_REVERSAL"
+    SHORT_REVERSAL = "SHORT_REVERSAL"
+
+    def is_long(self) -> bool:
+        return self in {SignalType.LONG_BREAKOUT, SignalType.LONG_REVERSAL}
+
+
+@dataclass
+class Signal:
+    symbol: str
+    signal_type: SignalType
+    score: float
+    risk_reward: float
+    stop_loss: float
+    take_profit: float
+    entry_price: float
+    df: Optional[pd.DataFrame] = None
+    pattern_id: Optional[int] = None
+    timeframe: str = "15m"
+
+
+MATCH_FIELDS = [
+    "ema21_vs_ema55",
+    "ema55_vs_ema144",
+    "ema144_vs_ema233",
+    "ema21_slope",
+    "ema144_slope",
+    "precio_vs_ema21",
+    "precio_vs_ema55",
+    "precio_vs_ema144",
+    "precio_vs_ema233",
+    "bb_estado",
+    "bb_precio",
+    "volumen",
+    "patron_vela",
+    "fib_zona",
+    "adx_tendencia",
+    "daily_pct_change",      # 🟢 NUEVO: Cambio % 24h
+    "ema_touch_count",       # 🟢 NUEVO: Conteo de toques a la EMA
 ]
 
-class UnicoBot:
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.mode = BotMode[config["MODE"]]
-        
-        if self.mode == BotMode.LIVE:
-            if not config["API_KEY"] or not config["API_SECRET"]:
-                logger.critical("❌ BYBIT_API_KEY o BYBIT_API_SECRET no están configuradas")
-                raise ValueError("Faltan credenciales de Bybit")
-        
-        self.api = BybitAPIManager(
-            api_key=config["API_KEY"],
-            api_secret=config["API_SECRET"],
-            sandbox=config["SANDBOX"],
-        )
-        
-        self.rm = RiskManager(
-            api_manager=self.api,
-            mode=self.mode,
-            db_path=config["DB_PATH"],
-            max_positions=config["MAX_POSITIONS"],
-            position_pct=config.get("POSITION_PCT", 0.30),
-            sl_pct=config.get("SL_PCT", 0.60),
-            tp_multiple=config.get("TP_MULTIPLE", 5.0),
-            leverage=config.get("LEVERAGE", 10),
-            cooldown_minutes=config.get("COOLDOWN_MINUTES", 15),
-            max_entries_daily=config.get("MAX_ENTRIES_DAILY", 999),
-        )
-        
-        self.scanner = MarketScanner(
-            api_manager=self.api,
-            watchlist=[],
-            scan_interval=config["SCAN_INTERVAL"],
-            min_score=config["MIN_SCORE"],
-            min_rr=config["MIN_RR"],
-            position_pct=config["POSITION_PCT"],
-            db_path=config["DB_PATH"],
-            signal_cooldown_seconds=60,
-            timeframes=config.get("TIMEFRAMES", ["15m", "3m"]),
-        )
-        
-        self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
-        
-        self.running = False
-        self.stats = {
-            "cycles": 0,
-            "signals": 0,
-            "opened": 0,
-            "closed": 0,
-            "reversals": 0,
-            "started_at": datetime.now(timezone.utc).isoformat(),
-        }
-        
-        signal.signal(signal.SIGINT, self._handle_shutdown)
-        signal.signal(signal.SIGTERM, self._handle_shutdown)
 
-    async def generate_dynamic_watchlist(self) -> List[str]:
-        """Escanea Bybit en 3 plazos (24h, 1h, 15m) y devuelve una lista dinámica."""
+class MarketScanner:
+    def __init__(
+        self,
+        api_manager: BybitAPIManager,
+        watchlist: List[str],
+        scan_interval: float,
+        min_score: float,
+        min_rr: float,
+        position_pct: float,
+        db_path: str = "patterns.db",
+        signal_cooldown_seconds: int = 60,
+        timeframes: List[str] = None,
+    ):
+        self.api = api_manager
+        self.watchlist = watchlist
+        self.scan_interval = scan_interval
+        self.min_score = min_score
+        self.min_rr = min_rr
+        self.position_pct = position_pct
+        self.db_path = db_path
+        self.signal_cooldown_seconds = signal_cooldown_seconds
+        self.timeframes = timeframes or ["15m", "3m"]
+        self.patterns_by_tf = {}
+        self._signal_cooldown = {}
+        self._load_all_patterns()
+
+    def _normalize_symbol(self, symbol: str) -> str:
+        return re.sub(r"[^\w]", "", symbol).upper()
+
+    def _load_all_patterns(self) -> None:
+        if not os.path.exists(self.db_path):
+            logger.warning("[MarketScanner] No se encontró DB de patrones. Usando seed_patterns.")
+            for tf in self.timeframes:
+                self.patterns_by_tf[tf] = [p.copy() for p in seed_patterns.PATTERNS if p.get("timeframe") == tf]
+            return
+
         try:
-            session = HTTP(testnet=False)
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                for tf in self.timeframes:
+                    rows = conn.execute("""
+                        SELECT * FROM patterns
+                        WHERE timeframe = ? AND resultado != 'EVITAR'
+                    """, (tf,)).fetchall()
+                    self.patterns_by_tf[tf] = [dict(row) for row in rows]
+                    logger.info(f"[MarketScanner] Cargados {len(self.patterns_by_tf[tf])} patrones para {tf}")
+        except Exception as exc:
+            logger.warning(f"[MarketScanner] Error cargando patrones: {exc}. Usando seed_patterns.")
+            for tf in self.timeframes:
+                self.patterns_by_tf[tf] = [p.copy() for p in seed_patterns.PATTERNS if p.get("timeframe") == tf]
+
+    def _can_signal(self, symbol: str) -> bool:
+        now = time.time()
+        if symbol in self._signal_cooldown:
+            elapsed = now - self._signal_cooldown[symbol]
+            if elapsed < self.signal_cooldown_seconds:
+                return False
+        return True
+
+    async def scan_all(self) -> List[Signal]:
+        signals: List[Signal] = []
+        now = time.time()
+
+        # 🟢 NUEVO: Obtener datos de cambio porcentual 24h de toda la watchlist en una sola llamada
+        ticker_map = {}
+        try:
+            # Usamos el método HTTP directamente o del manager para obtener tickers
+            session = self.api.exchange
             response = session.get_tickers(category="linear")
             tickers = response["result"]["list"]
-            
-            sorted_24h = sorted(tickers, key=lambda x: float(x.get("price24hPcnt", 0)), reverse=True)
-            top_24h = [t["symbol"] for t in sorted_24h[:15]]
-            
-            sorted_1h = sorted(tickers, key=lambda x: float(x.get("price1hPcnt", 0)), reverse=True)
-            top_1h = [t["symbol"] for t in sorted_1h[:15]]
-            
-            final_watchlist = list(set(top_24h + top_1h))
-            
-            if not final_watchlist:
-                logger.warning("⚠️ Bybit devolvió lista vacía. Usando lista de respaldo.")
-                return FALLBACK_WATCHLIST
+            for t in tickers:
+                ticker_map[t["symbol"]] = float(t.get("price24hPcnt", 0.0))
+        except Exception as e:
+            logger.debug(f"[MarketScanner] No se pudo obtener tickers 24h, usando 0.0: {e}")
 
-            logger.info(f"🔍 Lista dinámica generada: {len(final_watchlist)} activos")
-            return final_watchlist
+        for symbol in self.watchlist:
+            if symbol in self._signal_cooldown:
+                if now - self._signal_cooldown[symbol] < 300:
+                    continue
+
+            # Obtener el cambio diario para este símbolo
+            daily_pct = ticker_map.get(symbol, 0.0)
+
+            # 1. OBTENER TENDENCIA MACRO (1 HORA)
+            macro_angle = "FLAT"
+            try:
+                df_1h = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=100)
+                if df_1h is not None and len(df_1h) > 40:
+                    df_1h["ema144"] = df_1h["close"].ewm(span=144, adjust=False).mean()
+                    df_1h["ema233"] = df_1h["close"].ewm(span=233, adjust=False).mean()
+                    
+                    ema144_slope_1h = df_1h["ema144"].iloc[-1] - df_1h["ema144"].iloc[-5]
+                    ema233_slope_1h = df_1h["ema233"].iloc[-1] - df_1h["ema233"].iloc[-5]
+                    
+                    if ema144_slope_1h > 0 and ema233_slope_1h > 0:
+                        macro_angle = "BULLISH"
+                    elif ema144_slope_1h < 0 and ema233_slope_1h < 0:
+                        macro_angle = "BEARISH"
+            except Exception as exc:
+                logger.debug(f"[MarketScanner] No se pudo obtener macro 1h para {symbol}: {exc}")
+
+            # 2. ANALIZAR TIMEFRAMES
+            for timeframe in self.timeframes:
+                try:
+                    df = await self.api.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
+                    if df is None or len(df) < 40:
+                        continue
+
+                    # Pasar el cambio diario y el marco temporal a la descripción
+                    behavior = self._describe_behavior(df, daily_pct, timeframe)
+                    symbol_code = self._normalize_symbol(symbol)
+                    
+                    matches = self._match_patterns(symbol_code, behavior, timeframe, macro_angle)
+
+                    if not matches:
+                        continue
+
+                    best = max(matches, key=lambda item: (item["match_ratio"], item["pattern"].get("rb_real", 0.0)))
+                    signal = self._build_signal(symbol, df, behavior, best, timeframe)
+
+                    if signal and signal.score >= self.min_score:
+                        if self._can_signal(symbol):
+                            self._signal_cooldown[symbol] = now
+                            signals.append(signal)
+                            logger.debug(f"[MarketScanner] Señal {symbol} {timeframe} Score: {signal.score:.2f}")
+
+                except Exception as exc:
+                    logger.debug(f"[MarketScanner] Error en {symbol} {timeframe}: {exc}")
+
+        if not signals:
+            logger.info("[MarketScanner] Ninguna señal encontrada en este ciclo.")
+        else:
+            logger.info(f"[MarketScanner] {len(signals)} señales encontradas")
+
+        return signals
+
+    # 🟢 NUEVO: Cuenta los toques a la EMA 55 después del último cruce
+    def _count_touches_after_cross(self, df: pd.DataFrame, lookback: int = 50) -> int:
+        """
+        Cuenta cuántas veces el precio ha estado NEAR o TOUCHING la EMA55
+        después del último cruce alcista de la EMA55 sobre la EMA144.
+        Si el precio ya tocó la EMA más de 4 veces, es una señal de agotamiento.
+        """
+        try:
+            df = df.copy()
+            df['ema55'] = df['close'].ewm(span=55, adjust=False).mean()
+            df['ema144'] = df['close'].ewm(span=144, adjust=False).mean()
+            
+            # Detectar cruces alcistas en las últimas 50 velas
+            df['cross_bull'] = (df['ema55'] > df['ema144']) & (df['ema55'].shift(1) <= df['ema144'].shift(1))
+            cross_idx = df[df['cross_bull']].index
+            
+            if len(cross_idx) == 0:
+                return 0
+            
+            # Tomar el último cruce
+            last_cross_idx = cross_idx[-1]
+            df_after_cross = df.loc[last_cross_idx:]
+            
+            # Contar las veces que el precio estuvo cerca de la EMA55 (menos del 0.8% de distancia)
+            touch_count = 0
+            for idx, row in df_after_cross.iterrows():
+                diff = abs(float(row['close']) - float(row['ema55']))
+                pct = diff / float(row['close'])
+                if pct < 0.008: # Equivalente a NEAR o TOUCHING
+                    touch_count += 1
+            
+            return touch_count
             
         except Exception as e:
-            logger.error(f"❌ Error generando lista dinámica con pybit: {e}. Usando lista de respaldo.")
-            return FALLBACK_WATCHLIST
+            logger.debug(f"[MarketScanner] Error contando toques a EMA: {e}")
+            return 999  # Si hay error, ignoramos la señal
 
-    async def initialize(self) -> None:
-        logger.info(
-            "\n" + "=" * 60 + "\n"
-            + " 🚀 ÚNICO STRATEGY v5.0 — M15 + M3 (REGLAS DE ORO)\n"
-            + f" Modo: {self.mode.value}\n"
-            + f" Sandbox: {self.config['SANDBOX']}\n"
-            + f" Scanner: {'ON' if self.config['SCANNER_ENABLED'] else 'PAUSE'}\n"
-            + f" Máximo posiciones: {self.config['MAX_POSITIONS']}\n"
-            + f" Posición: {self.config['POSITION_PCT']*100:.0f}% capital\n"
-            + f" SL: {self.config['SL_PCT']*100:.0f}% de posición\n"
-            + f" TP: {self.config['TP_MULTIPLE']}x riesgo\n"
-            + f" Cooldown: {self.config['COOLDOWN_MINUTES']}min\n"
-            + "=" * 60
+    def _describe_behavior(self, df: pd.DataFrame, daily_pct: float, timeframe: str) -> Dict[str, Any]:
+        df = df.copy()
+        df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+        df["ema55"] = df["close"].ewm(span=55, adjust=False).mean()
+        df["ema144"] = df["close"].ewm(span=144, adjust=False).mean()
+        df["ema233"] = df["close"].ewm(span=233, adjust=False).mean()
+        df["bb_mid"] = df["close"].rolling(20).mean()
+        df["bb_std"] = df["close"].rolling(20).std()
+        df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
+        df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
+
+        # 🟢 NUEVO: Cálculo de ADX
+        df["tr"] = np.maximum(
+            df["high"] - df["low"],
+            np.maximum(
+                abs(df["high"] - df["close"].shift(1)),
+                abs(df["low"] - df["close"].shift(1))
+            )
         )
+        df["atr"] = df["tr"].rolling(14).mean()
+        df["up"] = df["high"] - df["high"].shift(1)
+        df["down"] = df["low"].shift(1) - df["low"]
+        df["+dm"] = np.where((df["up"] > df["down"]) & (df["up"] > 0), df["up"], 0.0)
+        df["-dm"] = np.where((df["down"] > df["up"]) & (df["down"] > 0), df["down"], 0.0)
+        df["+di"] = 100 * (df["+dm"].rolling(14).mean() / df["atr"])
+        df["-di"] = 100 * (df["-dm"].rolling(14).mean() / df["atr"])
+        df["dx"] = 100 * abs(df["+di"] - df["-di"]) / (df["+di"] + df["-di"])
+        df["adx"] = df["dx"].rolling(14).mean()
+
+        current = df.iloc[-1]
+        prior = df.iloc[-2]
+
+        # 🟢 NUEVO: Calcular toques a la EMA después del cruce
+        ema_touch_count = self._count_touches_after_cross(df)
+
+        def slope_label(series: pd.Series) -> str:
+            delta = series.iloc[-1] - series.iloc[-4]
+            if abs(delta) / max(series.iloc[-1], 1e-6) < 0.002:
+                return "FLAT"
+            return "UP" if delta > 0 else "DOWN"
+
+        def position_label(price: float, target: float) -> str:
+            diff = price - target
+            pct = abs(diff / max(price, 1e-6))
+            if pct < 0.002:
+                return "TOUCHING"
+            if pct < 0.008:
+                return "NEAR"
+            return "ABOVE" if diff > 0 else "BELOW"
+
+        def ema_relation(fast: float, slow: float, prev_fast: float, prev_slow: float) -> str:
+            if fast > slow and prev_fast <= prev_slow:
+                return "CROSSING_UP"
+            if fast < slow and prev_fast >= prev_slow:
+                return "CROSSING_DOWN"
+            if abs(fast - slow) / max(slow, 1e-6) < 0.0015:
+                return "FLAT"
+            return "ABOVE" if fast > slow else "BELOW"
+
+        def fib_zone(close: float) -> str:
+            window = df.iloc[-40:-5]
+            if len(window) < 10:
+                return "N/A"
+            swing_high = float(window["high"].max())
+            swing_low = float(window["low"].min())
+            if swing_high <= swing_low or close <= swing_low:
+                return "N/A"
+            ratio = (close - swing_low) / max(swing_high - swing_low, 1e-6)
+            if ratio < 0.382:
+                return "0.0_0.382"
+            if ratio < 0.5:
+                return "0.382_0.500"
+            if ratio < 0.618:
+                return "0.500_0.618"
+            if ratio < 0.786:
+                return "0.618_0.786"
+            if ratio <= 1.0:
+                return "0.786_1.000"
+            return "1.000_PLUS"
+
+        def bb_price_label(close: float, mid: float, lower: float, upper: float) -> str:
+            if close >= upper:
+                return "UPPER"
+            if close <= lower:
+                return "LOWER"
+            if close >= mid:
+                return "MID_TO_UPPER"
+            return "LOWER"
+
+        def bb_state_label(mid: float, upper: float, lower: float, recent: pd.DataFrame) -> str:
+            width = (upper - lower) / max(mid, 1e-6)
+            previous_width = ((recent["bb_upper"] - recent["bb_lower"]) / recent["bb_mid"].replace(0, np.nan)).iloc[-5:-1].mean()
+            if width < 0.025:
+                return "MAX_SQUEEZE"
+            if width < 0.045:
+                return "SQUEEZE"
+            if width > 0.080:
+                return "EXPANDING"
+            return "CONTRACTING"
+
+        def volume_label(volume: float, average: float) -> str:
+            if volume >= average * 2.0:
+                return "HIGH"
+            if volume >= average * 1.2:
+                return "MEDIUM"
+            if volume < average * 0.35:
+                return "VERY_LOW"
+            return "LOW"
+
+        def candle_pattern(row: pd.Series) -> str:
+            body = abs(row["close"] - row["open"])
+            upper_wick = float(row["high"] - max(row["close"], row["open"]))
+            lower_wick = float(min(row["close"], row["open"]) - row["low"])
+            if body > 0 and row["close"] > row["open"] and body > upper_wick * 2:
+                return "STRONG_GREEN"
+            if body > 0 and row["close"] < row["open"] and body > lower_wick * 2:
+                return "STRONG_RED"
+            if upper_wick > body * 1.5 and row["close"] < row["open"]:
+                return "REJECTION"
+            if lower_wick > body * 1.5 and row["close"] > row["open"]:
+                return "HAMMER"
+            return "NEUTRAL"
+
+        def adx_tendencia_label(adx_val: float) -> str:
+            if adx_val > 30:
+                return "STRONG"
+            elif adx_val > 20:
+                return "WEAK"
+            else:
+                return "RANGE"
+
+        volume_average = float(df["volume"].rolling(20).mean().iloc[-2] or 0.0)
+        price = float(current["close"])
+
+        return {
+            "ema21_vs_ema55": ema_relation(float(current["ema21"]), float(current["ema55"]),
+                                          float(prior["ema21"]), float(prior["ema55"])),
+            "ema55_vs_ema144": ema_relation(float(current["ema55"]), float(current["ema144"]),
+                                           float(prior["ema55"]), float(prior["ema144"])),
+            "ema144_vs_ema233": ema_relation(float(current["ema144"]), float(current["ema233"]),
+                                            float(prior["ema144"]), float(prior["ema233"])),
+            "ema21_slope": slope_label(df["ema21"]),
+            "ema144_slope": slope_label(df["ema144"]),
+            "precio_vs_ema21": position_label(price, float(current["ema21"])),
+            "precio_vs_ema55": position_label(price, float(current["ema55"])),
+            "precio_vs_ema144": position_label(price, float(current["ema144"])),
+            "precio_vs_ema233": position_label(price, float(current["ema233"])),
+            "bb_estado": bb_state_label(float(current["bb_mid"]), float(current["bb_upper"]),
+                                       float(current["bb_lower"]), df.iloc[-10:]),
+            "bb_precio": bb_price_label(price, float(current["bb_mid"]),
+                                       float(current["bb_lower"]), float(current["bb_upper"])),
+            "volumen": volume_label(float(current["volume"]), volume_average),
+            "patron_vela": candle_pattern(current),
+            "fib_zona": fib_zone(price),
+            "entry_price": price,
+            "adx_tendencia": adx_tendencia_label(float(current["adx"])),
+            "daily_pct_change": daily_pct,      # 🟢 NUEVO: Pasar el cambio diario
+            "ema_touch_count": ema_touch_count, # 🟢 NUEVO: Pasar el conteo de toques
+        }
+
+    def _evaluate_golden_rules(self, behavior: Dict[str, Any], macro_angle: str, timeframe: str) -> float:
+        score = 0.0
+        bb_price = behavior.get("bb_precio", "MID")
+        ema144_slope = behavior.get("ema144_slope", "FLAT")
+        volumen = behavior.get("volumen", "LOW")
+        precio_vs_ema144 = behavior.get("precio_vs_ema144", "")
+        adx_force = behavior.get("adx_tendencia", "RANGE")
+        daily_pct = behavior.get("daily_pct_change", 0.0)      # 🟢 NUEVO
+        ema_touch_count = behavior.get("ema_touch_count", 0)   # 🟢 NUEVO
+        signal_type = behavior.get("signal_type", "UNKNOWN")
+
+        # 🛑 FILTRO 1: Si el activo está extremadamente sobrecomprado (>30% en el día), no comprar.
+        if daily_pct > 0.30 and "LONG" in str(signal_type):
+            return 0.0
+        if daily_pct < -0.30 and "SHORT" in str(signal_type):
+            return 0.0
+
+        # 🛑 FILTRO 2: Si el precio ha tocado la EMA 55 más de 4 veces después del último cruce, es una trampa.
+        if ema_touch_count > 4:
+            # Penalizar fuertemente si está en la zona de compra/venta
+            if precio_vs_ema144 in ["ABOVE", "BELOW"]:
+                return 0.0
+            else:
+                # Si el precio está cerca de la EMA pero ya la tocó varias veces, seguir penalizando
+                score -= 30.0
+
+        # ⭐ REGLA DE ORO: CAZA DE ROMPIMIENTO REAL (Día 5)
+        if adx_force == "STRONG" and macro_angle == "BULLISH" and precio_vs_ema144 == "ABOVE":
+            if volumen in ["HIGH", "MEDIUM"]:
+                score += 30.0
+
+        # --- REGLA 1: COMPRA DE BAJO RIESGO (BANDA INFERIOR) ---
+        if macro_angle == "BULLISH":
+            if bb_price == "LOWER":
+                score += 25.0
+
+        # --- REGLA 2: VENTA DE CONTINUACIÓN (BANDA SUPERIOR O MEDIA EN BAJISTA) ---
+        if macro_angle == "BEARISH":
+            if bb_price in ["UPPER", "MID_TO_UPPER"]:
+                score += 20.0
+
+        # --- REGLA 3: COMPRA EN M3 (ANCLAJE A EMA55) ---
+        if timeframe == "3m" and ema144_slope == "UP":
+            if behavior.get("precio_vs_ema55") in ["TOUCHING", "NEAR"]:
+                score += 25.0
+
+        # --- REGLA 4: RECHAZO EN BANDA SUPERIOR (TRAMPA DE TECHO) ---
+        if bb_price == "UPPER":
+            candle = behavior.get("patron_vela", "NEUTRAL")
+            if candle in ["REJECTION", "STRONG_RED"]:
+                score += 15.0
+
+        # --- REGLA 5: ANCLAJE MACRO (Filtro de seguridad) ---
+        if bb_price == "MID" and macro_angle == "FLAT":
+            score -= 20.0
+
+        return max(0.0, score)
+
+    def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any], timeframe: str, macro_angle: str) -> List[Dict[str, Any]]:
+        matches = []
+        patterns = self.patterns_by_tf.get(timeframe, [])
         
-        self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
-        self.scanner.watchlist = self.config["WATCHLIST"]
+        golden_score = self._evaluate_golden_rules(behavior, macro_angle, timeframe)
+        
+        if golden_score < 15.0:
+            return matches
 
-        # ✅ CORRECCIÓN DE BALANCE EN VIVO (SOLUCIÓN A LOS 10.42 USDT)
-        if self.mode == BotMode.DRY_RUN:
-            logger.info("🔬 Modo DRY_RUN - Simulando balance de $10,000 USDT")
-            self.rm.set_initial_balance(10000.0)
-        else:
-            try:
-                balance = await self.api.fetch_balance()
-                self.rm.set_initial_balance(balance["total"])
-                logger.info(f"💰 Balance inicial REAL: {balance['total']:.2f} USDT")
-            except Exception as e:
-                logger.error(f"❌ Error obteniendo balance de Bybit: {e}")
-                raise
+        for pattern in patterns:
+            if pattern.get("symbol") not in {symbol_code, "UNIVERSAL"}:
+                continue
 
-    async def run(self) -> None:
-        await self.initialize()
-        self.running = True
-        logger.info("✅ Bot iniciado. Loop principal corriendo...")
+            if pattern.get("timeframe") != timeframe:
+                continue
 
-        while self.running:
-            try:
-                await self._cycle()
-            except Exception as exc:
-                logger.exception(f"❌ Error en ciclo: {exc}")
-                await asyncio.sleep(5)
+            signal_type = pattern.get("signal_type", "")
 
-        await self.shutdown()
+            score = 0
+            total = 0
 
-    async def _cycle(self) -> None:
-        self.stats["cycles"] += 1
-        capital = await self.rm.update_capital()
-        stopped, reason = self.rm.kill_switch.check(capital.total_balance)
-        if stopped:
-            logger.critical(f"🛑 Kill Switch activo: {reason}")
-            self.running = False
-            return
+            for key in MATCH_FIELDS:
+                expected = pattern.get(key)
+                actual = behavior.get(key)
+                if expected is None or expected == "N/A":
+                    continue
+                if actual is None:
+                    continue
 
-        min_available_to_trade = capital.total_balance * 0.05
-        if capital.available < min_available_to_trade:
-            logger.warning(f"⏸️ Saldo disponible muy bajo ({capital.available:.2f} USDT). Esperando liberación...")
-        elif self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
-            if self.stats["cycles"] % 15 == 0:
-                self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
-                self.scanner.watchlist = self.config["WATCHLIST"]
-                
-            signals = await self.scanner.scan_all()
-            self.stats["signals"] += len(signals)
+                total += 1
+                if str(expected).upper() == str(actual).upper():
+                    score += 1
+
+            if total == 0:
+                continue
+
+            match_ratio = score / total
             
-            if signals:
-                logger.info(f"🔍 Se encontraron {len(signals)} señales válidas después del filtro.")
-                for s in signals:
-                    # 🟢 CORRECCIÓN AQUÍ: Cambié 'price' por 'entry_price'
-                    logger.info(f"   🔸 {s.symbol} | TF: {s.timeframe} | Score: {s.score:.2f} | Precio: {s.entry_price}")
-                
-                signals.sort(key=lambda s: s.score, reverse=True)
-                available_slots = self.config["MAX_POSITIONS"] - len(self.rm.positions)
-                signals_to_process = signals[:available_slots]
-                
-                for signal in signals_to_process:
-                    await self._process_signal(signal)
-        else:
-            logger.debug("⏸️ Scanner en pausa o máximo de posiciones alcanzado.")
+            final_score = match_ratio + (golden_score / 100.0) * 0.5
+            final_score = min(final_score, 1.0)
 
-        if self.rm.positions:
-            dfs = {}
-            for symbol in list(self.rm.positions.keys()):
-                pos = self.rm.positions[symbol]
-                tf = getattr(pos, 'timeframe', '15m')
-                dfs[symbol] = await self.api.fetch_ohlcv(symbol, timeframe=tf, limit=100)
-            
-            closes = await self.rm.monitor_positions(dfs)
-            
-            for symbol, (should_close, reason, notes) in closes.items():
-                if not should_close:
+            # 🚨 FILTRO ANTI-TRAMPAS
+            if "BREAKOUT" in signal_type:
+                if behavior.get("adx_tendencia") in ["WEAK", "RANGE"]:
                     continue
-                    
-                pos = self.rm.positions.get(symbol)
-                if not pos:
+                if final_score < 0.40:
                     continue
-                    
-                close_side = "sell" if pos.side == "LONG" else "buy"
-                
-                # 🛡️ VERIFICACIÓN DE POSICIÓN FANTASMA
-                live_pos = await self.executor.check_position_exists(symbol)
-                
-                if not live_pos:
-                    logger.warning(f"🛡️ Posición {symbol} no existe en Bybit. Limpiando registro local...")
-                    await self.rm.close_position(symbol, CloseReason.FORCED_CLOSE, pos.current_price)
-                    self.stats["closed"] += 1
+            else:
+                if final_score < 0.40:
                     continue
 
-                result = await self.executor.close_position(
-                    symbol=symbol,
-                    side=close_side,
-                    contracts=pos.contracts,
-                    current_price=pos.current_price,
-                    reason=reason,
-                )
-                if result is None or result.get("is_ghost"):
-                    logger.warning(f"⚠️ Executor falló o devolvió GHOST en {symbol}. Limpiando registro local.")
-                    await self.rm.close_position(symbol, CloseReason.FORCED_CLOSE, pos.current_price)
-                    continue
+            matches.append({
+                "pattern": pattern,
+                "match_ratio": final_score,
+                "score": score,
+                "total": total,
+            })
 
-                await self.rm.close_position(symbol, reason, pos.current_price)
-                self.stats["closed"] += 1
-                
-                if reason == CloseReason.REVERSE:
-                    self.stats["reversals"] += 1
-                    reverse_side = "sell" if pos.side == "LONG" else "buy"
-                    reverse_order = await self.executor.open_position(
-                        symbol=symbol,
-                        side=reverse_side,
-                        position_size=pos,
-                    )
-                    if reverse_order:
-                        self.rm.register_position(
-                            order_id=reverse_order["id"],
-                            position_size=pos,
-                            pattern_id=pos.pattern_id,
-                            signal_type=pos.signal_type,
-                            arrow_color=pos.arrow_color,
-                            score=pos.score,
-                        )
-                        logger.info(f"🔄 Reverso abierto {symbol} {reverse_side}")
+        return matches
 
-        self._log_status(capital)
-        await asyncio.sleep(self.config["SCAN_INTERVAL"])
+    def _build_signal(
+        self,
+        symbol: str,
+        df: pd.DataFrame,
+        behavior: Dict[str, Any],
+        matched: Dict[str, Any],
+        timeframe: str,
+    ) -> Optional[Signal]:
+        pattern = matched["pattern"]
+        signal_type_str = pattern["signal_type"]
 
-    async def _process_signal(self, signal: Signal) -> None:
-        logger.info(
-            f"📊 Procesando señal {signal.signal_type.value} {signal.symbol} | "
-            f"Score {signal.score:.2f} | Timeframe: {signal.timeframe}"
+        if signal_type_str == "NO_SIGNAL":
+            return None
+
+        try:
+            signal_type = SignalType(signal_type_str)
+        except ValueError:
+            logger.warning(f"[MarketScanner] Tipo inválido '{signal_type_str}' para {symbol}")
+            return None
+
+        entry_price = float(behavior["entry_price"])
+        score = float(matched["match_ratio"])
+
+        return Signal(
+            symbol=symbol,
+            signal_type=signal_type,
+            score=score,
+            risk_reward=0.0,
+            stop_loss=0.0,
+            take_profit=0.0,
+            entry_price=entry_price,
+            df=df,
+            pattern_id=pattern.get("id"),
+            timeframe=timeframe,
         )
-
-        position_size = await self.rm.evaluate_entry(
-            signal=signal,
-            df=signal.df,
-            sl_structural=signal.stop_loss,
-            tp_structural=signal.take_profit,
-        )
-        
-        if not position_size:
-            logger.warning(f"⏭️ Señal descartada por RiskManager: {signal.symbol}")
-            return
-
-        open_side = "buy" if signal.signal_type.is_long() else "sell"
-        order = await self.executor.open_position(
-            symbol=signal.symbol,
-            side=open_side,
-            position_size=position_size,
-            stop_loss=position_size.stop_loss,
-            take_profit=position_size.take_profit,
-            leverage=position_size.leverage,
-        )
-        
-        if not order:
-            logger.error(f"❌ Error abriendo posición en {signal.symbol}")
-            return
-
-        self.rm.register_position(
-            order_id=order["id"],
-            position_size=position_size,
-            pattern_id=signal.pattern_id,
-            signal_type=signal.signal_type.value,
-            arrow_color=None,
-            score=signal.score,
-        )
-        self.stats["opened"] += 1
-        logger.info(
-            f"✅ Posición abierta {signal.symbol} {open_side} {signal.timeframe} | "
-            f"SL: {position_size.stop_loss:.4f} TP: {position_size.take_profit:.4f}"
-        )
-
-    def _log_status(self, capital: Any) -> None:
-        positions_info = []
-        for sym, pos in self.rm.positions.items():
-            positions_info.append(f"{sym}({pos.timeframe})")
-        
-        logger.info(
-            f"📊 Ciclo {self.stats['cycles']} | "
-            f"Balance: {capital.total_balance:.2f} USDT | "
-            f"Disponible: {capital.available:.2f} USDT | "
-            f"Posiciones: {len(self.rm.positions)} {positions_info} | "
-            f"Señales: {self.stats['signals']} | "
-            f"Abiertas: {self.stats['opened']} | "
-            f"Cerradas: {self.stats['closed']}"
-        )
-
-    def _handle_shutdown(self, signum: int, frame: Any) -> None:
-        logger.info(f"🛑 Señal {signum} recibida, cerrando...")
-        self.running = False
-
-    async def shutdown(self) -> None:
-        logger.info("🛑 Deteniendo bot...")
-        if self.api:
-            await self.api.close()
-        logger.info(
-            f"📊 Estadísticas finales: ciclos={self.stats['cycles']}, "
-            f"señales={self.stats['signals']}, abiertas={self.stats['opened']}, "
-            f"cerradas={self.stats['closed']}, reversos={self.stats['reversals']}"
-        )
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="ÚNICO STRATEGY Bot")
-    parser.add_argument("--status", action="store_true", help="Muestra el estado del bot")
-    parser.add_argument("--init-db", action="store_true", help="Inicializa la base de datos de patrones")
-    parser.add_argument("--dry-run", action="store_true", help="Forzar modo DRY_RUN")
-    parser.add_argument("--live", action="store_true", help="Forzar modo LIVE")
-    return parser.parse_args()
-
-
-def mostrar_estado() -> None:
-    if not os.path.exists(CONFIG["DB_PATH"]):
-        print("\n⚠️  La base de datos de patrones no existe. Ejecuta --init-db.")
-        return
-    print("\n" + "=" * 60)
-    print("  🧠 ÚNICO STRATEGY v5.0 — REGLAS DE ORO")
-    print("=" * 60)
-    print(f"  Modo: {CONFIG['MODE']}")
-    print(f"  Sandbox: {CONFIG['SANDBOX']}")
-    print(f"  DB: {CONFIG['DB_PATH']}")
-    print(f"  SL: {CONFIG['SL_PCT']*100:.0f}% de posición")
-    print(f"  TP: {CONFIG['TP_MULTIPLE']}x riesgo")
-    print("=" * 60)
-
-
-async def main() -> None:
-    args = parse_args()
-    
-    if args.dry_run:
-        CONFIG["MODE"] = "DRY_RUN"
-    if args.live:
-        CONFIG["MODE"] = "LIVE"
-
-    if args.init_db:
-        with sqlite3.connect(CONFIG['DB_PATH']) as conn:
-            seed_patterns.init_db(conn)
-            seed_patterns.insert_patterns(conn, seed_patterns.PATTERNS)
-            seed_patterns.print_summary(conn)
-        return
-
-    if args.status:
-        mostrar_estado()
-        return
-
-    if CONFIG["MODE"] == "LIVE":
-        if not CONFIG["API_KEY"] or not CONFIG["API_SECRET"]:
-            print("\n❌ ERROR: Faltan credenciales de Bybit")
-            print("   Asegúrate de configurar estas variables en Railway:")
-            print("   • BYBIT_API_KEY")
-            print("   • BYBIT_API_SECRET")
-            print("\n   También puedes usar el modo DRY_RUN para pruebas:")
-            print("   python main.py --dry-run\n")
-            sys.exit(1)
-
-    bot = UnicoBot(CONFIG)
-    
-    try:
-        await bot.run()
-    except KeyboardInterrupt:
-        logger.info("⏹️ Interrupción manual.")
-    except Exception as exc:
-        logger.exception(f"💥 Error crítico: {exc}")
-    finally:
-        await bot.shutdown()
-
-
-if __name__ == "__main__":
-    print("""
-╔═══════════════════════════════════════════════════════════════╗
-║            🧠 ÚNICO STRATEGY v5.0 — REGLAS DE ORO           ║
-║         Futuros Perpetuos USDT-M — Bybit                    ║
-╠═══════════════════════════════════════════════════════════════╣
-║  TIMEFRAMES:                                                 ║
-║  📊 M15: Entorno | ⚡ M3: Entrada                           ║
-╠═══════════════════════════════════════════════════════════════╣
-║  🛡️  SL: 6% del capital  |  🚀 TP: 30% del capital         ║
-║  📊 Posición: 30%        |  ⏱️  Cooldown: 15min            ║
-║  🔒 Límite diario: 999   |  🧠 Aprendizaje: ACTIVADO       ║
-╚═══════════════════════════════════════════════════════════════╝
-""")
-    asyncio.run(main())
