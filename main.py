@@ -211,7 +211,8 @@ class UnicoBot:
             if signals:
                 logger.info(f"🔍 Se encontraron {len(signals)} señales válidas después del filtro.")
                 for s in signals:
-                    logger.info(f"   🔸 {s.symbol} | TF: {s.timeframe} | Score: {s.score:.2f} | Precio: {s.price}")
+                    # 🟢 CORRECCIÓN AQUÍ: Cambié 'price' por 'entry_price'
+                    logger.info(f"   🔸 {s.symbol} | TF: {s.timeframe} | Score: {s.score:.2f} | Precio: {s.entry_price}")
                 
                 signals.sort(key=lambda s: s.score, reverse=True)
                 available_slots = self.config["MAX_POSITIONS"] - len(self.rm.positions)
