@@ -10,6 +10,7 @@ Mejoras implementadas:
   6. Ajuste de apalancamiento (set_leverage)
   7. Detección automática de apalancamiento máximo por símbolo
   8. Detección de activos ST (Special Treatment)
+  9. [CORRECCIÓN] Método get_positions para verificar existencia en vivo
 """
 
 import ccxt
@@ -401,27 +402,23 @@ class BybitAPIManager:
         return float(market.get("limits", {}).get("price", {}).get("min", 0.0))
 
     # ──────────────────────────────────────────
-    #  APALANCAMIENTO DINÁMICO (NUEVO)
+    #  APALANCAMIENTO DINÁMICO
     # ──────────────────────────────────────────
     async def get_max_leverage(self, symbol: str) -> int:
         """
         Obtiene el apalancamiento máximo permitido para un símbolo.
         También detecta si es un activo "ST" (Special Treatment).
         """
-        # Verificar caché
         if symbol in self._leverage_cache:
             return self._leverage_cache[symbol]
 
         try:
-            # 1. Intentar obtener de la caché de mercados
             await self._ensure_markets()
             market = self.exchange.markets.get(symbol)
             
-            # 2. Verificar si es activo ST
             is_st_asset = False
             if market and 'info' in market:
                 info = market['info']
-                # Buscar indicadores de ST
                 if (info.get('isST') or 
                     info.get('special_treatment') or
                     'ST' in symbol.upper()):
@@ -429,16 +426,13 @@ class BybitAPIManager:
                     self._st_assets.add(symbol)
                     logger.warning(f"[Leverage] {symbol} es un activo ST (mayor riesgo)")
             
-            # 3. Obtener apalancamiento máximo
-            max_lev = 10  # Default seguro
-            
+            max_lev = 10
             if market:
                 limits = market.get('limits', {})
                 leverage_limit = limits.get('leverage', {})
                 if leverage_limit:
                     max_lev = int(leverage_limit.get('max', 10))
             
-            # 4. Si es ST, limitar aún más (opcional)
             if is_st_asset and max_lev > 5:
                 logger.warning(
                     f"[Leverage] {symbol} es ST, reduciendo apalancamiento de "
@@ -446,7 +440,6 @@ class BybitAPIManager:
                 )
                 max_lev = 5
             
-            # 5. Intentar con API directa de Bybit para confirmar
             try:
                 response = await self._safe_call(
                     lambda: self.exchange.public_get_v5_market_instruments_info({
@@ -461,36 +454,27 @@ class BybitAPIManager:
                         if item.get('symbol') == symbol:
                             leverage_filter = item.get('leverageFilter', {})
                             api_max = int(leverage_filter.get('maxLeverage', 10))
-                            
-                            # Usar el menor entre ambos
                             max_lev = min(max_lev, api_max)
                             logger.debug(f"[Leverage] {symbol} max leverage (API): {max_lev}x")
                             break
             except Exception as e:
                 logger.debug(f"[Leverage] API directa falló para {symbol}: {e}")
             
-            # Guardar en caché
             self._leverage_cache[symbol] = max_lev
             logger.info(f"[Leverage] {symbol} apalancamiento efectivo: {max_lev}x")
             return max_lev
             
         except Exception as e:
             logger.error(f"[Leverage] Error obteniendo apalancamiento para {symbol}: {e}")
-            return 10  # Default seguro
+            return 10
 
     async def is_st_asset(self, symbol: str) -> bool:
-        """Verifica si un símbolo es un activo ST."""
         if symbol in self._st_assets:
             return True
-        # Intentar detectar
         await self.get_max_leverage(symbol)
         return symbol in self._st_assets
 
-    # ══════════════════════════════════════════════════════════
-    # ✅ SET LEVERAGE CORREGIDO (Maneja errores 110043 y 110013)
-    # ══════════════════════════════════════════════════════════
     async def set_leverage(self, symbol: str, leverage: int) -> None:
-        """Establece el apalancamiento para el símbolo."""
         try:
             await self._safe_call(
                 lambda: self.exchange.set_leverage(leverage, symbol),
@@ -501,21 +485,57 @@ class BybitAPIManager:
         except ccxt.ExchangeError as e:
             error_str = str(e)
             
-            # ✅ SOLUCIÓN 1: Ignorar error de apalancamiento ya modificado (110043)
             if "retCode\":110043" in error_str or "leverage not modified" in error_str.lower():
-                logger.warning(f"[Leverage] {symbol} ya tenía el apalancamiento en {leverage}x. Error 110043 ignorado, continuando.")
+                logger.warning(f"[Leverage] {symbol} ya tenía el apalancamiento en {leverage}x. Error 110043 ignorado.")
             
-            # ✅ SOLUCIÓN 2 (NUEVA): Ignorar error de límite de riesgo de la librería (110013)
             elif "retCode\":110013" in error_str or "cannot set leverage" in error_str.lower():
-                logger.warning(f"[Leverage] {symbol} error de límite de riesgo por parte de la librería (110013) ignorado. El bot usará el apalancamiento actual (10x).")
+                logger.warning(f"[Leverage] {symbol} error de límite de riesgo (110013) ignorado. Usando apalancamiento actual.")
             
             else:
-                # Si es cualquier otro error, sí lo lanzamos para que falle la operación
                 logger.error(f"[Leverage] Error al setear apalancamiento para {symbol}: {e}")
                 raise
 
     # ──────────────────────────────────────────
-    #  COLOCAR ORDEN - CORREGIDO CON TIME_IN_FORCE
+    #  OBTENER POSICIONES ABIERTAS (CORRECCIÓN CRÍTICA PARA EVITAR GHOST POSITIONS)
+    # ──────────────────────────────────────────
+    async def get_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Obtiene las posiciones abiertas en futuros lineales desde Bybit.
+        Si se pasa 'symbol', filtra solo por ese símbolo.
+        Retorna una lista de diccionarios con la información de las posiciones.
+        """
+        params = {"category": "linear"}
+        if symbol:
+            params["symbol"] = symbol
+
+        try:
+            # Usamos la llamada privada a la API v5 de Bybit gestionada por el Circuit Breaker
+            response = await self._safe_call(
+                lambda: self.exchange.private_get_v5_position_list(params),
+                endpoint_type="private",
+            )
+            
+            # Verificamos el código de respuesta de Bybit (0 = éxito)
+            if response and response.get("retCode") == 0:
+                result_list = response.get("result", {}).get("list", [])
+                
+                # Filtramos en caso de que Bybit devuelva posiciones con size = 0
+                active_positions = []
+                for pos in result_list:
+                    # Solo consideramos posiciones con contratos > 0
+                    if float(pos.get("size", 0)) > 0:
+                        active_positions.append(pos)
+                return active_positions
+            else:
+                logger.warning(f"[get_positions] Bybit devolvió error o lista vacía: {response}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"[get_positions] Error obteniendo posiciones para {symbol}: {e}")
+            return []
+
+    # ──────────────────────────────────────────
+    #  COLOCAR ORDEN
     # ──────────────────────────────────────────
     async def place_order(
         self,
@@ -534,22 +554,17 @@ class BybitAPIManager:
         if take_profit:
             params["takeProfit"] = str(take_profit)
 
-        # 🛡️ CORRECCIÓN DE ÓRDENES COLGADAS:
-        # Si no nos pasan precio, usamos límite. PERO añadimos timeInForce='IOC' para que no se quede abierta.
         if order_type == "market" or price is None:
             ticker = await self._safe_call(
                 lambda: self.exchange.fetch_ticker(symbol),
                 endpoint_type="public"
             )
-            # Calculamos el precio límite: 0.5% de margen
             if side.lower() == "buy":
                 price = ticker["last"] * 1.005
             else:
                 price = ticker["last"] * 0.995
             order_type = "limit"
-            
-            # 🛡️ CLAVE: Si el precio se escapa, la orden se cancela sola.
-            params["timeInForce"] = "IOC"  # Immediate or Cancel
+            params["timeInForce"] = "IOC"
 
         try:
             order = await self._safe_call(
