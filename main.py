@@ -161,6 +161,7 @@ class UnicoBot:
         self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
         self.scanner.watchlist = self.config["WATCHLIST"]
 
+        # ✅ CORRECCIÓN DE BALANCE EN VIVO (SOLUCIÓN A LOS 10.42 USDT)
         if self.mode == BotMode.DRY_RUN:
             logger.info("🔬 Modo DRY_RUN - Simulando balance de $10,000 USDT")
             self.rm.set_initial_balance(10000.0)
@@ -168,9 +169,9 @@ class UnicoBot:
             try:
                 balance = await self.api.fetch_balance()
                 self.rm.set_initial_balance(balance["total"])
-                logger.info(f"💰 Balance inicial: {balance['total']:.2f} USDT")
+                logger.info(f"💰 Balance inicial REAL: {balance['total']:.2f} USDT")
             except Exception as e:
-                logger.error(f"❌ Error obteniendo balance: {e}")
+                logger.error(f"❌ Error obteniendo balance de Bybit: {e}")
                 raise
 
     async def run(self) -> None:
@@ -207,11 +208,10 @@ class UnicoBot:
             signals = await self.scanner.scan_all()
             self.stats["signals"] += len(signals)
             
-            # 🟢 NUEVO: IMPRIMIR DETALLES DE LAS SEÑALES GENERADAS
             if signals:
-                logger.info(f"🔍 Se encontraron {len(signals)} señales válidas. Detalles:")
+                logger.info(f"🔍 Se encontraron {len(signals)} señales válidas después del filtro.")
                 for s in signals:
-                    logger.info(f"   🔸 {s.symbol} | TF: {s.timeframe} | Score: {s.score:.2f} | Precio: {s.price} | SL: {s.stop_loss} | TP: {s.take_profit}")
+                    logger.info(f"   🔸 {s.symbol} | TF: {s.timeframe} | Score: {s.score:.2f} | Precio: {s.price}")
                 
                 signals.sort(key=lambda s: s.score, reverse=True)
                 available_slots = self.config["MAX_POSITIONS"] - len(self.rm.positions)
@@ -241,16 +241,14 @@ class UnicoBot:
                     
                 close_side = "sell" if pos.side == "LONG" else "buy"
                 
-                # 🟢 NUEVO: CORRECCIÓN DE POSICIÓN FANTASMA
-                # Verificamos en Bybit si la posición existe antes de intentar cerrar
+                # 🛡️ VERIFICACIÓN DE POSICIÓN FANTASMA
                 live_pos = await self.executor.check_position_exists(symbol)
                 
                 if not live_pos:
-                    logger.warning(f"🛡️ Posición {symbol} no existe en Bybit (ya cerrada o liquidada). Limpiando registro local...")
-                    # Forzamos el cierre en el RiskManager local para quitar el bucle
+                    logger.warning(f"🛡️ Posición {symbol} no existe en Bybit. Limpiando registro local...")
                     await self.rm.close_position(symbol, CloseReason.FORCED_CLOSE, pos.current_price)
                     self.stats["closed"] += 1
-                    continue # Saltamos a la siguiente posición
+                    continue
 
                 result = await self.executor.close_position(
                     symbol=symbol,
@@ -259,13 +257,12 @@ class UnicoBot:
                     current_price=pos.current_price,
                     reason=reason,
                 )
-                if result is None:
-                    # Si el executor falló, intentamos forzar limpieza igualmente
-                    logger.warning(f"⚠️ Executor falló al cerrar {symbol}. Limpiando registro local.")
+                if result is None or result.get("is_ghost"):
+                    logger.warning(f"⚠️ Executor falló o devolvió GHOST en {symbol}. Limpiando registro local.")
                     await self.rm.close_position(symbol, CloseReason.FORCED_CLOSE, pos.current_price)
                     continue
 
-                close_result = await self.rm.close_position(symbol, reason, pos.current_price)
+                await self.rm.close_position(symbol, reason, pos.current_price)
                 self.stats["closed"] += 1
                 
                 if reason == CloseReason.REVERSE:
@@ -292,7 +289,7 @@ class UnicoBot:
 
     async def _process_signal(self, signal: Signal) -> None:
         logger.info(
-            f"📊 Señal {signal.signal_type.value} {signal.symbol} | "
+            f"📊 Procesando señal {signal.signal_type.value} {signal.symbol} | "
             f"Score {signal.score:.2f} | Timeframe: {signal.timeframe}"
         )
 
