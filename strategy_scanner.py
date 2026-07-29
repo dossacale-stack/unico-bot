@@ -55,6 +55,7 @@ MATCH_FIELDS = [
     "volumen",
     "patron_vela",
     "fib_zona",
+    "adx_tendencia",  # 🟢 Indicador de fuerza de la ola
 ]
 
 
@@ -126,7 +127,7 @@ class MarketScanner:
                 if now - self._signal_cooldown[symbol] < 300:
                     continue
 
-            # 1. OBTENER TENDENCIA MACRO (1 HORA) - Para ver el "Océano Verde/Rojo"
+            # 1. OBTENER TENDENCIA MACRO (1 HORA)
             macro_angle = "FLAT"
             try:
                 df_1h = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=100)
@@ -144,7 +145,7 @@ class MarketScanner:
             except Exception as exc:
                 logger.debug(f"[MarketScanner] No se pudo obtener macro 1h para {symbol}: {exc}")
 
-            # 2. ANALIZAR TIMEFRAMES (15M para entorno, 3M para entrada precisa)
+            # 2. ANALIZAR TIMEFRAMES
             for timeframe in self.timeframes:
                 try:
                     df = await self.api.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
@@ -188,6 +189,24 @@ class MarketScanner:
         df["bb_std"] = df["close"].rolling(20).std()
         df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
         df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
+
+        # 🟢 CÁLCULO DEL ADX (Umbral ajustado a 30)
+        df["tr"] = np.maximum(
+            df["high"] - df["low"],
+            np.maximum(
+                abs(df["high"] - df["close"].shift(1)),
+                abs(df["low"] - df["close"].shift(1))
+            )
+        )
+        df["atr"] = df["tr"].rolling(14).mean()
+        df["up"] = df["high"] - df["high"].shift(1)
+        df["down"] = df["low"].shift(1) - df["low"]
+        df["+dm"] = np.where((df["up"] > df["down"]) & (df["up"] > 0), df["up"], 0.0)
+        df["-dm"] = np.where((df["down"] > df["up"]) & (df["down"] > 0), df["down"], 0.0)
+        df["+di"] = 100 * (df["+dm"].rolling(14).mean() / df["atr"])
+        df["-di"] = 100 * (df["-dm"].rolling(14).mean() / df["atr"])
+        df["dx"] = 100 * abs(df["+di"] - df["-di"]) / (df["+di"] + df["-di"])
+        df["adx"] = df["dx"].rolling(14).mean()
 
         current = df.iloc[-1]
         prior = df.iloc[-2]
@@ -280,6 +299,15 @@ class MarketScanner:
                 return "HAMMER"
             return "NEUTRAL"
 
+        def adx_tendencia_label(adx_val: float) -> str:
+            # 🟢 UMBRAL SUBIDO A 30 PARA SER MÁS ESTRICTO
+            if adx_val > 30:
+                return "STRONG"
+            elif adx_val > 20:
+                return "WEAK"
+            else:
+                return "RANGE"
+
         volume_average = float(df["volume"].rolling(20).mean().iloc[-2] or 0.0)
         price = float(current["close"])
 
@@ -304,39 +332,37 @@ class MarketScanner:
             "patron_vela": candle_pattern(current),
             "fib_zona": fib_zone(price),
             "entry_price": price,
+            "adx_tendencia": adx_tendencia_label(float(current["adx"])),
         }
 
-    # 📊 EVALUACIÓN DE LAS 5 REGLAS DE ORO (BASE DE DATOS DE PRECISIÓN)
     def _evaluate_golden_rules(self, behavior: Dict[str, Any], macro_angle: str, timeframe: str) -> float:
         score = 0.0
         bb_price = behavior.get("bb_precio", "MID")
         ema144_slope = behavior.get("ema144_slope", "FLAT")
         volumen = behavior.get("volumen", "LOW")
         precio_vs_ema144 = behavior.get("precio_vs_ema144", "")
-        precio_vs_ema55 = behavior.get("precio_vs_ema55", "")
-        precio_vs_ema233 = behavior.get("precio_vs_ema233", "")
+        adx_force = behavior.get("adx_tendencia", "RANGE")
 
-        # FILTRO BASE: Si no hay volumen alto, no operamos (Regla de Interés)
-        if volumen != "HIGH":
-            return 0.0
+        # ⭐ REGLA DE ORO: CAZA DE ROMPIMIENTO REAL
+        # Si el ADX es FUERTE (ahora >30), es un pico de continuación.
+        if adx_force == "STRONG" and macro_angle == "BULLISH" and precio_vs_ema144 == "ABOVE":
+            if volumen in ["HIGH", "MEDIUM"]:
+                score += 30.0  # Máxima prioridad para los picos que siguen subiendo
 
         # --- REGLA 1: COMPRA DE BAJO RIESGO (BANDA INFERIOR) ---
-        # Contexto: Anclaje alcista en 1h, precio tocando la banda inferior en M15/M3
         if macro_angle == "BULLISH":
             if bb_price == "LOWER":
-                score += 25.0  # Puntuación alta por tocar la banda inferior en tendencia macro alcista
+                score += 25.0
 
         # --- REGLA 2: VENTA DE CONTINUACIÓN (BANDA SUPERIOR O MEDIA EN BAJISTA) ---
-        # Contexto: Anclaje bajista en 1h, precio tocando la banda superior o media
         if macro_angle == "BEARISH":
             if bb_price in ["UPPER", "MID_TO_UPPER"]:
                 score += 20.0
 
         # --- REGLA 3: COMPRA EN M3 (ANCLAJE A EMA55) ---
-        # Contexto: Para entradas en 3m, prioridad si la EMA144 tiene pendiente positiva
         if timeframe == "3m" and ema144_slope == "UP":
-            if precio_vs_ema55 in ["TOUCHING", "NEAR"]:
-                score += 25.0  # Entrada quirúrgica en M3
+            if behavior.get("precio_vs_ema55") in ["TOUCHING", "NEAR"]:
+                score += 25.0
 
         # --- REGLA 4: RECHAZO EN BANDA SUPERIOR (TRAMPA DE TECHO) ---
         if bb_price == "UPPER":
@@ -345,20 +371,17 @@ class MarketScanner:
                 score += 15.0
 
         # --- REGLA 5: ANCLAJE MACRO (Filtro de seguridad) ---
-        # Penalización si el precio está en la zona media y las EMAs están planas
         if bb_price == "MID" and macro_angle == "FLAT":
-            score -= 20.0  # Fuerte penalización en mercados laterales
+            score -= 20.0
 
-        return max(0.0, score)  # Asegurar que el score no sea negativo
+        return max(0.0, score)
 
     def _match_patterns(self, symbol_code: str, behavior: Dict[str, Any], timeframe: str, macro_angle: str) -> List[Dict[str, Any]]:
         matches = []
         patterns = self.patterns_by_tf.get(timeframe, [])
         
-        # 1. Aplicar las Reglas de Oro y obtener una puntuación base
         golden_score = self._evaluate_golden_rules(behavior, macro_angle, timeframe)
         
-        # Si el entorno de subasta no cumple las condiciones, descartar
         if golden_score < 15.0:
             return matches
 
@@ -371,7 +394,6 @@ class MarketScanner:
 
             signal_type = pattern.get("signal_type", "")
 
-            # 2. Integrar la puntuación de las Reglas de Oro
             score = 0
             total = 0
 
@@ -392,17 +414,27 @@ class MarketScanner:
 
             match_ratio = score / total
             
-            # 3. Sumar el puntaje de las Reglas de Oro al ratio de coincidencia del patrón
-            final_score = match_ratio + (golden_score / 100.0) * 0.5  # Ponderación del 50% para las reglas de oro
-            final_score = min(final_score, 1.0)  # No superar 1.0
+            final_score = match_ratio + (golden_score / 100.0) * 0.5
+            final_score = min(final_score, 1.0)
 
-            if final_score >= 0.40:
-                matches.append({
-                    "pattern": pattern,
-                    "match_ratio": final_score,
-                    "score": score,
-                    "total": total,
-                })
+            # 🚨 FILTRO ANTI-TRAMPAS (ADX >= 30)
+            # Si el patrón es un Breakout, y el ADX es DÉBIL o RANGO, es una trampa.
+            if "BREAKOUT" in signal_type:
+                if behavior.get("adx_tendencia") in ["WEAK", "RANGE"]:
+                    continue  # Descartado, es el Día 1
+                # Si pasó el filtro, exigimos que al menos tenga un 0.40 de match con la base de datos
+                if final_score < 0.40:
+                    continue
+            else:
+                if final_score < 0.40:
+                    continue
+
+            matches.append({
+                "pattern": pattern,
+                "match_ratio": final_score,
+                "score": score,
+                "total": total,
+            })
 
         return matches
 
