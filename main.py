@@ -117,30 +117,26 @@ class UnicoBot:
         signal.signal(signal.SIGINT, self._handle_shutdown)
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
-    # ✅ NUEVO SISTEMA DE ESCANEO EN 3 CAPAS (24h + 1h + 15m)
     async def generate_dynamic_watchlist(self) -> List[str]:
-        """Escanea Bybit en 3 plazos (24h, 1h, 15m) y devuelve una lista dinámica de oportunidades."""
+        """Escanea Bybit en 3 plazos (24h, 1h, 15m) y devuelve una lista dinámica."""
         try:
             session = HTTP(testnet=False)
             response = session.get_tickers(category="linear")
             tickers = response["result"]["list"]
             
-            # 1. Obtener Top 15 de las últimas 24h (Tendencia macro)
             sorted_24h = sorted(tickers, key=lambda x: float(x.get("price24hPcnt", 0)), reverse=True)
             top_24h = [t["symbol"] for t in sorted_24h[:15]]
             
-            # 2. Obtener Top 15 de la última 1h (Interés reciente)
             sorted_1h = sorted(tickers, key=lambda x: float(x.get("price1hPcnt", 0)), reverse=True)
             top_1h = [t["symbol"] for t in sorted_1h[:15]]
             
-            # 3. Fusionar las listas sin duplicados (El fogonazo de 15m ya está incluido en el Top 1h)
             final_watchlist = list(set(top_24h + top_1h))
             
             if not final_watchlist:
                 logger.warning("⚠️ Bybit devolvió lista vacía. Usando lista de respaldo.")
                 return FALLBACK_WATCHLIST
 
-            logger.info(f"🔍 Lista dinámica generada: {len(final_watchlist)} activos (Top 24h + Top 1h)")
+            logger.info(f"🔍 Lista dinámica generada: {len(final_watchlist)} activos")
             return final_watchlist
             
         except Exception as e:
@@ -162,7 +158,6 @@ class UnicoBot:
             + "=" * 60
         )
         
-        # Generar la Watchlist Dinámica al iniciar
         self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
         self.scanner.watchlist = self.config["WATCHLIST"]
 
@@ -201,12 +196,10 @@ class UnicoBot:
             self.running = False
             return
 
-        # Regla de capital disponible
         min_available_to_trade = capital.total_balance * 0.05
         if capital.available < min_available_to_trade:
-            logger.warning(f"⏸️ Saldo disponible muy bajo ({capital.available:.2f} USDT). Esperando liberación de capital...")
+            logger.warning(f"⏸️ Saldo disponible muy bajo ({capital.available:.2f} USDT). Esperando liberación...")
         elif self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
-            # Refrescar la Watchlist cada 15 ciclos (aprox 7.5 minutos) para cazar nuevas olas
             if self.stats["cycles"] % 15 == 0:
                 self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
                 self.scanner.watchlist = self.config["WATCHLIST"]
@@ -214,7 +207,12 @@ class UnicoBot:
             signals = await self.scanner.scan_all()
             self.stats["signals"] += len(signals)
             
+            # 🟢 NUEVO: IMPRIMIR DETALLES DE LAS SEÑALES GENERADAS
             if signals:
+                logger.info(f"🔍 Se encontraron {len(signals)} señales válidas. Detalles:")
+                for s in signals:
+                    logger.info(f"   🔸 {s.symbol} | TF: {s.timeframe} | Score: {s.score:.2f} | Precio: {s.price} | SL: {s.stop_loss} | TP: {s.take_profit}")
+                
                 signals.sort(key=lambda s: s.score, reverse=True)
                 available_slots = self.config["MAX_POSITIONS"] - len(self.rm.positions)
                 signals_to_process = signals[:available_slots]
@@ -242,6 +240,18 @@ class UnicoBot:
                     continue
                     
                 close_side = "sell" if pos.side == "LONG" else "buy"
+                
+                # 🟢 NUEVO: CORRECCIÓN DE POSICIÓN FANTASMA
+                # Verificamos en Bybit si la posición existe antes de intentar cerrar
+                live_pos = await self.executor.check_position_exists(symbol)
+                
+                if not live_pos:
+                    logger.warning(f"🛡️ Posición {symbol} no existe en Bybit (ya cerrada o liquidada). Limpiando registro local...")
+                    # Forzamos el cierre en el RiskManager local para quitar el bucle
+                    await self.rm.close_position(symbol, CloseReason.FORCED_CLOSE, pos.current_price)
+                    self.stats["closed"] += 1
+                    continue # Saltamos a la siguiente posición
+
                 result = await self.executor.close_position(
                     symbol=symbol,
                     side=close_side,
@@ -250,6 +260,9 @@ class UnicoBot:
                     reason=reason,
                 )
                 if result is None:
+                    # Si el executor falló, intentamos forzar limpieza igualmente
+                    logger.warning(f"⚠️ Executor falló al cerrar {symbol}. Limpiando registro local.")
+                    await self.rm.close_position(symbol, CloseReason.FORCED_CLOSE, pos.current_price)
                     continue
 
                 close_result = await self.rm.close_position(symbol, reason, pos.current_price)
