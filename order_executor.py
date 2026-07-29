@@ -30,19 +30,9 @@ class OrderExecutor:
         logger.info("[OrderExecutor] Reconciliando posiciones (modo base).")
         await asyncio.sleep(0.01)
 
-    # ==========================================
-    # 🟢 NUEVO: Método para verificar existencia real de la posición en Bybit
-    # ==========================================
     async def check_position_exists(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        Verifica si la posición está realmente abierta en Bybit.
-        Retorna el dict de la posición si existe (size > 0), o None si no existe.
-        """
         try:
-            # Usamos el método get_positions de tu BybitAPIManager
             response = await self.api.get_positions(symbol=symbol)
-            
-            # Bybit a veces devuelve un diccionario con "list" dentro
             if isinstance(response, dict) and "list" in response:
                 positions = response["list"]
             elif isinstance(response, list):
@@ -51,14 +41,11 @@ class OrderExecutor:
                 positions = []
 
             for pos in positions:
-                # Verificamos que el símbolo coincida y que el tamaño sea > 0
                 if pos.get("symbol") == symbol:
                     size = float(pos.get("size", 0))
                     if size > 0:
                         return pos
-            
-            return None  # No se encontró posición activa
-
+            return None
         except Exception as e:
             logger.error(f"[OrderExecutor] Error verificando posición {symbol}: {e}")
             return None
@@ -94,33 +81,12 @@ class OrderExecutor:
             # 1. Ajustar apalancamiento
             await self.api.set_leverage(symbol, lev)
 
-            # 2. Verificar balance disponible
-            try:
-                bal = await self.api.fetch_balance()
-                logger.debug(
-                    f"[OrderExecutor] balance antes de orden: total={bal.get('total')} free={bal.get('free')}"
-                )
-            except Exception as e:
-                logger.debug(f"[OrderExecutor] no se pudo fetch_balance: {e}")
-
-            # 3. Verificar tamaño mínimo
-            try:
-                min_amt = await self.api.get_min_amount(symbol)
-            except Exception:
-                min_amt = 0.0
-
-            if min_amt and amount < float(min_amt):
-                logger.warning(
-                    f"[OrderExecutor] Cantidad {amount} menor que min del mercado {min_amt}. Ajustando a min."
-                )
-                amount = float(min_amt)
-
-            # 4. Validar SL y TP
+            # 2. Validar SL y TP (Asegurar que no sean 0)
             if stop_loss <= 0 or take_profit <= 0:
                 logger.error(f"[OrderExecutor] SL/TP inválidos: SL={stop_loss}, TP={take_profit}")
                 return None
 
-            # 5. Colocar orden (modo One-Way)
+            # 3. Colocar orden (modo One-Way)
             order = await self.api.place_order(
                 symbol=symbol,
                 side=side,
@@ -131,6 +97,32 @@ class OrderExecutor:
                 take_profit=take_profit,
                 reduce_only=False,
             )
+
+            # 🔴 CORRECCIÓN: RECALCULAR SL/TP SI EL PRECIO CAMBIÓ EN LA EJECUCIÓN
+            # A veces el precio de mercado salta. Bybit ejecuta la orden a un precio distinto al planeado.
+            # Si el precio de ejecución es distinto, debemos ajustar el SL/TP dinámicamente.
+            executed_price = float(order.get("price", position_size.entry_price))
+            if abs(executed_price - position_size.entry_price) > (position_size.entry_price * 0.005):  # Si se movió más del 0.5%
+                logger.warning(f"[OrderExecutor] Precio ejecutado ({executed_price}) diferente al planeado ({position_size.entry_price}). Recalculando SL/TP...")
+                
+                # Recalcular SL y TP basados en el precio real de ejecución
+                risk_per_contract = abs(executed_price - stop_loss)  # Distancia original al SL
+                new_stop_loss = executed_price - risk_per_contract
+                new_take_profit = executed_price + (risk_per_contract * 5)  # 5x el riesgo
+                
+                # Enviar la corrección a Bybit
+                await self.api.place_order(
+                    symbol=symbol,
+                    side=side,
+                    order_type="limit",  # Usamos limit para modificar SL/TP de la posición existente
+                    amount=0,            # 0 porque solo modificamos los parámetros
+                    price=None,
+                    stop_loss=new_stop_loss,
+                    take_profit=new_take_profit,
+                    reduce_only=False,
+                )
+                logger.info(f"[OrderExecutor] SL/TP recalculados para {symbol}: Nuevo SL={new_stop_loss:.4f}, Nuevo TP={new_take_profit:.4f}")
+
             return {
                 "id": order.get("id", str(order.get("order_link_id", ""))),
                 "symbol": symbol,
@@ -139,6 +131,7 @@ class OrderExecutor:
                 "stop_loss": stop_loss,
                 "take_profit": take_profit,
             }
+
         except Exception as exc:
             logger.error(f"[OrderExecutor] Error abriendo posición: {exc}")
             return None
@@ -158,17 +151,13 @@ class OrderExecutor:
             return {"id": f"DRY-CLOSE-{symbol}-{int(time.time())}"}
 
         try:
-            # 🟢 CORRECCIÓN 1: Antes de cerrar, verificar que la posición realmente existe en Bybit
             position_exists = await self.check_position_exists(symbol)
             if not position_exists:
                 logger.warning(
-                    f"[OrderExecutor] 🛡️ Posición {symbol} no existe en Bybit (ya cerrada). "
-                    f"Devolviendo 'GHOST' para forzar limpieza en RiskManager."
+                    f"[OrderExecutor] 🛡️ Posición {symbol} no existe en Bybit. Devolviendo 'GHOST'."
                 )
-                # Retornamos un diccionario especial para que main.py entienda que debe limpiarla
                 return {"id": "GHOST_POSITION", "symbol": symbol, "is_ghost": True}
 
-            # Si existe, procedemos a cerrar
             order = await self.api.place_order(
                 symbol=symbol,
                 side=side,
@@ -182,15 +171,9 @@ class OrderExecutor:
             return {"id": order.get("id", str(order.get("order_link_id", "")))}
         
         except Exception as exc:
-            # 🟢 CORRECCIÓN 2: Manejo específico del error de posición fantasma
             error_msg = str(exc)
-            if "110017" in error_msg or "current position is zero" in error_msg:
-                logger.warning(
-                    f"[OrderExecutor] ⚠️ Bybit rechazó orden (Error 110017) en {symbol}. "
-                    f"La posición es fantasma. Devolviendo 'GHOST' para limpieza."
-                )
+            if "110017" in error_msg or "current position is zero" in error_msg.lower():
                 return {"id": "GHOST_POSITION", "symbol": symbol, "is_ghost": True}
-
             logger.error(f"[OrderExecutor] Error cerrando posición: {exc}")
             return None
 
