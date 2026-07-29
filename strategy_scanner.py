@@ -56,8 +56,8 @@ MATCH_FIELDS = [
     "patron_vela",
     "fib_zona",
     "adx_tendencia",
-    "daily_pct_change",      # 🟢 NUEVO: Cambio % 24h
-    "ema_touch_count",       # 🟢 NUEVO: Conteo de toques a la EMA
+    "daily_pct_change",
+    "ema_touch_count",
 ]
 
 
@@ -124,10 +124,8 @@ class MarketScanner:
         signals: List[Signal] = []
         now = time.time()
 
-        # 🟢 NUEVO: Obtener datos de cambio porcentual 24h de toda la watchlist en una sola llamada
         ticker_map = {}
         try:
-            # Usamos el método HTTP directamente o del manager para obtener tickers
             session = self.api.exchange
             response = session.get_tickers(category="linear")
             tickers = response["result"]["list"]
@@ -141,10 +139,8 @@ class MarketScanner:
                 if now - self._signal_cooldown[symbol] < 300:
                     continue
 
-            # Obtener el cambio diario para este símbolo
             daily_pct = ticker_map.get(symbol, 0.0)
 
-            # 1. OBTENER TENDENCIA MACRO (1 HORA)
             macro_angle = "FLAT"
             try:
                 df_1h = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=100)
@@ -162,14 +158,12 @@ class MarketScanner:
             except Exception as exc:
                 logger.debug(f"[MarketScanner] No se pudo obtener macro 1h para {symbol}: {exc}")
 
-            # 2. ANALIZAR TIMEFRAMES
             for timeframe in self.timeframes:
                 try:
                     df = await self.api.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
                     if df is None or len(df) < 40:
                         continue
 
-                    # Pasar el cambio diario y el marco temporal a la descripción
                     behavior = self._describe_behavior(df, daily_pct, timeframe)
                     symbol_code = self._normalize_symbol(symbol)
                     
@@ -185,7 +179,7 @@ class MarketScanner:
                         if self._can_signal(symbol):
                             self._signal_cooldown[symbol] = now
                             signals.append(signal)
-                            logger.debug(f"[MarketScanner] Señal {symbol} {timeframe} Score: {signal.score:.2f}")
+                            logger.debug(f"[MarketScanner] Señal {signal.signal_type.value} {symbol} {timeframe} Score: {signal.score:.2f}")
 
                 except Exception as exc:
                     logger.debug(f"[MarketScanner] Error en {symbol} {timeframe}: {exc}")
@@ -197,42 +191,40 @@ class MarketScanner:
 
         return signals
 
-    # 🟢 NUEVO: Cuenta los toques a la EMA 55 después del último cruce
     def _count_touches_after_cross(self, df: pd.DataFrame, lookback: int = 50) -> int:
         """
         Cuenta cuántas veces el precio ha estado NEAR o TOUCHING la EMA55
-        después del último cruce alcista de la EMA55 sobre la EMA144.
-        Si el precio ya tocó la EMA más de 4 veces, es una señal de agotamiento.
+        después del último cruce de la EMA55 sobre la EMA144.
+        (Funciona tanto para cruces alcistas como bajistas).
         """
         try:
             df = df.copy()
             df['ema55'] = df['close'].ewm(span=55, adjust=False).mean()
             df['ema144'] = df['close'].ewm(span=144, adjust=False).mean()
             
-            # Detectar cruces alcistas en las últimas 50 velas
-            df['cross_bull'] = (df['ema55'] > df['ema144']) & (df['ema55'].shift(1) <= df['ema144'].shift(1))
-            cross_idx = df[df['cross_bull']].index
+            # Detectar cruces en las últimas 50 velas
+            df['cross'] = (df['ema55'] > df['ema144']) & (df['ema55'].shift(1) <= df['ema144'].shift(1))
+            df['cross'] = df['cross'] | ((df['ema55'] < df['ema144']) & (df['ema55'].shift(1) >= df['ema144'].shift(1)))
+            cross_idx = df[df['cross']].index
             
             if len(cross_idx) == 0:
                 return 0
             
-            # Tomar el último cruce
             last_cross_idx = cross_idx[-1]
             df_after_cross = df.loc[last_cross_idx:]
             
-            # Contar las veces que el precio estuvo cerca de la EMA55 (menos del 0.8% de distancia)
             touch_count = 0
             for idx, row in df_after_cross.iterrows():
                 diff = abs(float(row['close']) - float(row['ema55']))
                 pct = diff / float(row['close'])
-                if pct < 0.008: # Equivalente a NEAR o TOUCHING
+                if pct < 0.01: # 1% de distancia para considerar "toque"
                     touch_count += 1
             
             return touch_count
             
         except Exception as e:
             logger.debug(f"[MarketScanner] Error contando toques a EMA: {e}")
-            return 999  # Si hay error, ignoramos la señal
+            return 999
 
     def _describe_behavior(self, df: pd.DataFrame, daily_pct: float, timeframe: str) -> Dict[str, Any]:
         df = df.copy()
@@ -245,7 +237,6 @@ class MarketScanner:
         df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
         df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
 
-        # 🟢 NUEVO: Cálculo de ADX
         df["tr"] = np.maximum(
             df["high"] - df["low"],
             np.maximum(
@@ -266,7 +257,6 @@ class MarketScanner:
         current = df.iloc[-1]
         prior = df.iloc[-2]
 
-        # 🟢 NUEVO: Calcular toques a la EMA después del cruce
         ema_touch_count = self._count_touches_after_cross(df)
 
         def slope_label(series: pd.Series) -> str:
@@ -280,7 +270,7 @@ class MarketScanner:
             pct = abs(diff / max(price, 1e-6))
             if pct < 0.002:
                 return "TOUCHING"
-            if pct < 0.008:
+            if pct < 0.01:
                 return "NEAR"
             return "ABOVE" if diff > 0 else "BELOW"
 
@@ -390,8 +380,8 @@ class MarketScanner:
             "fib_zona": fib_zone(price),
             "entry_price": price,
             "adx_tendencia": adx_tendencia_label(float(current["adx"])),
-            "daily_pct_change": daily_pct,      # 🟢 NUEVO: Pasar el cambio diario
-            "ema_touch_count": ema_touch_count, # 🟢 NUEVO: Pasar el conteo de toques
+            "daily_pct_change": daily_pct,
+            "ema_touch_count": ema_touch_count,
         }
 
     def _evaluate_golden_rules(self, behavior: Dict[str, Any], macro_angle: str, timeframe: str) -> float:
@@ -399,56 +389,63 @@ class MarketScanner:
         bb_price = behavior.get("bb_precio", "MID")
         ema144_slope = behavior.get("ema144_slope", "FLAT")
         volumen = behavior.get("volumen", "LOW")
+        precio_vs_ema55 = behavior.get("precio_vs_ema55", "")
         precio_vs_ema144 = behavior.get("precio_vs_ema144", "")
-        adx_force = behavior.get("adx_tendencia", "RANGE")
-        daily_pct = behavior.get("daily_pct_change", 0.0)      # 🟢 NUEVO
-        ema_touch_count = behavior.get("ema_touch_count", 0)   # 🟢 NUEVO
+        precio_vs_ema233 = behavior.get("precio_vs_ema233", "")
+        daily_pct = behavior.get("daily_pct_change", 0.0)
+        ema_touch_count = behavior.get("ema_touch_count", 0)
         signal_type = behavior.get("signal_type", "UNKNOWN")
+        
+        ema55_vs_ema144 = behavior.get("ema55_vs_ema144", "")
+        ema144_vs_ema233 = behavior.get("ema144_vs_ema233", "")
 
-        # 🛑 FILTRO 1: Si el activo está extremadamente sobrecomprado (>30% en el día), no comprar.
+        # 🛑 FILTRO DURO 1: Sobrecompra/Sobreventa extrema
         if daily_pct > 0.30 and "LONG" in str(signal_type):
             return 0.0
         if daily_pct < -0.30 and "SHORT" in str(signal_type):
             return 0.0
 
-        # 🛑 FILTRO 2: Si el precio ha tocado la EMA 55 más de 4 veces después del último cruce, es una trampa.
+        # 🛑 FILTRO DURO 2: Si el precio ha tocado la EMA 55 más de 4 veces, es un mercado lateral.
         if ema_touch_count > 4:
-            # Penalizar fuertemente si está en la zona de compra/venta
-            if precio_vs_ema144 in ["ABOVE", "BELOW"]:
-                return 0.0
-            else:
-                # Si el precio está cerca de la EMA pero ya la tocó varias veces, seguir penalizando
-                score -= 30.0
+            return 0.0
 
-        # ⭐ REGLA DE ORO: CAZA DE ROMPIMIENTO REAL (Día 5)
-        if adx_force == "STRONG" and macro_angle == "BULLISH" and precio_vs_ema144 == "ABOVE":
-            if volumen in ["HIGH", "MEDIUM"]:
-                score += 30.0
+        # 🛑 FILTRO DURO 3: No comprar/vender en picos. Si el precio está lejos de la EMA55 (+/- 3%), descartar.
+        if precio_vs_ema55 == "ABOVE" and (float(behavior.get("entry_price", 0)) - float(behavior.get("precio_vs_ema55", 0)) > 0.03):
+            return 0.0
+        if precio_vs_ema55 == "BELOW" and (float(behavior.get("precio_vs_ema55", 0)) - float(behavior.get("entry_price", 0)) > 0.03):
+            return 0.0
 
-        # --- REGLA 1: COMPRA DE BAJO RIESGO (BANDA INFERIOR) ---
-        if macro_angle == "BULLISH":
-            if bb_price == "LOWER":
-                score += 25.0
+        # 🔥 REGLA DE ORO 1: COMPRA EN RETROCESO A EMA 144/233 (Tendencia Alcista confirmada)
+        # Condición: EMAs ordenadas al alza (55 > 144 > 233).
+        if ema55_vs_ema144 in ["ABOVE", "CROSSING_UP"] and ema144_vs_ema233 in ["ABOVE", "CROSSING_UP"]:
+            # Si el precio ha retrocedido hasta tocar la 144 o la 233, es una entrada quirúrgica.
+            if (precio_vs_ema144 in ["TOUCHING", "NEAR"] or precio_vs_ema233 in ["TOUCHING", "NEAR"]):
+                if volumen in ["HIGH", "MEDIUM"]:
+                    score += 50.0  # Puntuación máxima
+            # Si solo tocó la 55, es una entrada secundaria (tiene menos prioridad).
+            elif precio_vs_ema55 in ["TOUCHING", "NEAR"]:
+                if volumen in ["HIGH", "MEDIUM"]:
+                    score += 25.0
 
-        # --- REGLA 2: VENTA DE CONTINUACIÓN (BANDA SUPERIOR O MEDIA EN BAJISTA) ---
-        if macro_angle == "BEARISH":
-            if bb_price in ["UPPER", "MID_TO_UPPER"]:
-                score += 20.0
+        # 🔥 REGLA DE ORO 2: VENTA EN RETROCESO A EMA 144/233 (Tendencia Bajista confirmada)
+        # Condición: EMAs ordenadas a la baja (55 < 144 < 233).
+        if ema55_vs_ema144 in ["BELOW", "CROSSING_DOWN"] and ema144_vs_ema233 in ["BELOW", "CROSSING_DOWN"]:
+            # Si el precio ha subido hasta tocar la 144 o la 233 por arriba, es una entrada quirúrgica para Short.
+            if (precio_vs_ema144 in ["TOUCHING", "NEAR"] or precio_vs_ema233 in ["TOUCHING", "NEAR"]):
+                if volumen in ["HIGH", "MEDIUM"]:
+                    score += 50.0  # Puntuación máxima
+            # Si solo tocó la 55, es una entrada secundaria.
+            elif precio_vs_ema55 in ["TOUCHING", "NEAR"]:
+                if volumen in ["HIGH", "MEDIUM"]:
+                    score += 25.0
 
-        # --- REGLA 3: COMPRA EN M3 (ANCLAJE A EMA55) ---
-        if timeframe == "3m" and ema144_slope == "UP":
-            if behavior.get("precio_vs_ema55") in ["TOUCHING", "NEAR"]:
-                score += 25.0
+        # --- REGLA 3: BAJO RIESGO EN BANDA INFERIOR (Para Longs) ---
+        if macro_angle == "BULLISH" and bb_price == "LOWER":
+            score += 15.0
 
-        # --- REGLA 4: RECHAZO EN BANDA SUPERIOR (TRAMPA DE TECHO) ---
-        if bb_price == "UPPER":
-            candle = behavior.get("patron_vela", "NEUTRAL")
-            if candle in ["REJECTION", "STRONG_RED"]:
-                score += 15.0
-
-        # --- REGLA 5: ANCLAJE MACRO (Filtro de seguridad) ---
-        if bb_price == "MID" and macro_angle == "FLAT":
-            score -= 20.0
+        # --- REGLA 4: BAJO RIESGO EN BANDA SUPERIOR (Para Shorts) ---
+        if macro_angle == "BEARISH" and bb_price == "UPPER":
+            score += 15.0
 
         return max(0.0, score)
 
@@ -493,15 +490,8 @@ class MarketScanner:
             final_score = match_ratio + (golden_score / 100.0) * 0.5
             final_score = min(final_score, 1.0)
 
-            # 🚨 FILTRO ANTI-TRAMPAS
-            if "BREAKOUT" in signal_type:
-                if behavior.get("adx_tendencia") in ["WEAK", "RANGE"]:
-                    continue
-                if final_score < 0.40:
-                    continue
-            else:
-                if final_score < 0.40:
-                    continue
+            if final_score < 0.40:
+                continue
 
             matches.append({
                 "pattern": pattern,
