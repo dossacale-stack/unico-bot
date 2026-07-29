@@ -55,7 +55,9 @@ MATCH_FIELDS = [
     "volumen",
     "patron_vela",
     "fib_zona",
-    "adx_tendencia",  # 🟢 Indicador de fuerza de la ola
+    "adx_tendencia",
+    "daily_pct_change",      # 🟢 NUEVO: Cambio % 24h
+    "ema_touch_count",       # 🟢 NUEVO: Conteo de toques a la EMA
 ]
 
 
@@ -122,10 +124,25 @@ class MarketScanner:
         signals: List[Signal] = []
         now = time.time()
 
+        # 🟢 NUEVO: Obtener datos de cambio porcentual 24h de toda la watchlist en una sola llamada
+        ticker_map = {}
+        try:
+            # Usamos el método HTTP directamente o del manager para obtener tickers
+            session = self.api.exchange
+            response = session.get_tickers(category="linear")
+            tickers = response["result"]["list"]
+            for t in tickers:
+                ticker_map[t["symbol"]] = float(t.get("price24hPcnt", 0.0))
+        except Exception as e:
+            logger.debug(f"[MarketScanner] No se pudo obtener tickers 24h, usando 0.0: {e}")
+
         for symbol in self.watchlist:
             if symbol in self._signal_cooldown:
                 if now - self._signal_cooldown[symbol] < 300:
                     continue
+
+            # Obtener el cambio diario para este símbolo
+            daily_pct = ticker_map.get(symbol, 0.0)
 
             # 1. OBTENER TENDENCIA MACRO (1 HORA)
             macro_angle = "FLAT"
@@ -152,7 +169,8 @@ class MarketScanner:
                     if df is None or len(df) < 40:
                         continue
 
-                    behavior = self._describe_behavior(df)
+                    # Pasar el cambio diario y el marco temporal a la descripción
+                    behavior = self._describe_behavior(df, daily_pct, timeframe)
                     symbol_code = self._normalize_symbol(symbol)
                     
                     matches = self._match_patterns(symbol_code, behavior, timeframe, macro_angle)
@@ -179,7 +197,44 @@ class MarketScanner:
 
         return signals
 
-    def _describe_behavior(self, df: pd.DataFrame) -> Dict[str, Any]:
+    # 🟢 NUEVO: Cuenta los toques a la EMA 55 después del último cruce
+    def _count_touches_after_cross(self, df: pd.DataFrame, lookback: int = 50) -> int:
+        """
+        Cuenta cuántas veces el precio ha estado NEAR o TOUCHING la EMA55
+        después del último cruce alcista de la EMA55 sobre la EMA144.
+        Si el precio ya tocó la EMA más de 4 veces, es una señal de agotamiento.
+        """
+        try:
+            df = df.copy()
+            df['ema55'] = df['close'].ewm(span=55, adjust=False).mean()
+            df['ema144'] = df['close'].ewm(span=144, adjust=False).mean()
+            
+            # Detectar cruces alcistas en las últimas 50 velas
+            df['cross_bull'] = (df['ema55'] > df['ema144']) & (df['ema55'].shift(1) <= df['ema144'].shift(1))
+            cross_idx = df[df['cross_bull']].index
+            
+            if len(cross_idx) == 0:
+                return 0
+            
+            # Tomar el último cruce
+            last_cross_idx = cross_idx[-1]
+            df_after_cross = df.loc[last_cross_idx:]
+            
+            # Contar las veces que el precio estuvo cerca de la EMA55 (menos del 0.8% de distancia)
+            touch_count = 0
+            for idx, row in df_after_cross.iterrows():
+                diff = abs(float(row['close']) - float(row['ema55']))
+                pct = diff / float(row['close'])
+                if pct < 0.008: # Equivalente a NEAR o TOUCHING
+                    touch_count += 1
+            
+            return touch_count
+            
+        except Exception as e:
+            logger.debug(f"[MarketScanner] Error contando toques a EMA: {e}")
+            return 999  # Si hay error, ignoramos la señal
+
+    def _describe_behavior(self, df: pd.DataFrame, daily_pct: float, timeframe: str) -> Dict[str, Any]:
         df = df.copy()
         df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
         df["ema55"] = df["close"].ewm(span=55, adjust=False).mean()
@@ -190,7 +245,7 @@ class MarketScanner:
         df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
         df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
 
-        # 🟢 CÁLCULO DEL ADX (Umbral ajustado a 30)
+        # 🟢 NUEVO: Cálculo de ADX
         df["tr"] = np.maximum(
             df["high"] - df["low"],
             np.maximum(
@@ -210,6 +265,9 @@ class MarketScanner:
 
         current = df.iloc[-1]
         prior = df.iloc[-2]
+
+        # 🟢 NUEVO: Calcular toques a la EMA después del cruce
+        ema_touch_count = self._count_touches_after_cross(df)
 
         def slope_label(series: pd.Series) -> str:
             delta = series.iloc[-1] - series.iloc[-4]
@@ -300,7 +358,6 @@ class MarketScanner:
             return "NEUTRAL"
 
         def adx_tendencia_label(adx_val: float) -> str:
-            # 🟢 UMBRAL SUBIDO A 30 PARA SER MÁS ESTRICTO
             if adx_val > 30:
                 return "STRONG"
             elif adx_val > 20:
@@ -333,6 +390,8 @@ class MarketScanner:
             "fib_zona": fib_zone(price),
             "entry_price": price,
             "adx_tendencia": adx_tendencia_label(float(current["adx"])),
+            "daily_pct_change": daily_pct,      # 🟢 NUEVO: Pasar el cambio diario
+            "ema_touch_count": ema_touch_count, # 🟢 NUEVO: Pasar el conteo de toques
         }
 
     def _evaluate_golden_rules(self, behavior: Dict[str, Any], macro_angle: str, timeframe: str) -> float:
@@ -342,12 +401,29 @@ class MarketScanner:
         volumen = behavior.get("volumen", "LOW")
         precio_vs_ema144 = behavior.get("precio_vs_ema144", "")
         adx_force = behavior.get("adx_tendencia", "RANGE")
+        daily_pct = behavior.get("daily_pct_change", 0.0)      # 🟢 NUEVO
+        ema_touch_count = behavior.get("ema_touch_count", 0)   # 🟢 NUEVO
+        signal_type = behavior.get("signal_type", "UNKNOWN")
 
-        # ⭐ REGLA DE ORO: CAZA DE ROMPIMIENTO REAL
-        # Si el ADX es FUERTE (ahora >30), es un pico de continuación.
+        # 🛑 FILTRO 1: Si el activo está extremadamente sobrecomprado (>30% en el día), no comprar.
+        if daily_pct > 0.30 and "LONG" in str(signal_type):
+            return 0.0
+        if daily_pct < -0.30 and "SHORT" in str(signal_type):
+            return 0.0
+
+        # 🛑 FILTRO 2: Si el precio ha tocado la EMA 55 más de 4 veces después del último cruce, es una trampa.
+        if ema_touch_count > 4:
+            # Penalizar fuertemente si está en la zona de compra/venta
+            if precio_vs_ema144 in ["ABOVE", "BELOW"]:
+                return 0.0
+            else:
+                # Si el precio está cerca de la EMA pero ya la tocó varias veces, seguir penalizando
+                score -= 30.0
+
+        # ⭐ REGLA DE ORO: CAZA DE ROMPIMIENTO REAL (Día 5)
         if adx_force == "STRONG" and macro_angle == "BULLISH" and precio_vs_ema144 == "ABOVE":
             if volumen in ["HIGH", "MEDIUM"]:
-                score += 30.0  # Máxima prioridad para los picos que siguen subiendo
+                score += 30.0
 
         # --- REGLA 1: COMPRA DE BAJO RIESGO (BANDA INFERIOR) ---
         if macro_angle == "BULLISH":
@@ -417,12 +493,10 @@ class MarketScanner:
             final_score = match_ratio + (golden_score / 100.0) * 0.5
             final_score = min(final_score, 1.0)
 
-            # 🚨 FILTRO ANTI-TRAMPAS (ADX >= 30)
-            # Si el patrón es un Breakout, y el ADX es DÉBIL o RANGO, es una trampa.
+            # 🚨 FILTRO ANTI-TRAMPAS
             if "BREAKOUT" in signal_type:
                 if behavior.get("adx_tendencia") in ["WEAK", "RANGE"]:
-                    continue  # Descartado, es el Día 1
-                # Si pasó el filtro, exigimos que al menos tenga un 0.40 de match con la base de datos
+                    continue
                 if final_score < 0.40:
                     continue
             else:
