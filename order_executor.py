@@ -30,6 +30,39 @@ class OrderExecutor:
         logger.info("[OrderExecutor] Reconciliando posiciones (modo base).")
         await asyncio.sleep(0.01)
 
+    # ==========================================
+    # 🟢 NUEVO: Método para verificar existencia real de la posición en Bybit
+    # ==========================================
+    async def check_position_exists(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Verifica si la posición está realmente abierta en Bybit.
+        Retorna el dict de la posición si existe (size > 0), o None si no existe.
+        """
+        try:
+            # Usamos el método get_positions de tu BybitAPIManager
+            response = await self.api.get_positions(symbol=symbol)
+            
+            # Bybit a veces devuelve un diccionario con "list" dentro
+            if isinstance(response, dict) and "list" in response:
+                positions = response["list"]
+            elif isinstance(response, list):
+                positions = response
+            else:
+                positions = []
+
+            for pos in positions:
+                # Verificamos que el símbolo coincida y que el tamaño sea > 0
+                if pos.get("symbol") == symbol:
+                    size = float(pos.get("size", 0))
+                    if size > 0:
+                        return pos
+            
+            return None  # No se encontró posición activa
+
+        except Exception as e:
+            logger.error(f"[OrderExecutor] Error verificando posición {symbol}: {e}")
+            return None
+
     async def open_position(
         self,
         symbol: str,
@@ -125,6 +158,17 @@ class OrderExecutor:
             return {"id": f"DRY-CLOSE-{symbol}-{int(time.time())}"}
 
         try:
+            # 🟢 CORRECCIÓN 1: Antes de cerrar, verificar que la posición realmente existe en Bybit
+            position_exists = await self.check_position_exists(symbol)
+            if not position_exists:
+                logger.warning(
+                    f"[OrderExecutor] 🛡️ Posición {symbol} no existe en Bybit (ya cerrada). "
+                    f"Devolviendo 'GHOST' para forzar limpieza en RiskManager."
+                )
+                # Retornamos un diccionario especial para que main.py entienda que debe limpiarla
+                return {"id": "GHOST_POSITION", "symbol": symbol, "is_ghost": True}
+
+            # Si existe, procedemos a cerrar
             order = await self.api.place_order(
                 symbol=symbol,
                 side=side,
@@ -136,7 +180,17 @@ class OrderExecutor:
                 reduce_only=True,
             )
             return {"id": order.get("id", str(order.get("order_link_id", "")))}
+        
         except Exception as exc:
+            # 🟢 CORRECCIÓN 2: Manejo específico del error de posición fantasma
+            error_msg = str(exc)
+            if "110017" in error_msg or "current position is zero" in error_msg:
+                logger.warning(
+                    f"[OrderExecutor] ⚠️ Bybit rechazó orden (Error 110017) en {symbol}. "
+                    f"La posición es fantasma. Devolviendo 'GHOST' para limpieza."
+                )
+                return {"id": "GHOST_POSITION", "symbol": symbol, "is_ghost": True}
+
             logger.error(f"[OrderExecutor] Error cerrando posición: {exc}")
             return None
 
