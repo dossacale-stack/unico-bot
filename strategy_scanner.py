@@ -37,28 +37,7 @@ class Signal:
     entry_price: float
     df: Optional[pd.DataFrame] = None
     pattern_id: Optional[int] = None
-    timeframe: str = "15m"
-
-
-MATCH_FIELDS = [
-    "ema21_vs_ema55",
-    "ema55_vs_ema144",
-    "ema144_vs_ema233",
-    "ema21_slope",
-    "ema144_slope",
-    "precio_vs_ema21",
-    "precio_vs_ema55",
-    "precio_vs_ema144",
-    "precio_vs_ema233",
-    "bb_estado",
-    "bb_precio",
-    "volumen",
-    "patron_vela",
-    "fib_zona",
-    "adx_tendencia",
-    "daily_pct_change",
-    "ema_touch_count",
-]
+    timeframe: str = "3m"
 
 
 class MarketScanner:
@@ -82,7 +61,7 @@ class MarketScanner:
         self.position_pct = position_pct
         self.db_path = db_path
         self.signal_cooldown_seconds = signal_cooldown_seconds
-        self.timeframes = timeframes or ["15m", "3m"]
+        self.timeframes = ["15m", "3m"]
         self.patterns_by_tf = {}
         self._signal_cooldown = {}
         self._load_all_patterns()
@@ -141,48 +120,72 @@ class MarketScanner:
 
             daily_pct = ticker_map.get(symbol, 0.0)
 
-            macro_angle = "FLAT"
+            # 🟢 PASO 1: EL FILTRO DEL "CRUCE INMINENTE" EN M15
+            # Si el precio está muy lejos de la EMA55 en M15 (>5%), significa que el cruce ya pasó.
+            # El bot ignora ese activo porque llegaría tarde.
             try:
-                df_1h = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=100)
-                if df_1h is not None and len(df_1h) > 40:
-                    df_1h["ema144"] = df_1h["close"].ewm(span=144, adjust=False).mean()
-                    df_1h["ema233"] = df_1h["close"].ewm(span=233, adjust=False).mean()
-                    
-                    ema144_slope_1h = df_1h["ema144"].iloc[-1] - df_1h["ema144"].iloc[-5]
-                    ema233_slope_1h = df_1h["ema233"].iloc[-1] - df_1h["ema233"].iloc[-5]
-                    
-                    if ema144_slope_1h > 0 and ema233_slope_1h > 0:
-                        macro_angle = "BULLISH"
-                    elif ema144_slope_1h < 0 and ema233_slope_1h < 0:
-                        macro_angle = "BEARISH"
+                df_15m = await self.api.fetch_ohlcv(symbol, timeframe="15m", limit=50)
+                if df_15m is None or len(df_15m) < 40:
+                    continue
+                
+                df_15m["ema55"] = df_15m["close"].ewm(span=55, adjust=False).mean()
+                price_15m = df_15m["close"].iloc[-1]
+                ema55_15m = df_15m["ema55"].iloc[-1]
+                
+                # Calculamos la distancia porcentual del precio a la EMA55
+                distance_pct = abs(price_15m - ema55_15m) / price_15m
+                
+                # 🔥 SI LA DISTANCIA ES MAYOR AL 5%, LO DESCARTAMOS INMEDIATAMENTE
+                if distance_pct > 0.05:
+                    logger.debug(f"[MarketScanner] {symbol} descartado: distancia a EMA55 M15 es {distance_pct:.2%} (>5%). Cruce ya pasado.")
+                    continue
+                
+                # Si pasó el filtro, sabemos que el cruce es reciente y estamos en el punto de inflexión.
+                # Ahora definimos quién domina la subasta en M15
+                macro_angle = "FLAT"
+                df_15m["ema144"] = df_15m["close"].ewm(span=144, adjust=False).mean()
+                df_15m["ema233"] = df_15m["close"].ewm(span=233, adjust=False).mean()
+                
+                last_p = df_15m["close"].iloc[-1]
+                ema144_15m = df_15m["ema144"].iloc[-1]
+                ema233_15m = df_15m["ema233"].iloc[-1]
+
+                if last_p > ema55_15m and last_p > ema144_15m and last_p > ema233_15m:
+                    macro_angle = "BULLISH" # Subasta compradora
+                elif last_p < ema55_15m and last_p < ema144_15m and last_p < ema233_15m:
+                    macro_angle = "BEARISH" # Subasta vendedora
+                else:
+                    macro_angle = "FLAT"
+
             except Exception as exc:
-                logger.debug(f"[MarketScanner] No se pudo obtener macro 1h para {symbol}: {exc}")
+                logger.debug(f"[MarketScanner] Error en M15 para {symbol}: {exc}")
+                continue
 
-            for timeframe in self.timeframes:
-                try:
-                    df = await self.api.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
-                    if df is None or len(df) < 40:
-                        continue
+            # 🟢 PASO 2: ENTRADA QUIRÚRGICA EN M3
+            try:
+                df_3m = await self.api.fetch_ohlcv(symbol, timeframe="3m", limit=80)
+                if df_3m is None or len(df_3m) < 40:
+                    continue
 
-                    behavior = self._describe_behavior(df, daily_pct, timeframe)
-                    symbol_code = self._normalize_symbol(symbol)
-                    
-                    matches = self._match_patterns(symbol_code, behavior, timeframe, macro_angle)
+                behavior = self._describe_behavior_m3(df_3m, daily_pct, macro_angle)
+                symbol_code = self._normalize_symbol(symbol)
+                
+                matches = self._match_patterns(symbol_code, behavior, "3m", macro_angle)
 
-                    if not matches:
-                        continue
+                if not matches:
+                    continue
 
-                    best = max(matches, key=lambda item: (item["match_ratio"], item["pattern"].get("rb_real", 0.0)))
-                    signal = self._build_signal(symbol, df, behavior, best, timeframe)
+                best = max(matches, key=lambda item: (item["match_ratio"], item["pattern"].get("rb_real", 0.0)))
+                signal = self._build_signal(symbol, df_3m, behavior, best, "3m")
 
-                    if signal and signal.score >= self.min_score:
-                        if self._can_signal(symbol):
-                            self._signal_cooldown[symbol] = now
-                            signals.append(signal)
-                            logger.debug(f"[MarketScanner] Señal {signal.signal_type.value} {symbol} {timeframe} Score: {signal.score:.2f}")
+                if signal and signal.score >= self.min_score:
+                    if self._can_signal(symbol):
+                        self._signal_cooldown[symbol] = now
+                        signals.append(signal)
+                        logger.debug(f"[MarketScanner] Señal {signal.signal_type.value} {symbol} en M3 | Macro: {macro_angle}")
 
-                except Exception as exc:
-                    logger.debug(f"[MarketScanner] Error en {symbol} {timeframe}: {exc}")
+            except Exception as exc:
+                logger.debug(f"[MarketScanner] Error en {symbol} M3: {exc}")
 
         if not signals:
             logger.info("[MarketScanner] Ninguna señal encontrada en este ciclo.")
@@ -191,52 +194,18 @@ class MarketScanner:
 
         return signals
 
-    def _count_touches_after_cross(self, df: pd.DataFrame, lookback: int = 50) -> int:
-        """
-        Cuenta cuántas veces el precio ha estado NEAR o TOUCHING la EMA55
-        después del último cruce de la EMA55 sobre la EMA144.
-        (Funciona tanto para cruces alcistas como bajistas).
-        """
-        try:
-            df = df.copy()
-            df['ema55'] = df['close'].ewm(span=55, adjust=False).mean()
-            df['ema144'] = df['close'].ewm(span=144, adjust=False).mean()
-            
-            # Detectar cruces en las últimas 50 velas
-            df['cross'] = (df['ema55'] > df['ema144']) & (df['ema55'].shift(1) <= df['ema144'].shift(1))
-            df['cross'] = df['cross'] | ((df['ema55'] < df['ema144']) & (df['ema55'].shift(1) >= df['ema144'].shift(1)))
-            cross_idx = df[df['cross']].index
-            
-            if len(cross_idx) == 0:
-                return 0
-            
-            last_cross_idx = cross_idx[-1]
-            df_after_cross = df.loc[last_cross_idx:]
-            
-            touch_count = 0
-            for idx, row in df_after_cross.iterrows():
-                diff = abs(float(row['close']) - float(row['ema55']))
-                pct = diff / float(row['close'])
-                if pct < 0.01: # 1% de distancia para considerar "toque"
-                    touch_count += 1
-            
-            return touch_count
-            
-        except Exception as e:
-            logger.debug(f"[MarketScanner] Error contando toques a EMA: {e}")
-            return 999
-
-    def _describe_behavior(self, df: pd.DataFrame, daily_pct: float, timeframe: str) -> Dict[str, Any]:
+    def _describe_behavior_m3(self, df: pd.DataFrame, daily_pct: float, macro_angle: str) -> Dict[str, Any]:
         df = df.copy()
+        # 🟢 Cálculo de las EMAs en M3 para el cruce de entrada
         df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
         df["ema55"] = df["close"].ewm(span=55, adjust=False).mean()
         df["ema144"] = df["close"].ewm(span=144, adjust=False).mean()
-        df["ema233"] = df["close"].ewm(span=233, adjust=False).mean()
         df["bb_mid"] = df["close"].rolling(20).mean()
         df["bb_std"] = df["close"].rolling(20).std()
         df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
         df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
 
+        # 🟢 ADX (Fuerza del impulso en M3)
         df["tr"] = np.maximum(
             df["high"] - df["low"],
             np.maximum(
@@ -257,8 +226,6 @@ class MarketScanner:
         current = df.iloc[-1]
         prior = df.iloc[-2]
 
-        ema_touch_count = self._count_touches_after_cross(df)
-
         def slope_label(series: pd.Series) -> str:
             delta = series.iloc[-1] - series.iloc[-4]
             if abs(delta) / max(series.iloc[-1], 1e-6) < 0.002:
@@ -270,7 +237,7 @@ class MarketScanner:
             pct = abs(diff / max(price, 1e-6))
             if pct < 0.002:
                 return "TOUCHING"
-            if pct < 0.01:
+            if pct < 0.008:
                 return "NEAR"
             return "ABOVE" if diff > 0 else "BELOW"
 
@@ -283,27 +250,6 @@ class MarketScanner:
                 return "FLAT"
             return "ABOVE" if fast > slow else "BELOW"
 
-        def fib_zone(close: float) -> str:
-            window = df.iloc[-40:-5]
-            if len(window) < 10:
-                return "N/A"
-            swing_high = float(window["high"].max())
-            swing_low = float(window["low"].min())
-            if swing_high <= swing_low or close <= swing_low:
-                return "N/A"
-            ratio = (close - swing_low) / max(swing_high - swing_low, 1e-6)
-            if ratio < 0.382:
-                return "0.0_0.382"
-            if ratio < 0.5:
-                return "0.382_0.500"
-            if ratio < 0.618:
-                return "0.500_0.618"
-            if ratio < 0.786:
-                return "0.618_0.786"
-            if ratio <= 1.0:
-                return "0.786_1.000"
-            return "1.000_PLUS"
-
         def bb_price_label(close: float, mid: float, lower: float, upper: float) -> str:
             if close >= upper:
                 return "UPPER"
@@ -312,17 +258,6 @@ class MarketScanner:
             if close >= mid:
                 return "MID_TO_UPPER"
             return "LOWER"
-
-        def bb_state_label(mid: float, upper: float, lower: float, recent: pd.DataFrame) -> str:
-            width = (upper - lower) / max(mid, 1e-6)
-            previous_width = ((recent["bb_upper"] - recent["bb_lower"]) / recent["bb_mid"].replace(0, np.nan)).iloc[-5:-1].mean()
-            if width < 0.025:
-                return "MAX_SQUEEZE"
-            if width < 0.045:
-                return "SQUEEZE"
-            if width > 0.080:
-                return "EXPANDING"
-            return "CONTRACTING"
 
         def volume_label(volume: float, average: float) -> str:
             if volume >= average * 2.0:
@@ -348,7 +283,7 @@ class MarketScanner:
             return "NEUTRAL"
 
         def adx_tendencia_label(adx_val: float) -> str:
-            if adx_val > 30:
+            if adx_val > 25:
                 return "STRONG"
             elif adx_val > 20:
                 return "WEAK"
@@ -359,93 +294,69 @@ class MarketScanner:
         price = float(current["close"])
 
         return {
+            "precio_vs_ema21": position_label(price, float(current["ema21"])),
+            "precio_vs_ema55": position_label(price, float(current["ema55"])),
+            "precio_vs_ema144": position_label(price, float(current["ema144"])),
             "ema21_vs_ema55": ema_relation(float(current["ema21"]), float(current["ema55"]),
                                           float(prior["ema21"]), float(prior["ema55"])),
             "ema55_vs_ema144": ema_relation(float(current["ema55"]), float(current["ema144"]),
                                            float(prior["ema55"]), float(prior["ema144"])),
-            "ema144_vs_ema233": ema_relation(float(current["ema144"]), float(current["ema233"]),
-                                            float(prior["ema144"]), float(prior["ema233"])),
-            "ema21_slope": slope_label(df["ema21"]),
-            "ema144_slope": slope_label(df["ema144"]),
-            "precio_vs_ema21": position_label(price, float(current["ema21"])),
-            "precio_vs_ema55": position_label(price, float(current["ema55"])),
-            "precio_vs_ema144": position_label(price, float(current["ema144"])),
-            "precio_vs_ema233": position_label(price, float(current["ema233"])),
-            "bb_estado": bb_state_label(float(current["bb_mid"]), float(current["bb_upper"]),
-                                       float(current["bb_lower"]), df.iloc[-10:]),
             "bb_precio": bb_price_label(price, float(current["bb_mid"]),
                                        float(current["bb_lower"]), float(current["bb_upper"])),
             "volumen": volume_label(float(current["volume"]), volume_average),
             "patron_vela": candle_pattern(current),
-            "fib_zona": fib_zone(price),
             "entry_price": price,
             "adx_tendencia": adx_tendencia_label(float(current["adx"])),
             "daily_pct_change": daily_pct,
-            "ema_touch_count": ema_touch_count,
+            "macro_angle": macro_angle,
         }
 
     def _evaluate_golden_rules(self, behavior: Dict[str, Any], macro_angle: str, timeframe: str) -> float:
         score = 0.0
         bb_price = behavior.get("bb_precio", "MID")
-        ema144_slope = behavior.get("ema144_slope", "FLAT")
         volumen = behavior.get("volumen", "LOW")
-        precio_vs_ema55 = behavior.get("precio_vs_ema55", "")
-        precio_vs_ema144 = behavior.get("precio_vs_ema144", "")
-        precio_vs_ema233 = behavior.get("precio_vs_ema233", "")
+        adx_force = behavior.get("adx_tendencia", "RANGE")
         daily_pct = behavior.get("daily_pct_change", 0.0)
-        ema_touch_count = behavior.get("ema_touch_count", 0)
         signal_type = behavior.get("signal_type", "UNKNOWN")
         
+        precio_vs_ema55 = behavior.get("precio_vs_ema55", "")
+        precio_vs_ema144 = behavior.get("precio_vs_ema144", "")
         ema55_vs_ema144 = behavior.get("ema55_vs_ema144", "")
-        ema144_vs_ema233 = behavior.get("ema144_vs_ema233", "")
 
-        # 🛑 FILTRO DURO 1: Sobrecompra/Sobreventa extrema
-        if daily_pct > 0.30 and "LONG" in str(signal_type):
+        # 🛑 FILTRO DE DOMINIO DE LA SUBASTA (El Océano en M15)
+        # Si la subasta de 15m dice que los compradores dominan, pero la señal es SHORT, la descartamos.
+        if macro_angle == "BULLISH" and "SHORT" in str(signal_type):
             return 0.0
-        if daily_pct < -0.30 and "SHORT" in str(signal_type):
-            return 0.0
-
-        # 🛑 FILTRO DURO 2: Si el precio ha tocado la EMA 55 más de 4 veces, es un mercado lateral.
-        if ema_touch_count > 4:
+        if macro_angle == "BEARISH" and "LONG" in str(signal_type):
             return 0.0
 
-        # 🛑 FILTRO DURO 3: No comprar/vender en picos. Si el precio está lejos de la EMA55 (+/- 3%), descartar.
-        if precio_vs_ema55 == "ABOVE" and (float(behavior.get("entry_price", 0)) - float(behavior.get("precio_vs_ema55", 0)) > 0.03):
-            return 0.0
-        if precio_vs_ema55 == "BELOW" and (float(behavior.get("precio_vs_ema55", 0)) - float(behavior.get("entry_price", 0)) > 0.03):
+        # 🛑 FILTRO DURO: Si el ADX en M3 es débil, no es un movimiento real.
+        if adx_force in ["WEAK", "RANGE"]:
             return 0.0
 
-        # 🔥 REGLA DE ORO 1: COMPRA EN RETROCESO A EMA 144/233 (Tendencia Alcista confirmada)
-        # Condición: EMAs ordenadas al alza (55 > 144 > 233).
-        if ema55_vs_ema144 in ["ABOVE", "CROSSING_UP"] and ema144_vs_ema233 in ["ABOVE", "CROSSING_UP"]:
-            # Si el precio ha retrocedido hasta tocar la 144 o la 233, es una entrada quirúrgica.
-            if (precio_vs_ema144 in ["TOUCHING", "NEAR"] or precio_vs_ema233 in ["TOUCHING", "NEAR"]):
-                if volumen in ["HIGH", "MEDIUM"]:
-                    score += 50.0  # Puntuación máxima
-            # Si solo tocó la 55, es una entrada secundaria (tiene menos prioridad).
-            elif precio_vs_ema55 in ["TOUCHING", "NEAR"]:
-                if volumen in ["HIGH", "MEDIUM"]:
-                    score += 25.0
+        # 🛑 FILTRO DURO: No tocar si está muy sobrecomprado/sobrevendido en el día.
+        if daily_pct > 0.05 and "LONG" in str(signal_type):
+            return 0.0
+        if daily_pct < -0.05 and "SHORT" in str(signal_type):
+            return 0.0
 
-        # 🔥 REGLA DE ORO 2: VENTA EN RETROCESO A EMA 144/233 (Tendencia Bajista confirmada)
-        # Condición: EMAs ordenadas a la baja (55 < 144 < 233).
-        if ema55_vs_ema144 in ["BELOW", "CROSSING_DOWN"] and ema144_vs_ema233 in ["BELOW", "CROSSING_DOWN"]:
-            # Si el precio ha subido hasta tocar la 144 o la 233 por arriba, es una entrada quirúrgica para Short.
-            if (precio_vs_ema144 in ["TOUCHING", "NEAR"] or precio_vs_ema233 in ["TOUCHING", "NEAR"]):
-                if volumen in ["HIGH", "MEDIUM"]:
-                    score += 50.0  # Puntuación máxima
-            # Si solo tocó la 55, es una entrada secundaria.
-            elif precio_vs_ema55 in ["TOUCHING", "NEAR"]:
-                if volumen in ["HIGH", "MEDIUM"]:
-                    score += 25.0
+        # 🔥 REGLA 1: ENTRADA LARGA (Compra - Subasta dominada por compradores)
+        if "LONG" in str(signal_type):
+            # Cruce de 55 sobre 144 en M3
+            if ema55_vs_ema144 in ["CROSSING_UP", "ABOVE"]:
+                # Precio en Banda Inferior o tocando la 55 (El muelle)
+                if bb_price == "LOWER" or precio_vs_ema55 in ["TOUCHING", "NEAR"]:
+                    if volumen in ["HIGH", "MEDIUM"]:
+                        score += 50.0
 
-        # --- REGLA 3: BAJO RIESGO EN BANDA INFERIOR (Para Longs) ---
-        if macro_angle == "BULLISH" and bb_price == "LOWER":
-            score += 15.0
-
-        # --- REGLA 4: BAJO RIESGO EN BANDA SUPERIOR (Para Shorts) ---
-        if macro_angle == "BEARISH" and bb_price == "UPPER":
-            score += 15.0
+        # 🔥 REGLA 2: ENTRADA CORTA (Venta - Subasta dominada por vendedores)
+        elif "SHORT" in str(signal_type):
+            # Cruce de 55 bajo 144 en M3
+            if ema55_vs_ema144 in ["CROSSING_DOWN", "BELOW"]:
+                # Precio en Banda Superior o tocando la 55 (El muelle)
+                if bb_price == "UPPER" or precio_vs_ema55 in ["TOUCHING", "NEAR"]:
+                    if volumen in ["HIGH", "MEDIUM"]:
+                        score += 50.0
 
         return max(0.0, score)
 
@@ -470,7 +381,12 @@ class MarketScanner:
             score = 0
             total = 0
 
-            for key in MATCH_FIELDS:
+            match_fields = [
+                "precio_vs_ema21", "precio_vs_ema55", "precio_vs_ema144",
+                "ema21_vs_ema55", "ema55_vs_ema144", "bb_precio", "volumen", "patron_vela", "adx_tendencia"
+            ]
+
+            for key in match_fields:
                 expected = pattern.get(key)
                 actual = behavior.get(key)
                 if expected is None or expected == "N/A":
