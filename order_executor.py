@@ -62,6 +62,11 @@ class OrderExecutor:
         amount = float(position_size.contracts)
         lev = leverage or self.default_leverage
 
+        # 🟢 NUEVO FILTRO: NO OPERAR EN PARES QUE TERMINEN EN USDC
+        if symbol.upper().endswith("USDC"):
+            logger.info(f"[OrderExecutor] ⛔ Bloqueada apertura en {symbol} (par USDC). El scanner seguirá vigilándolo, pero no se operará.")
+            return None
+
         if self.mode == BotMode.DRY_RUN:
             order_id = f"DRY-{symbol}-{int(time.time())}"
             logger.info(
@@ -78,7 +83,6 @@ class OrderExecutor:
             }
 
         try:
-            # 🟢 CORRECCIÓN: Verificar que NO haya una posición abierta antes de entrar
             existing_pos = await self.check_position_exists(symbol)
             if existing_pos:
                 logger.warning(f"[OrderExecutor] 🛡️ Ya existe una posición abierta en {symbol}. Se omite la nueva entrada para evitar duplicados.")
@@ -218,4 +222,3 @@ class OrderExecutor:
             leverage=lev,
         )
         return open_result
-    
