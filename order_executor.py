@@ -78,58 +78,68 @@ class OrderExecutor:
             }
 
         try:
+            # 🟢 CORRECCIÓN: Verificar que NO haya una posición abierta antes de entrar
+            existing_pos = await self.check_position_exists(symbol)
+            if existing_pos:
+                logger.warning(f"[OrderExecutor] 🛡️ Ya existe una posición abierta en {symbol}. Se omite la nueva entrada para evitar duplicados.")
+                return None
+
             # 1. Ajustar apalancamiento
             await self.api.set_leverage(symbol, lev)
 
-            # 2. Validar SL y TP (Asegurar que no sean 0)
-            if stop_loss <= 0 or take_profit <= 0:
-                logger.error(f"[OrderExecutor] SL/TP inválidos: SL={stop_loss}, TP={take_profit}")
-                return None
-
-            # 3. Colocar orden (modo One-Way)
+            # 2. Colocar orden de MERCADO (SIN SL ni TP)
             order = await self.api.place_order(
                 symbol=symbol,
                 side=side,
                 order_type="market",
                 amount=amount,
                 price=None,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
+                stop_loss=None,
+                take_profit=None,
                 reduce_only=False,
             )
 
-            # 🔴 CORRECCIÓN: RECALCULAR SL/TP SI EL PRECIO CAMBIÓ EN LA EJECUCIÓN
-            # A veces el precio de mercado salta. Bybit ejecuta la orden a un precio distinto al planeado.
-            # Si el precio de ejecución es distinto, debemos ajustar el SL/TP dinámicamente.
-            executed_price = float(order.get("price", position_size.entry_price))
-            if abs(executed_price - position_size.entry_price) > (position_size.entry_price * 0.005):  # Si se movió más del 0.5%
-                logger.warning(f"[OrderExecutor] Precio ejecutado ({executed_price}) diferente al planeado ({position_size.entry_price}). Recalculando SL/TP...")
-                
-                # Recalcular SL y TP basados en el precio real de ejecución
-                risk_per_contract = abs(executed_price - stop_loss)  # Distancia original al SL
-                new_stop_loss = executed_price - risk_per_contract
-                new_take_profit = executed_price + (risk_per_contract * 5)  # 5x el riesgo
-                
-                # Enviar la corrección a Bybit
-                await self.api.place_order(
-                    symbol=symbol,
-                    side=side,
-                    order_type="limit",  # Usamos limit para modificar SL/TP de la posición existente
-                    amount=0,            # 0 porque solo modificamos los parámetros
-                    price=None,
-                    stop_loss=new_stop_loss,
-                    take_profit=new_take_profit,
-                    reduce_only=False,
-                )
-                logger.info(f"[OrderExecutor] SL/TP recalculados para {symbol}: Nuevo SL={new_stop_loss:.4f}, Nuevo TP={new_take_profit:.4f}")
+            if not order:
+                logger.error(f"[OrderExecutor] La orden de mercado falló en {symbol}")
+                return None
+
+            # 3. Obtener el precio de entrada real de la ejecución
+            await asyncio.sleep(0.5)
+            live_pos = await self.check_position_exists(symbol)
+            
+            if not live_pos:
+                logger.error(f"[OrderExecutor] No se pudo encontrar la posición recién abierta en {symbol}")
+                return order
+
+            executed_price = float(live_pos.get("avgPrice", position_size.entry_price))
+
+            # 4. Recalcular SL y TP en base al precio REAL de entrada
+            risk_distance = abs(executed_price - stop_loss)
+            new_sl = executed_price - risk_distance
+            new_tp = executed_price + (risk_distance * 5)
+
+            logger.info(f"[OrderExecutor] Precio ejecutado real: {executed_price:.4f}. Aplicando SL={new_sl:.4f}, TP={new_tp:.4f}")
+
+            # 5. Enviar la orden de SL y TP a la posición YA ABIERTA
+            await self.api.place_order(
+                symbol=symbol,
+                side=side,
+                order_type="limit",
+                amount=0,
+                price=None,
+                stop_loss=new_sl,
+                take_profit=new_tp,
+                reduce_only=False,
+            )
 
             return {
                 "id": order.get("id", str(order.get("order_link_id", ""))),
                 "symbol": symbol,
                 "side": side,
                 "amount": amount,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit,
+                "stop_loss": new_sl,
+                "take_profit": new_tp,
+                "entry_price": executed_price
             }
 
         except Exception as exc:
@@ -208,3 +218,4 @@ class OrderExecutor:
             leverage=lev,
         )
         return open_result
+    
