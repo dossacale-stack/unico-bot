@@ -15,6 +15,7 @@ from bybit_api_manager import BybitAPIManager
 from strategy_scanner import MarketScanner, Signal
 from order_executor import OrderExecutor
 from risk_manager import BotMode, CloseReason, RiskManager
+from trailing_stop import TrailingStopManager
 import seed_patterns
 
 # ─── CONFIGURACIÓN DE LOGGING ───
@@ -41,7 +42,7 @@ CONFIG: Dict[str, Any] = {
     
     "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "1")),
     "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.30")),
-    "SL_PCT": float(os.getenv("SL_PCT", "0.60")),
+    "SL_PCT": float(os.getenv("SL_PCT", "0.40")),  # 🔥 Stop Loss al 40% (0.40)
     "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
     "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
     "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "15")),
@@ -53,9 +54,13 @@ CONFIG: Dict[str, Any] = {
     "CAPITAL_FILE": os.getenv("CAPITAL_FILE", "capital_inicial.json"),
     
     "WATCHLIST": [],
+
+    # 🟢 Trailing Stop
+    "TRAILING_ACTIVATED": os.getenv("TRAILING_ACTIVATED", "true").lower() == "true",
+    "TRAILING_CALLBACK_PCT": float(os.getenv("TRAILING_CALLBACK_PCT", "0.005")),
 }
 
-# 🛡️ LISTA DE RESPALDO (Por si la API de Bybit falla totalmente)
+# 🛡️ LISTA DE RESPALDO
 FALLBACK_WATCHLIST = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", 
     "ADAUSDT", "LINKUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT"
@@ -83,7 +88,7 @@ class UnicoBot:
             db_path=config["DB_PATH"],
             max_positions=config["MAX_POSITIONS"],
             position_pct=config.get("POSITION_PCT", 0.30),
-            sl_pct=config.get("SL_PCT", 0.60),
+            sl_pct=config.get("SL_PCT", 0.40),  # 🔥 RiskManager usa 40%
             tp_multiple=config.get("TP_MULTIPLE", 5.0),
             leverage=config.get("LEVERAGE", 10),
             cooldown_minutes=config.get("COOLDOWN_MINUTES", 15),
@@ -103,6 +108,11 @@ class UnicoBot:
         )
         
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
+        self.trailing_stop = TrailingStopManager(
+            api_manager=self.api,
+            callback_pct=config.get("TRAILING_CALLBACK_PCT", 0.005),
+            is_active=config.get("TRAILING_ACTIVATED", True)
+        )
         
         self.running = False
         self.stats = {
@@ -118,32 +128,26 @@ class UnicoBot:
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
     async def generate_dynamic_watchlist(self) -> List[str]:
-        """Escanea Bybit en 3 plazos (24h, 1h, 15m) y devuelve una lista dinámica."""
         try:
             session = HTTP(testnet=False)
             response = session.get_tickers(category="linear")
             tickers = response["result"]["list"]
-            
             sorted_24h = sorted(tickers, key=lambda x: float(x.get("price24hPcnt", 0)), reverse=True)
             top_24h = [t["symbol"] for t in sorted_24h[:15]]
-            
             sorted_1h = sorted(tickers, key=lambda x: float(x.get("price1hPcnt", 0)), reverse=True)
             top_1h = [t["symbol"] for t in sorted_1h[:15]]
-            
             final_watchlist = list(set(top_24h + top_1h))
-            
             if not final_watchlist:
                 logger.warning("⚠️ Bybit devolvió lista vacía. Usando lista de respaldo.")
                 return FALLBACK_WATCHLIST
-
             logger.info(f"🔍 Lista dinámica generada: {len(final_watchlist)} activos")
             return final_watchlist
-            
         except Exception as e:
             logger.error(f"❌ Error generando lista dinámica con pybit: {e}. Usando lista de respaldo.")
             return FALLBACK_WATCHLIST
 
     async def initialize(self) -> None:
+        # 🔴 CORRECCIÓN DEL BANNER (Textos actualizados al 40%)
         logger.info(
             "\n" + "=" * 60 + "\n"
             + " 🚀 ÚNICO STRATEGY v5.0 — M15 + M3 (REGLAS DE ORO)\n"
@@ -152,16 +156,16 @@ class UnicoBot:
             + f" Scanner: {'ON' if self.config['SCANNER_ENABLED'] else 'PAUSE'}\n"
             + f" Máximo posiciones: {self.config['MAX_POSITIONS']}\n"
             + f" Posición: {self.config['POSITION_PCT']*100:.0f}% capital\n"
-            + f" SL: {self.config['SL_PCT']*100:.0f}% de posición\n"
+            + f" SL: {self.config['SL_PCT']*100:.0f}% de posición\n"  # <--- Ya no dirá 6%, dirá 40%
             + f" TP: {self.config['TP_MULTIPLE']}x riesgo\n"
             + f" Cooldown: {self.config['COOLDOWN_MINUTES']}min\n"
+            + f" Trailing Stop: {'ON' if self.config['TRAILING_ACTIVATED'] else 'OFF'}\n"
             + "=" * 60
         )
         
         self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
         self.scanner.watchlist = self.config["WATCHLIST"]
 
-        # ✅ CORRECCIÓN DE BALANCE EN VIVO (SOLUCIÓN A LOS 10.42 USDT)
         if self.mode == BotMode.DRY_RUN:
             logger.info("🔬 Modo DRY_RUN - Simulando balance de $10,000 USDT")
             self.rm.set_initial_balance(10000.0)
@@ -211,7 +215,6 @@ class UnicoBot:
             if signals:
                 logger.info(f"🔍 Se encontraron {len(signals)} señales válidas después del filtro.")
                 for s in signals:
-                    # 🟢 CORRECCIÓN AQUÍ: Cambié 'price' por 'entry_price'
                     logger.info(f"   🔸 {s.symbol} | TF: {s.timeframe} | Score: {s.score:.2f} | Precio: {s.entry_price}")
                 
                 signals.sort(key=lambda s: s.score, reverse=True)
@@ -222,6 +225,11 @@ class UnicoBot:
                     await self._process_signal(signal)
         else:
             logger.debug("⏸️ Scanner en pausa o máximo de posiciones alcanzado.")
+
+        # 🟢 Trailing Stop en vivo
+        if self.rm.positions and self.config["TRAILING_ACTIVATED"]:
+            for symbol, pos in self.rm.positions.items():
+                await self.trailing_stop.manage(symbol, pos.side)
 
         if self.rm.positions:
             dfs = {}
@@ -242,7 +250,6 @@ class UnicoBot:
                     
                 close_side = "sell" if pos.side == "LONG" else "buy"
                 
-                # 🛡️ VERIFICACIÓN DE POSICIÓN FANTASMA
                 live_pos = await self.executor.check_position_exists(symbol)
                 
                 if not live_pos:
