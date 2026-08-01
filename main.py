@@ -6,7 +6,7 @@ import signal
 import sqlite3
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 # ✅ IMPORTACIÓN DE LA LIBRERÍA OFICIAL DE BYBIT
 from pybit.unified_trading import HTTP
@@ -15,7 +15,6 @@ from bybit_api_manager import BybitAPIManager
 from strategy_scanner import MarketScanner, Signal
 from order_executor import OrderExecutor
 from risk_manager import BotMode, CloseReason, RiskManager
-from trailing_stop import TrailingStopManager
 import seed_patterns
 
 # ─── CONFIGURACIÓN DE LOGGING ───
@@ -42,7 +41,7 @@ CONFIG: Dict[str, Any] = {
     
     "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "1")),
     "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.30")),
-    "SL_PCT": float(os.getenv("SL_PCT", "0.40")),  # 🔥 Stop Loss al 40% (0.40)
+    "SL_PCT": float(os.getenv("SL_PCT", "0.40")),  # 🔥 Stop Loss al 40%
     "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
     "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
     "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "15")),
@@ -66,6 +65,80 @@ FALLBACK_WATCHLIST = [
     "ADAUSDT", "LINKUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT"
 ]
 
+# =========================================================
+# 🟢 CLASE DE TRAILING STOP INTEGRADA AQUÍ (Ya no necesita importación externa)
+# =========================================================
+class TrailingStopManager:
+    def __init__(
+        self,
+        api_manager: BybitAPIManager,
+        callback_pct: float = 0.005,  # 0.5% de retroceso
+        is_active: bool = True
+    ):
+        self.api = api_manager
+        self.callback_pct = callback_pct
+        self.is_active = is_active
+        self._tracked_positions = {}  # Guarda el mejor precio alcanzado
+
+    async def manage(self, symbol: str, side: str) -> None:
+        if not self.is_active:
+            return
+        try:
+            response = await self.api.get_positions(symbol=symbol)
+            if isinstance(response, dict) and "list" in response:
+                positions = response["list"]
+            elif isinstance(response, list):
+                positions = response
+            else:
+                return
+
+            if not positions:
+                return
+
+            pos = positions[0]
+            size = float(pos.get("size", 0))
+            if size == 0:
+                return
+
+            current_price = float(pos.get("markPrice", 0))
+            current_sl = float(pos.get("stopLoss", 0))
+            entry_price = float(pos.get("avgPrice", 0))
+
+            if side == "LONG":
+                best_price = self._tracked_positions.get(symbol, entry_price)
+                if current_price > best_price:
+                    best_price = current_price
+                    self._tracked_positions[symbol] = best_price
+                new_sl = best_price - (best_price * self.callback_pct)
+                if new_sl > current_sl and new_sl > entry_price:
+                    logger.info(f"[TrailingStop] Actualizando SL LONG {symbol}: {current_sl:.4f} -> {new_sl:.4f}")
+                    await self.api.place_order(
+                        symbol=symbol, side="buy", order_type="limit", amount=0,
+                        price=None, stop_loss=new_sl, take_profit=None, reduce_only=False,
+                    )
+            elif side == "SHORT":
+                best_price = self._tracked_positions.get(symbol, entry_price)
+                if current_price < best_price:
+                    best_price = current_price
+                    self._tracked_positions[symbol] = best_price
+                new_sl = best_price + (best_price * self.callback_pct)
+                if new_sl < current_sl and new_sl < entry_price:
+                    logger.info(f"[TrailingStop] Actualizando SL SHORT {symbol}: {current_sl:.4f} -> {new_sl:.4f}")
+                    await self.api.place_order(
+                        symbol=symbol, side="sell", order_type="limit", amount=0,
+                        price=None, stop_loss=new_sl, take_profit=None, reduce_only=False,
+                    )
+        except Exception as e:
+            logger.error(f"[TrailingStop] Error gestionando trailing para {symbol}: {e}")
+
+    def reset(self, symbol: str) -> None:
+        if symbol in self._tracked_positions:
+            del self._tracked_positions[symbol]
+# =========================================================
+# FIN DE LA CLASE TRAILING STOP
+# =========================================================
+
+
 class UnicoBot:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -88,7 +161,7 @@ class UnicoBot:
             db_path=config["DB_PATH"],
             max_positions=config["MAX_POSITIONS"],
             position_pct=config.get("POSITION_PCT", 0.30),
-            sl_pct=config.get("SL_PCT", 0.40),  # 🔥 RiskManager usa 40%
+            sl_pct=config.get("SL_PCT", 0.40),
             tp_multiple=config.get("TP_MULTIPLE", 5.0),
             leverage=config.get("LEVERAGE", 10),
             cooldown_minutes=config.get("COOLDOWN_MINUTES", 15),
@@ -108,6 +181,8 @@ class UnicoBot:
         )
         
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
+        
+        # 🟢 Inicializar el Trailing Stop ya integrado en este archivo
         self.trailing_stop = TrailingStopManager(
             api_manager=self.api,
             callback_pct=config.get("TRAILING_CALLBACK_PCT", 0.005),
@@ -147,7 +222,6 @@ class UnicoBot:
             return FALLBACK_WATCHLIST
 
     async def initialize(self) -> None:
-        # 🔴 CORRECCIÓN DEL BANNER (Textos actualizados al 40%)
         logger.info(
             "\n" + "=" * 60 + "\n"
             + " 🚀 ÚNICO STRATEGY v5.0 — M15 + M3 (REGLAS DE ORO)\n"
@@ -156,7 +230,7 @@ class UnicoBot:
             + f" Scanner: {'ON' if self.config['SCANNER_ENABLED'] else 'PAUSE'}\n"
             + f" Máximo posiciones: {self.config['MAX_POSITIONS']}\n"
             + f" Posición: {self.config['POSITION_PCT']*100:.0f}% capital\n"
-            + f" SL: {self.config['SL_PCT']*100:.0f}% de posición\n"  # <--- Ya no dirá 6%, dirá 40%
+            + f" SL: {self.config['SL_PCT']*100:.0f}% de posición\n"
             + f" TP: {self.config['TP_MULTIPLE']}x riesgo\n"
             + f" Cooldown: {self.config['COOLDOWN_MINUTES']}min\n"
             + f" Trailing Stop: {'ON' if self.config['TRAILING_ACTIVATED'] else 'OFF'}\n"
@@ -226,7 +300,7 @@ class UnicoBot:
         else:
             logger.debug("⏸️ Scanner en pausa o máximo de posiciones alcanzado.")
 
-        # 🟢 Trailing Stop en vivo
+        # 🟢 Trailing Stop en vivo (integrado)
         if self.rm.positions and self.config["TRAILING_ACTIVATED"]:
             for symbol, pos in self.rm.positions.items():
                 await self.trailing_stop.manage(symbol, pos.side)
