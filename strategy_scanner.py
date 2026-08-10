@@ -66,6 +66,10 @@ class MarketScanner:
         self._signal_cooldown = {}
         self._load_all_patterns()
 
+        # 🟢 NUEVO: Caché de contexto histórico para no sobrecargar la API
+        self._historical_cache = {} 
+        self._historical_cache_time = {}
+
     def _normalize_symbol(self, symbol: str) -> str:
         return re.sub(r"[^\w]", "", symbol).upper()
 
@@ -99,6 +103,64 @@ class MarketScanner:
                 return False
         return True
 
+    # 🟢 NUEVO: Obtener el contexto histórico con caché
+    async def _get_historical_context(self, symbol: str) -> Dict[str, Any]:
+        now = time.time()
+        # Si ya tenemos datos y no ha pasado más de 1 hora, usamos la caché
+        if symbol in self._historical_cache and (now - self._historical_cache_time.get(symbol, 0)) < 3600:
+            return self._historical_cache[symbol]
+
+        context = {
+            "day_high": 0.0, "day_low": 0.0,
+            "week_high": 0.0, "week_low": 0.0,
+            "month_high": 0.0, "month_low": 0.0,
+            "ath": 0.0, "atl": 0.0,
+            "position": "MID_RANGE"
+        }
+
+        try:
+            # 1. Rango Diario (24h)
+            ticker = await self.api._safe_call(
+                lambda: self.api.exchange.fetch_ticker(symbol),
+                endpoint_type="public"
+            )
+            context["day_high"] = ticker.get("high", 0.0)
+            context["day_low"] = ticker.get("low", 0.0)
+
+            # 2. Rango Semanal (últimas 168 velas de 1h)
+            df_week = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=168)
+            if df_week is not None and not df_week.empty:
+                context["week_high"] = df_week["high"].max()
+                context["week_low"] = df_week["low"].min()
+
+            # 3. Rango Mensual e Histórico (720 velas de 1h ≈ 30 días)
+            df_hist = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=720)
+            if df_hist is not None and not df_hist.empty:
+                context["month_high"] = df_hist["high"].max()
+                context["month_low"] = df_hist["low"].min()
+                context["ath"] = df_hist["high"].max()
+                context["atl"] = df_hist["low"].min()
+
+            # 4. Clasificar la posición
+            if context["ath"] > 0:
+                if ticker["last"] >= (context["ath"] * 0.95):
+                    context["position"] = "ATH_ZONE"
+                elif ticker["last"] <= (context["atl"] * 1.05):
+                    context["position"] = "ATL_ZONE"
+                elif ticker["last"] >= (context["month_high"] * 0.95):
+                    context["position"] = "MONTH_HIGH"
+                elif ticker["last"] <= (context["month_low"] * 1.05):
+                    context["position"] = "MONTH_LOW"
+
+            # Guardar en caché
+            self._historical_cache[symbol] = context
+            self._historical_cache_time[symbol] = now
+
+        except Exception as e:
+            logger.debug(f"[MarketScanner] Error obteniendo contexto histórico para {symbol}: {e}")
+
+        return context
+
     async def scan_all(self) -> List[Signal]:
         signals: List[Signal] = []
         now = time.time()
@@ -120,48 +182,41 @@ class MarketScanner:
 
             daily_pct = ticker_map.get(symbol, 0.0)
 
-            # 🟢 PASO 1: EL FILTRO DEL "CRUCE INMINENTE" EN M15
-            # Si el precio está muy lejos de la EMA55 en M15 (>5%), significa que el cruce ya pasó.
-            # El bot ignora ese activo porque llegaría tarde.
+            # 🟢 PASO 1: OBTENER CONTEXTO HISTÓRICO (y guardarlo en caché si no lo tenemos)
+            historical_context = await self._get_historical_context(symbol)
+
+            # 1. VERIFICAR SI ESTÁ CERCA DE LAS MEDIAS EN M15 (Filtro de vigilancia)
             try:
                 df_15m = await self.api.fetch_ohlcv(symbol, timeframe="15m", limit=50)
                 if df_15m is None or len(df_15m) < 40:
                     continue
                 
                 df_15m["ema55"] = df_15m["close"].ewm(span=55, adjust=False).mean()
-                price_15m = df_15m["close"].iloc[-1]
-                ema55_15m = df_15m["ema55"].iloc[-1]
-                
-                # Calculamos la distancia porcentual del precio a la EMA55
-                distance_pct = abs(price_15m - ema55_15m) / price_15m
-                
-                # 🔥 SI LA DISTANCIA ES MAYOR AL 5%, LO DESCARTAMOS INMEDIATAMENTE
-                if distance_pct > 0.05:
-                    logger.debug(f"[MarketScanner] {symbol} descartado: distancia a EMA55 M15 es {distance_pct:.2%} (>5%). Cruce ya pasado.")
-                    continue
-                
-                # Si pasó el filtro, sabemos que el cruce es reciente y estamos en el punto de inflexión.
-                # Ahora definimos quién domina la subasta en M15
-                macro_angle = "FLAT"
                 df_15m["ema144"] = df_15m["close"].ewm(span=144, adjust=False).mean()
                 df_15m["ema233"] = df_15m["close"].ewm(span=233, adjust=False).mean()
                 
-                last_p = df_15m["close"].iloc[-1]
+                price_15m = df_15m["close"].iloc[-1]
+                ema55_15m = df_15m["ema55"].iloc[-1]
                 ema144_15m = df_15m["ema144"].iloc[-1]
                 ema233_15m = df_15m["ema233"].iloc[-1]
+                
+                distance_pct = abs(price_15m - ema55_15m) / price_15m
+                
+                # Si la distancia es mayor al 5%, el cruce está lejos. Pasamos al M3 normal.
+                if distance_pct > 0.05:
+                    continue
 
-                if last_p > ema55_15m and last_p > ema144_15m and last_p > ema233_15m:
-                    macro_angle = "BULLISH" # Subasta compradora
-                elif last_p < ema55_15m and last_p < ema144_15m and last_p < ema233_15m:
-                    macro_angle = "BEARISH" # Subasta vendedora
-                else:
-                    macro_angle = "FLAT"
+                macro_angle = "FLAT"
+                if price_15m > ema55_15m and price_15m > ema144_15m and price_15m > ema233_15m:
+                    macro_angle = "BULLISH"
+                elif price_15m < ema55_15m and price_15m < ema144_15m and price_15m < ema233_15m:
+                    macro_angle = "BEARISH"
 
             except Exception as exc:
                 logger.debug(f"[MarketScanner] Error en M15 para {symbol}: {exc}")
                 continue
 
-            # 🟢 PASO 2: ENTRADA QUIRÚRGICA EN M3
+            # 2. ANÁLISIS DE PRECISIÓN EN M3
             try:
                 df_3m = await self.api.fetch_ohlcv(symbol, timeframe="3m", limit=80)
                 if df_3m is None or len(df_3m) < 40:
@@ -176,13 +231,36 @@ class MarketScanner:
                     continue
 
                 best = max(matches, key=lambda item: (item["match_ratio"], item["pattern"].get("rb_real", 0.0)))
-                signal = self._build_signal(symbol, df_3m, behavior, best, "3m")
+                signal_type_str = best["pattern"]["signal_type"]
+                
+                try:
+                    signal_type = SignalType(signal_type_str)
+                except ValueError:
+                    logger.warning(f"[MarketScanner] Tipo inválido '{signal_type_str}' para {symbol}")
+                    continue
 
-                if signal and signal.score >= self.min_score:
+                # 🟢 PASO 3: FILTRO DE CONTEXTO HISTÓRICO
+                # Si el precio está en una zona peligrosa, ajustamos el puntaje.
+                position = historical_context.get("position", "MID_RANGE")
+                score = best["match_ratio"]
+
+                if position in ["ATH_ZONE", "MONTH_HIGH"] and signal_type.is_long():
+                    logger.debug(f"[MarketScanner] ⚠️ {symbol} en zona de máximo ({position}). Bajando score de LONG.")
+                    score = score * 0.3  # Reducimos drásticamente el puntaje para que no sea elegida
+                elif position in ["ATL_ZONE", "MONTH_LOW"] and not signal_type.is_long():
+                    logger.debug(f"[MarketScanner] ⚠️ {symbol} en zona de mínimo ({position}). Bajando score de SHORT.")
+                    score = score * 0.3
+
+                if score < self.min_score:
+                    continue
+
+                signal = self._build_signal(symbol, df_3m, behavior, best, "3m", score)
+
+                if signal:
                     if self._can_signal(symbol):
                         self._signal_cooldown[symbol] = now
                         signals.append(signal)
-                        logger.debug(f"[MarketScanner] Señal {signal.signal_type.value} {symbol} en M3 | Macro: {macro_angle}")
+                        logger.debug(f"[MarketScanner] Señal {signal.signal_type.value} {symbol} en M3 | Macro: {macro_angle} | Context: {position}")
 
             except Exception as exc:
                 logger.debug(f"[MarketScanner] Error en {symbol} M3: {exc}")
@@ -196,7 +274,6 @@ class MarketScanner:
 
     def _describe_behavior_m3(self, df: pd.DataFrame, daily_pct: float, macro_angle: str) -> Dict[str, Any]:
         df = df.copy()
-        # 🟢 Cálculo de las EMAs en M3 para el cruce de entrada
         df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
         df["ema55"] = df["close"].ewm(span=55, adjust=False).mean()
         df["ema144"] = df["close"].ewm(span=144, adjust=False).mean()
@@ -205,7 +282,6 @@ class MarketScanner:
         df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
         df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
 
-        # 🟢 ADX (Fuerza del impulso en M3)
         df["tr"] = np.maximum(
             df["high"] - df["low"],
             np.maximum(
@@ -323,37 +399,27 @@ class MarketScanner:
         precio_vs_ema144 = behavior.get("precio_vs_ema144", "")
         ema55_vs_ema144 = behavior.get("ema55_vs_ema144", "")
 
-        # 🛑 FILTRO DE DOMINIO DE LA SUBASTA (El Océano en M15)
-        # Si la subasta de 15m dice que los compradores dominan, pero la señal es SHORT, la descartamos.
         if macro_angle == "BULLISH" and "SHORT" in str(signal_type):
             return 0.0
         if macro_angle == "BEARISH" and "LONG" in str(signal_type):
             return 0.0
 
-        # 🛑 FILTRO DURO: Si el ADX en M3 es débil, no es un movimiento real.
         if adx_force in ["WEAK", "RANGE"]:
             return 0.0
 
-        # 🛑 FILTRO DURO: No tocar si está muy sobrecomprado/sobrevendido en el día.
         if daily_pct > 0.05 and "LONG" in str(signal_type):
             return 0.0
         if daily_pct < -0.05 and "SHORT" in str(signal_type):
             return 0.0
 
-        # 🔥 REGLA 1: ENTRADA LARGA (Compra - Subasta dominada por compradores)
         if "LONG" in str(signal_type):
-            # Cruce de 55 sobre 144 en M3
             if ema55_vs_ema144 in ["CROSSING_UP", "ABOVE"]:
-                # Precio en Banda Inferior o tocando la 55 (El muelle)
                 if bb_price == "LOWER" or precio_vs_ema55 in ["TOUCHING", "NEAR"]:
                     if volumen in ["HIGH", "MEDIUM"]:
                         score += 50.0
 
-        # 🔥 REGLA 2: ENTRADA CORTA (Venta - Subasta dominada por vendedores)
         elif "SHORT" in str(signal_type):
-            # Cruce de 55 bajo 144 en M3
             if ema55_vs_ema144 in ["CROSSING_DOWN", "BELOW"]:
-                # Precio en Banda Superior o tocando la 55 (El muelle)
                 if bb_price == "UPPER" or precio_vs_ema55 in ["TOUCHING", "NEAR"]:
                     if volumen in ["HIGH", "MEDIUM"]:
                         score += 50.0
@@ -425,31 +491,6 @@ class MarketScanner:
         behavior: Dict[str, Any],
         matched: Dict[str, Any],
         timeframe: str,
+        score: float
     ) -> Optional[Signal]:
-        pattern = matched["pattern"]
-        signal_type_str = pattern["signal_type"]
-
-        if signal_type_str == "NO_SIGNAL":
-            return None
-
-        try:
-            signal_type = SignalType(signal_type_str)
-        except ValueError:
-            logger.warning(f"[MarketScanner] Tipo inválido '{signal_type_str}' para {symbol}")
-            return None
-
-        entry_price = float(behavior["entry_price"])
-        score = float(matched["match_ratio"])
-
-        return Signal(
-            symbol=symbol,
-            signal_type=signal_type,
-            score=score,
-            risk_reward=0.0,
-            stop_loss=0.0,
-            take_profit=0.0,
-            entry_price=entry_price,
-            df=df,
-            pattern_id=pattern.get("id"),
-            timeframe=timeframe,
-        )
+        pattern 
