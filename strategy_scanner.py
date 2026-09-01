@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 import time
+import asyncio  # ✅ CORRECCIÓN: Añadido para poder usar asyncio.run()
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
@@ -167,7 +168,11 @@ class StrategyScanner:
         #  INICIALIZACIÓN
         # ═══════════════════════════════════════════════════════
         self._load_all_patterns()
-        self._aprender_watchlist()
+        # ✅ CORRECCIÓN: Se añadió asyncio.run() para ejecutar la corrutina correctamente
+        try:
+            asyncio.run(self._aprender_watchlist())
+        except RuntimeError:
+            pass # Evita errores si ya hay un loop corriendo
         
         logger.info(f"📡 STRATEGY SCANNER WASHI RADAR UNIFICADO")
         logger.info(f"   Watchlist: {len(self.watchlist)} activos")
