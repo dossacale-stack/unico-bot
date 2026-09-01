@@ -167,7 +167,6 @@ class StrategyScanner:
         #  INICIALIZACIÓN
         # ═══════════════════════════════════════════════════════
         self._load_all_patterns()
-        # ✅ CORRECCIÓN: Eliminado asyncio.run() para evitar el RuntimeWarning.
         
         logger.info(f"📡 STRATEGY SCANNER WASHI RADAR UNIFICADO")
         logger.info(f"   Watchlist: {len(self.watchlist)} activos")
@@ -210,9 +209,8 @@ class StrategyScanner:
         except Exception as exc:
             logger.warning(f"[StrategyScanner] Error cargando patrones: {exc}. Usando seed_patterns.")
             for tf in self.timeframes:
-                    self.patterns_by_tf[tf] = [p.copy() for p in seed_patterns.PATTERNS if p.get("timeframe") == tf]
-
-async def _aprender_watchlist(self):
+                self.patterns_by_tf[tf] = [p.copy() for p in seed_patterns.PATTERNS if p.get("timeframe") == tf]async def _aprender_watchlist(self):
+    """Aprende de todos los símbolos en la watchlist"""
     logger.info("🧠 WASHI aprendiendo de la watchlist...")
     
     for symbol in self.watchlist:
@@ -363,6 +361,211 @@ async def _get_historical_context(self, symbol: str) -> Dict[str, Any]:
         logger.debug(f"[StrategyScanner] Error en contexto histórico para {symbol}: {e}")
 
     return context# ═══════════════════════════════════════════════════════════
+# 5. ANÁLISIS DE SUBASTA
+# ═══════════════════════════════════════════════════════════
+
+def _analyze_auction(self, df: pd.DataFrame) -> Dict[str, Any]:
+    """Analiza la subasta: compradores vs vendedores"""
+    close = df['close']
+    open_price = df['open']
+    
+    buy_volume = df[close > open_price]['volume'].sum()
+    sell_volume = df[close < open_price]['volume'].sum()
+    
+    total_volume = buy_volume + sell_volume
+    if total_volume == 0:
+        return {'type': 'BALANCED', 'buy_ratio': 0.5, 'sell_ratio': 0.5}
+    
+    buy_ratio = buy_volume / total_volume
+    sell_ratio = sell_volume / total_volume
+    
+    vwap = (df['close'] * df['volume']).sum() / df['volume'].sum() if df['volume'].sum() > 0 else close.iloc[-1]
+    price = close.iloc[-1]
+    price_vs_vwap = (price - vwap) / vwap if vwap > 0 else 0
+    
+    delta = (df['volume'] * np.where(df['close'] > df['open'], 1, -1)).sum()
+    
+    if buy_ratio > 0.52 and price_vs_vwap > 0 and delta > 0:
+        auction_type = "BUYERS_IN_CONTROL"
+    elif sell_ratio > 0.52 and price_vs_vwap < 0 and delta < 0:
+        auction_type = "SELLERS_IN_CONTROL"
+    else:
+        auction_type = "BALANCED"
+    
+    return {
+        'type': auction_type,
+        'buy_ratio': buy_ratio,
+        'sell_ratio': sell_ratio,
+        'vwap': vwap,
+        'price_vs_vwap': price_vs_vwap,
+        'delta': delta
+    }
+
+# ═══════════════════════════════════════════════════════════
+# 6. DETECCIÓN DE CRUCES
+# ═══════════════════════════════════════════════════════════
+
+def _detect_crossovers(self, df: pd.DataFrame) -> Dict[str, str]:
+    """Detecta cruces entre EMAs"""
+    if len(df) < 3:
+        return {}
+    
+    ema21 = df['close'].ewm(span=21, adjust=False).mean()
+    ema55 = df['close'].ewm(span=55, adjust=False).mean()
+    ema144 = df['close'].ewm(span=144, adjust=False).mean()
+    ema233 = df['close'].ewm(span=233, adjust=False).mean()
+    
+    crossovers = {}
+    
+    if len(ema21) > 2:
+        prev_21 = ema21.iloc[-2]
+        curr_21 = ema21.iloc[-1]
+        prev_55 = ema55.iloc[-2]
+        curr_55 = ema55.iloc[-1]
+        
+        if prev_21 <= prev_55 and curr_21 > curr_55:
+            crossovers['ema21_55'] = 'CROSSING_UP'
+        elif prev_21 >= prev_55 and curr_21 < curr_55:
+            crossovers['ema21_55'] = 'CROSSING_DOWN'
+        else:
+            crossovers['ema21_55'] = 'NO_CROSS'
+    
+    if len(ema55) > 2:
+        prev_55 = ema55.iloc[-2]
+        curr_55 = ema55.iloc[-1]
+        prev_144 = ema144.iloc[-2]
+        curr_144 = ema144.iloc[-1]
+        
+        if prev_55 <= prev_144 and curr_55 > curr_144:
+            crossovers['ema55_144'] = 'CROSSING_UP'
+        elif prev_55 >= prev_144 and curr_55 < curr_144:
+            crossovers['ema55_144'] = 'CROSSING_DOWN'
+        else:
+            crossovers['ema55_144'] = 'NO_CROSS'
+    
+    return crossovers
+
+# ═══════════════════════════════════════════════════════════
+# 7. DESCRIPCIÓN DE COMPORTAMIENTO M3
+# ═══════════════════════════════════════════════════════════
+
+def _describe_behavior_m3(self, df: pd.DataFrame, daily_pct: float, macro_angle: str) -> Dict[str, Any]:
+    """Describe el comportamiento en M3"""
+    df = df.copy()
+    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+    df["ema55"] = df["close"].ewm(span=55, adjust=False).mean()
+    df["ema144"] = df["close"].ewm(span=144, adjust=False).mean()
+    df["bb_mid"] = df["close"].rolling(20).mean()
+    df["bb_std"] = df["close"].rolling(20).std()
+    df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
+    df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
+
+    df["tr"] = np.maximum(
+        df["high"] - df["low"],
+        np.maximum(
+            abs(df["high"] - df["close"].shift(1)),
+            abs(df["low"] - df["close"].shift(1))
+        )
+    )
+    df["atr"] = df["tr"].rolling(14).mean()
+    df["up"] = df["high"] - df["high"].shift(1)
+    df["down"] = df["low"].shift(1) - df["low"]
+    df["+dm"] = np.where((df["up"] > df["down"]) & (df["up"] > 0), df["up"], 0.0)
+    df["-dm"] = np.where((df["down"] > df["up"]) & (df["down"] > 0), df["down"], 0.0)
+    df["+di"] = 100 * (df["+dm"].rolling(14).mean() / df["atr"])
+    df["-di"] = 100 * (df["-dm"].rolling(14).mean() / df["atr"])
+    df["dx"] = 100 * abs(df["+di"] - df["-di"]) / (df["+di"] + df["-di"])
+    df["adx"] = df["dx"].rolling(14).mean()
+
+    current = df.iloc[-1]
+    prior = df.iloc[-2]
+
+    def position_label(price: float, target: float) -> str:
+        if target == 0 or price == 0:
+            return "N/A"
+        diff = price - target
+        pct = abs(diff / max(price, 1e-6))
+        if pct < 0.002:
+            return "TOUCHING"
+        if pct < 0.008:
+            return "NEAR"
+        return "ABOVE" if diff > 0 else "BELOW"
+
+    def ema_relation(fast: float, slow: float, prev_fast: float, prev_slow: float) -> str:
+        if fast > slow and prev_fast <= prev_slow:
+            return "CROSSING_UP"
+        if fast < slow and prev_fast >= prev_slow:
+            return "CROSSING_DOWN"
+        if abs(fast - slow) / max(slow, 1e-6) < 0.0015:
+            return "FLAT"
+        return "ABOVE" if fast > slow else "BELOW"
+
+    def bb_price_label(close: float, mid: float, lower: float, upper: float) -> str:
+        if close >= upper:
+            return "UPPER"
+        if close <= lower:
+            return "LOWER"
+        if close >= mid:
+            return "MID_TO_UPPER"
+        return "MID_TO_LOWER"
+
+    def volume_label(volume: float, average: float) -> str:
+        if average == 0:
+            return "LOW"
+        ratio = volume / average
+        if ratio >= 2.0:
+            return "HIGH"
+        if ratio >= 1.2:
+            return "MEDIUM"
+        if ratio < 0.35:
+            return "VERY_LOW"
+        return "LOW"
+
+    def candle_pattern(row: pd.Series) -> str:
+        body = abs(row["close"] - row["open"])
+        if body == 0:
+            return "NEUTRAL"
+        upper_wick = float(row["high"] - max(row["close"], row["open"]))
+        lower_wick = float(min(row["close"], row["open"]) - row["low"])
+        if row["close"] > row["open"] and body > upper_wick * 2:
+            return "STRONG_GREEN"
+        if row["close"] < row["open"] and body > lower_wick * 2:
+            return "STRONG_RED"
+        if upper_wick > body * 1.5 and row["close"] < row["open"]:
+            return "REJECTION"
+        if lower_wick > body * 1.5 and row["close"] > row["open"]:
+            return "HAMMER"
+        return "NEUTRAL"
+
+    def adx_tendencia_label(adx_val: float) -> str:
+        if adx_val > 25:
+            return "STRONG"
+        elif adx_val > 20:
+            return "WEAK"
+        else:
+            return "RANGE"
+
+    price = float(current["close"])
+    volume_average = float(df["volume"].rolling(20).mean().iloc[-2] or 0.0)
+
+    return {
+        "precio_vs_ema21": position_label(price, float(current["ema21"])),
+        "precio_vs_ema55": position_label(price, float(current["ema55"])),
+        "precio_vs_ema144": position_label(price, float(current["ema144"])),
+        "ema21_vs_ema55": ema_relation(float(current["ema21"]), float(current["ema55"]),
+                                      float(prior["ema21"]), float(prior["ema55"])),
+        "ema55_vs_ema144": ema_relation(float(current["ema55"]), float(current["ema144"]),
+                                       float(prior["ema55"]), float(prior["ema144"])),
+        "bb_precio": bb_price_label(price, float(current["bb_mid"]),
+                                   float(current["bb_lower"]), float(current["bb_upper"])),
+        "volumen": volume_label(float(current["volume"]), volume_average),
+        "patron_vela": candle_pattern(current),
+        "entry_price": price,
+        "adx_tendencia": adx_tendencia_label(float(current["adx"])),
+        "daily_pct_change": daily_pct,
+        "macro_angle": macro_angle,
+        "atr": float(current["atr"]) if not pd.isna(current["atr"]) else price * 0.01,
+    }# ═══════════════════════════════════════════════════════════
 # 5. ANÁLISIS DE SUBASTA
 # ═══════════════════════════════════════════════════════════
 
@@ -785,7 +988,7 @@ def _build_signal(
         return None
 
 # ═══════════════════════════════════════════════════════════
-# 10. ESCANEO PRINCIPAL (WASHI RADAR + SEÑALES)
+# 10. ESCANEO PRINCIPAL (WASHI RADAR + SEÑALES)  <-- ¡MÉTODO ESCANEO!
 # ═══════════════════════════════════════════════════════════
 
 async def scan_all(self) -> List[Signal]:
