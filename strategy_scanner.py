@@ -210,8 +210,9 @@ class StrategyScanner:
         except Exception as exc:
             logger.warning(f"[StrategyScanner] Error cargando patrones: {exc}. Usando seed_patterns.")
             for tf in self.timeframes:
-                self.patterns_by_tf[tf] = [p.copy() for p in seed_patterns.PATTERNS if p.get("timeframe") == tf]async def _aprender_watchlist(self):
-    """Aprende de todos los símbolos en la watchlist"""
+                    self.patterns_by_tf[tf] = [p.copy() for p in seed_patterns.PATTERNS if p.get("timeframe") == tf]
+
+async def _aprender_watchlist(self):
     logger.info("🧠 WASHI aprendiendo de la watchlist...")
     
     for symbol in self.watchlist:
