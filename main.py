@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from pybit.unified_trading import HTTP
 
 from bybit_api_manager import BybitAPIManager
-from strategy_scanner import MarketScanner, Signal
+from strategy_scanner import MarketScanner, Signal  # <--- CORREGIDO (Eliminado "strategy.")
 from order_executor import OrderExecutor
 from risk_manager import BotMode, CloseReason, RiskManager
 import seed_patterns
