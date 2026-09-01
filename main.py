@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from pybit.unified_trading import HTTP
 
 from bybit_api_manager import BybitAPIManager
-from strategy_scanner import MarketScanner, Signal  # <--- CORREGIDO (Eliminado "strategy.")
+from strategy_scanner import StrategyScanner as MarketScanner, Signal
 from order_executor import OrderExecutor
 from risk_manager import BotMode, CloseReason, RiskManager
 import seed_patterns
@@ -66,19 +66,19 @@ FALLBACK_WATCHLIST = [
 ]
 
 # =========================================================
-# 🟢 CLASE DE TRAILING STOP INTEGRADA AQUÍ (Ya no necesita importación externa)
+# 🟢 CLASE DE TRAILING STOP INTEGRADA AQUÍ
 # =========================================================
 class TrailingStopManager:
     def __init__(
         self,
         api_manager: BybitAPIManager,
-        callback_pct: float = 0.005,  # 0.5% de retroceso
+        callback_pct: float = 0.005,
         is_active: bool = True
     ):
         self.api = api_manager
         self.callback_pct = callback_pct
         self.is_active = is_active
-        self._tracked_positions = {}  # Guarda el mejor precio alcanzado
+        self._tracked_positions = {}
 
     async def manage(self, symbol: str, side: str) -> None:
         if not self.is_active:
@@ -182,7 +182,6 @@ class UnicoBot:
         
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
         
-        # 🟢 Inicializar el Trailing Stop ya integrado en este archivo
         self.trailing_stop = TrailingStopManager(
             api_manager=self.api,
             callback_pct=config.get("TRAILING_CALLBACK_PCT", 0.005),
@@ -300,7 +299,6 @@ class UnicoBot:
         else:
             logger.debug("⏸️ Scanner en pausa o máximo de posiciones alcanzado.")
 
-        # 🟢 Trailing Stop en vivo (integrado)
         if self.rm.positions and self.config["TRAILING_ACTIVATED"]:
             for symbol, pos in self.rm.positions.items():
                 await self.trailing_stop.manage(symbol, pos.side)
