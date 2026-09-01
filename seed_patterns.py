@@ -1,5 +1,8 @@
 # seed_patterns.py — AÑADIR ESTOS PATRONES WASHI
 
+# ✅ CORRECCIÓN: Lista principal definida antes de usarse
+PATTERNS = []
+
 WASHI_PATTERNS = [
     # 🟢 WASHI - COMPRA EN SOPORTE HISTÓRICO
     {
@@ -63,5 +66,5 @@ WASHI_PATTERNS = [
     },
 ]
 
-# AÑADIR estos patrones a PATTERNS
+# ✅ CORRECCIÓN: PATTERNS ya existe, ahora se extiende sin error
 PATTERNS.extend(WASHI_PATTERNS)
