@@ -1,5 +1,4 @@
 ccxt>=4.0.0
-ccxtpro>=4.0.0
 pandas>=2.0.0
 numpy>=1.24.0
 pybit>=5.0.0
