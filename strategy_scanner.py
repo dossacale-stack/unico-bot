@@ -563,7 +563,7 @@ class StrategyScanner:
         }
 
     # ═══════════════════════════════════════════════════════════
-    # 8. MATCH CON PATRONES
+    # 8. MATCH CON PATRONES (MODIFICADO)
     # ═══════════════════════════════════════════════════════════
 
     def _match_patterns(
@@ -580,7 +580,9 @@ class StrategyScanner:
         
         golden_score = self._evaluate_golden_rules(behavior, macro_angle, timeframe, bb_analysis)
         
-        if golden_score < 8.0:
+        # 🔥 MODIFICADO: Reducido el umbral de 8.0 a 5.0
+        if golden_score < 5.0:
+            logger.debug(f"[DEBUG] {symbol_code} {timeframe}: Golden Score ({golden_score}) demasiado bajo.")
             return matches
 
         for pattern in patterns:
@@ -620,6 +622,9 @@ class StrategyScanner:
             if final_score < 0.30:
                 continue
 
+            # 🔥 MODIFICADO: Añadido print de depuración
+            logger.debug(f"[DEBUG] Patrón {pattern.get('id')} en {symbol_code}: Score {score}/{total}, Final: {final_score:.2f}")
+
             matches.append({
                 "pattern": pattern,
                 "match_ratio": final_score,
@@ -636,7 +641,7 @@ class StrategyScanner:
         timeframe: str,
         bb_analysis: Dict[str, Any]
     ) -> float:
-        """Evalúa reglas de oro con Bollinger"""
+        """Evalúa reglas de oro con Bollinger (MODIFICADO)"""
         score = 0.0
         bb_pos = bb_analysis.get('position', 'MID')
         volumen = behavior.get("volumen", "LOW")
@@ -650,8 +655,9 @@ class StrategyScanner:
         if macro_angle == "BEARISH" and "LONG" in str(signal_type):
             return 0.0
 
-        if adx_force in ["RANGE"]:
-            return 0.0
+        # 🔥 MODIFICADO: Eliminado el filtro estricto de RANGE
+        # if adx_force in ["RANGE"]:
+        #     return 0.0
 
         if daily_pct > 0.05 and "LONG" in str(signal_type):
             return 0.0
@@ -683,6 +689,10 @@ class StrategyScanner:
             
             if volumen in ["HIGH", "MEDIUM"]:
                 score += 15
+
+        # 🔥 MODIFICADO: Puntaje base bajo si no hay tendencia para no descartar todo
+        if adx_force == "RANGE":
+            score += 10
 
         return max(0.0, score)
 
@@ -780,7 +790,7 @@ class StrategyScanner:
             return None
 
     # ═══════════════════════════════════════════════════════════
-    # 10. ESCANEO PRINCIPAL (WASHI RADAR + SEÑALES)
+    # 10. ESCANEO PRINCIPAL (WASHI RADAR + SEÑALES) (MODIFICADO)
     # ═══════════════════════════════════════════════════════════
 
     async def scan_all(self) -> List[Signal]:
@@ -836,7 +846,8 @@ class StrategyScanner:
                 
                 distance_pct = abs(price_15m - ema55_15m) / price_15m if price_15m > 0 else 0.1
                 
-                if distance_pct > 0.12:
+                # 🔥 MODIFICADO: Relajado de 0.12 a 0.30 para no perder activos en movimiento
+                if distance_pct > 0.30:
                     logger.debug(f"[StrategyScanner] {symbol}: M15 lejos de EMA55 ({distance_pct:.2%})")
                     continue
 
