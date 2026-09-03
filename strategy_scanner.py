@@ -1,6 +1,5 @@
 # strategy_scanner.py - Strategy Scanner WASHI RADAR UNIFICADO
 # ============================================================
-
 import logging
 import os
 import re
@@ -81,9 +80,7 @@ class Signal:
     bb_squeeze: bool = False
     oportunidad: Optional[OportunidadActivo] = None
 
-# ═══════════════════════════════════════════════════════════════
-#  🔥 NOMBRE DE LA CLASE CORREGIDO A MarketScanner PARA COINCIDIR CON main.py
-# ═══════════════════════════════════════════════════════════════
+# 🔥 NOMBRE CORREGIDO: MarketScanner para coincidir con main.py
 class MarketScanner:
     def __init__(
         self,
@@ -294,8 +291,8 @@ class MarketScanner:
         matches = []
         patterns = self.patterns_by_tf.get(timeframe, [])
         golden_score = self._evaluate_golden_rules(behavior, macro_angle, timeframe, bb_analysis)
-        if golden_score < 5.0:
-            return matches
+        # 🔥 ELIMINADO EL FILTRO ESTRICTO: if golden_score < 5.0: return matches
+        
         for pattern in patterns:
             if pattern.get("symbol") not in {symbol_code, "UNIVERSAL"}: continue
             if pattern.get("timeframe") != timeframe: continue
@@ -320,8 +317,15 @@ class MarketScanner:
         volumen = behavior.get("volumen", "LOW")
         adx_force = behavior.get("adx_tendencia", "RANGE")
         daily_pct = behavior.get("daily_pct_change", 0.0)
-        signal_type = behavior.get("signal_type", "UNKNOWN")
         is_squeeze = bb_analysis.get('is_squeeze', False)
+        
+        # 🔥 CORRECCIÓN CRÍTICA: Inferir la dirección según la posición en Bollinger
+        if bb_pos in ["AT_LOWER", "BELOW_LOWER", "BELOW_MIDDLE"]:
+            signal_type = "LONG"
+        elif bb_pos in ["AT_UPPER", "ABOVE_UPPER", "ABOVE_MIDDLE"]:
+            signal_type = "SHORT"
+        else:
+            signal_type = "UNKNOWN"
         
         if macro_angle == "BULLISH" and "SHORT" in str(signal_type): return 0.0
         if macro_angle == "BEARISH" and "LONG" in str(signal_type): return 0.0
@@ -340,7 +344,7 @@ class MarketScanner:
             if behavior.get("ema55_vs_ema144", "") in ["CROSSING_DOWN", "BELOW"]: score += 20
             if volumen in ["HIGH", "MEDIUM"]: score += 15
 
-        # 🔥 CORRECCIÓN: Dar puntaje base a rangos sin tendencia para no descartar todo
+        # 🔥 Puntaje base bajo si no hay tendencia para no descartar todo
         if adx_force == "RANGE": score += 10
 
         return max(0.0, score)
@@ -450,7 +454,10 @@ class MarketScanner:
                 behavior['auction_type'] = auction['type']
                 symbol_code = self._normalize_symbol(symbol)
                 matches = self._match_patterns(symbol_code, behavior, "3m", macro_angle, bb_analysis)
-                if not matches: continue
+                if not matches: 
+                    # 🔥 PRINT DE DEPURACIÓN
+                    logger.debug(f"[DEBUG] {symbol} {symbol_code}: Sin matches, Score: N/A")
+                    continue
                 best = max(matches, key=lambda item: item["match_ratio"])
                 try:
                     signal_type = SignalType(best["pattern"]["signal_type"])
@@ -463,6 +470,9 @@ class MarketScanner:
                 bb_pos = bb_analysis['position']
                 if signal_type.is_long() and bb_pos in ["ABOVE_UPPER", "AT_UPPER"]: score = score * 0.7
                 elif signal_type.is_short() and bb_pos in ["BELOW_LOWER", "AT_LOWER"]: score = score * 0.7
+                
+                # 🔥 PRINT DE DEPURACIÓN PARA VER EL SCORE
+                logger.debug(f"[DEBUG] {symbol} {symbol_code}: Match encontrado, Score: {score:.2f}")
                 
                 if score < self.min_score: continue
                 signal = self._build_signal(symbol, df_3m, behavior, best, "3m", score, bb_analysis, auction, historical_context)
