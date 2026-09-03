@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional
 from pybit.unified_trading import HTTP
 
 from bybit_api_manager import BybitAPIManager
-# 🔥 CORREGIDO: Importa MarketScanner
 from strategy_scanner import MarketScanner, Signal
 from order_executor import OrderExecutor
 from risk_manager import BotMode, CloseReason, RiskManager
@@ -31,7 +30,7 @@ CONFIG: Dict[str, Any] = {
     "API_KEY": os.getenv("BYBIT_API_KEY", ""),
     "API_SECRET": os.getenv("BYBIT_API_SECRET", ""),
     "SANDBOX": os.getenv("BYBIT_SANDBOX", "false").lower() == "true",
-    "MODE": os.getenv("BOT_MODE", "DRY_RUN"), # 🔥 Puesto en DRY_RUN para probar sin arriesgar los $10
+    "MODE": os.getenv("BOT_MODE", "DRY_RUN"),  # 🔥 Predeterminado en DRY_RUN para pruebas
     
     "SCANNER_ENABLED": True,
     "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "30.0")),
@@ -130,7 +129,6 @@ class UnicoBot:
         
         self.api = BybitAPIManager(api_key=config["API_KEY"], api_secret=config["API_SECRET"], sandbox=config["SANDBOX"])
         self.rm = RiskManager(api_manager=self.api, mode=self.mode, db_path=config["DB_PATH"], max_positions=config["MAX_POSITIONS"], position_pct=config.get("POSITION_PCT", 0.30), sl_pct=config.get("SL_PCT", 0.40), tp_multiple=config.get("TP_MULTIPLE", 5.0), leverage=config.get("LEVERAGE", 10), cooldown_minutes=config.get("COOLDOWN_MINUTES", 15), max_entries_daily=config.get("MAX_ENTRIES_DAILY", 999))
-        # 🔥 CORREGIDO: Instancia MarketScanner
         self.scanner = MarketScanner(api_manager=self.api, watchlist=[], scan_interval=config["SCAN_INTERVAL"], min_score=config["MIN_SCORE"], min_rr=config["MIN_RR"], position_pct=config["POSITION_PCT"], db_path=config["DB_PATH"], signal_cooldown_seconds=60, timeframes=config.get("TIMEFRAMES", ["15m", "3m"]))
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
         self.trailing_stop = TrailingStopManager(api_manager=self.api, callback_pct=config.get("TRAILING_CALLBACK_PCT", 0.005), is_active=config.get("TRAILING_ACTIVATED", True))
