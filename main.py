@@ -5,74 +5,16 @@ import os
 import signal
 import sqlite3
 import sys
-import traceback
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-# ═══════════════════════════════════════════════════════════
-# DIAGNÓSTICO DE IMPORTS — muestra el error real en el log
-# ═══════════════════════════════════════════════════════════
-print("=" * 70)
-print("🔍 DIAGNÓSTICO DE IMPORTS")
-print("=" * 70)
+from pybit.unified_trading import HTTP
 
-try:
-    from pybit.unified_trading import HTTP
-    print("✅ pybit OK")
-except Exception as e:
-    print(f"❌ pybit FALLA: {e}")
-    traceback.print_exc()
-
-try:
-    from bybit_api_manager import BybitAPIManager
-    print("✅ bybit_api_manager OK")
-except Exception as e:
-    print(f"❌ bybit_api_manager FALLA: {e}")
-    traceback.print_exc()
-    sys.exit(1)
-
-try:
-    from risk_manager import BotMode, CloseReason, RiskManager
-    print("✅ risk_manager OK")
-except Exception as e:
-    print(f"❌ risk_manager FALLA: {e}")
-    traceback.print_exc()
-    sys.exit(1)
-
-try:
-    from setup_memory import SetupMemory
-    print("✅ setup_memory OK")
-except Exception as e:
-    print(f"❌ setup_memory FALLA: {e}")
-    traceback.print_exc()
-
-try:
-    from strategy_scanner import MarketScanner, Signal, SignalType
-    print("✅ strategy_scanner OK")
-except Exception as e:
-    print(f"❌ strategy_scanner FALLA: {e}")
-    traceback.print_exc()
-    sys.exit(1)
-
-try:
-    from order_executor import OrderExecutor
-    print("✅ order_executor OK")
-except Exception as e:
-    print(f"❌ order_executor FALLA: {e}")
-    traceback.print_exc()
-    sys.exit(1)
-
-try:
-    import seed_patterns
-    print("✅ seed_patterns OK")
-except Exception as e:
-    print(f"❌ seed_patterns FALLA: {e}")
-    traceback.print_exc()
-    sys.exit(1)
-
-print("=" * 70)
-print("🎉 TODOS LOS IMPORTS OK")
-print("=" * 70)
+from bybit_api_manager import BybitAPIManager
+from strategy_scanner import MarketScanner, Signal
+from order_executor import OrderExecutor
+from risk_manager import BotMode, CloseReason, RiskManager
+import seed_patterns
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,11 +28,14 @@ CONFIG: Dict[str, Any] = {
     "API_SECRET": os.getenv("BYBIT_API_SECRET", ""),
     "SANDBOX": os.getenv("BYBIT_SANDBOX", "false").lower() == "true",
     "MODE": os.getenv("BOT_MODE", "DRY_RUN"),
+
     "SCANNER_ENABLED": True,
     "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "20.0")),
-    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.35")),
-    "MIN_RR": float(os.getenv("MIN_RR", "1.5")),
+    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.15")),
+    "MIN_RR": float(os.getenv("MIN_RR", "0.8")),
+
     "TIMEFRAMES": ["15m", "3m"],
+
     "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "3")),
     "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.30")),
     "SL_PCT": float(os.getenv("SL_PCT", "0.15")),
@@ -98,10 +43,14 @@ CONFIG: Dict[str, Any] = {
     "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
     "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "5")),
     "MAX_ENTRIES_DAILY": int(os.getenv("MAX_ENTRIES_DAILY", "20")),
+
     "LEARNING_ENABLED": os.getenv("LEARNING_ENABLED", "true").lower() == "true",
+
     "DB_PATH": os.getenv("DB_PATH", "patterns.db"),
     "CAPITAL_FILE": os.getenv("CAPITAL_FILE", "capital_inicial.json"),
+
     "WATCHLIST": [],
+
     "TRAILING_ACTIVATED": os.getenv("TRAILING_ACTIVATED", "true").lower() == "true",
     "TRAILING_CALLBACK_PCT": float(os.getenv("TRAILING_CALLBACK_PCT", "0.005")),
 }
@@ -140,21 +89,25 @@ class TrailingStopManager:
             entry_price = float(pos.get("avgPrice", 0))
             callback = atr * self.callback_atr_mult
             if side == "LONG":
-                best_price = self._tracked_positions.get(symbol, entry_price)
-                if current_price > best_price:
-                    best_price = current_price
-                    self._tracked_positions[symbol] = best_price
-                new_sl = best_price - callback
+                best = self._tracked_positions.get(symbol, entry_price)
+                if current_price > best:
+                    best = current_price
+                    self._tracked_positions[symbol] = best
+                new_sl = best - callback
                 if new_sl > current_sl and new_sl > entry_price:
-                    await self.api.place_order(symbol=symbol, side="buy", order_type="limit", amount=0, price=None, stop_loss=new_sl, take_profit=None, reduce_only=False)
+                    await self.api.place_order(symbol=symbol, side="buy", order_type="limit",
+                                               amount=0, price=None, stop_loss=new_sl,
+                                               take_profit=None, reduce_only=False)
             elif side == "SHORT":
-                best_price = self._tracked_positions.get(symbol, entry_price)
-                if current_price < best_price:
-                    best_price = current_price
-                    self._tracked_positions[symbol] = best_price
-                new_sl = best_price + callback
+                best = self._tracked_positions.get(symbol, entry_price)
+                if current_price < best:
+                    best = current_price
+                    self._tracked_positions[symbol] = best
+                new_sl = best + callback
                 if new_sl < current_sl and new_sl < entry_price:
-                    await self.api.place_order(symbol=symbol, side="sell", order_type="limit", amount=0, price=None, stop_loss=new_sl, take_profit=None, reduce_only=False)
+                    await self.api.place_order(symbol=symbol, side="sell", order_type="limit",
+                                               amount=0, price=None, stop_loss=new_sl,
+                                               take_profit=None, reduce_only=False)
         except Exception as e:
             logger.error(f"[TrailingStop] Error {symbol}: {e}")
 
@@ -166,7 +119,7 @@ class UnicoBot:
 
         if self.mode == BotMode.LIVE:
             if not config["API_KEY"] or not config["API_SECRET"]:
-                logger.critical("❌ Faltan credenciales")
+                logger.critical("Faltan credenciales Bybit")
                 raise ValueError("Faltan BYBIT_API_KEY o BYBIT_API_SECRET")
 
         self.api = BybitAPIManager(
@@ -232,13 +185,17 @@ class UnicoBot:
                 return [to_ccxt_symbol(s) for s in FALLBACK_WATCHLIST]
             return final_watchlist
         except Exception as e:
-            logger.error(f"❌ Error watchlist: {e}")
+            logger.error(f"Error watchlist: {e}")
             return [to_ccxt_symbol(s) for s in FALLBACK_WATCHLIST]
 
     async def initialize(self) -> None:
-        logger.info("\n🚀 ÚNICO STRATEGY v6.0 ARRANCANDO\n")
+        logger.info("=" * 60)
+        logger.info("UNICO STRATEGY v6.0 - ARRANCANDO")
+        logger.info(f"MODO: {self.mode.value}")
+        logger.info("=" * 60)
         self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
         self.scanner.watchlist = self.config["WATCHLIST"]
+        logger.info(f"Watchlist: {len(self.config['WATCHLIST'])} simbolos")
 
         if self.mode == BotMode.DRY_RUN:
             self.rm.set_initial_balance(10000.0)
@@ -246,9 +203,9 @@ class UnicoBot:
             try:
                 balance = await self.api.fetch_balance()
                 self.rm.set_initial_balance(balance["total"])
-                logger.info(f"💰 Balance inicial REAL: {balance['total']:.2f} USDT")
+                logger.info(f"Balance REAL: {balance['total']:.2f} USDT")
             except Exception as e:
-                logger.error(f"❌ Error balance: {e}")
+                logger.error(f"Error balance: {e}")
                 raise
 
     async def run(self) -> None:
@@ -258,7 +215,7 @@ class UnicoBot:
             try:
                 await self._cycle()
             except Exception as exc:
-                logger.exception(f"❌ Error en ciclo: {exc}")
+                logger.exception(f"Error en ciclo: {exc}")
                 await asyncio.sleep(5)
         await self.shutdown()
 
@@ -267,18 +224,24 @@ class UnicoBot:
         capital = await self.rm.update_capital()
         stopped, reason = self.rm.kill_switch.check(capital.total_balance)
         if stopped:
-            logger.critical(f"🛑 Kill Switch: {reason}")
+            logger.critical(f"Kill Switch: {reason}")
             self.running = False
             return
-        min_available = capital.total_balance * 0.05
-        if capital.available < min_available:
-            logger.warning(f"⏸️ Saldo bajo")
-        elif self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
+
+        # FIX: Solo bloquea por saldo bajo en LIVE. En DRY_RUN el scanner siempre corre.
+        if self.mode == BotMode.LIVE:
+            min_available = capital.total_balance * 0.05
+            if capital.available < min_available:
+                logger.warning(f"Saldo bajo: {capital.available:.2f} < {min_available:.2f}")
+
+        if self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
             if self.stats["cycles"] % 15 == 0:
                 self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
                 self.scanner.watchlist = self.config["WATCHLIST"]
+
             signals = await self.scanner.scan_all()
             self.stats["signals"] += len(signals)
+
             if signals:
                 signals.sort(key=lambda s: s.score, reverse=True)
                 available_slots = self.config["MAX_POSITIONS"] - len(self.rm.positions)
@@ -290,7 +253,15 @@ class UnicoBot:
             for symbol in list(self.rm.positions.keys()):
                 pos = self.rm.positions[symbol]
                 tf = getattr(pos, 'timeframe', '15m')
-                dfs[symbol] = await self.api.fetch_ohlcv(symbol, timeframe=tf, limit=100)
+                try:
+                    dfs[symbol] = await asyncio.wait_for(
+                        self.api.fetch_ohlcv(symbol, timeframe=tf, limit=100),
+                        timeout=15.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout OHLCV {symbol}")
+                    continue
+
             closes = await self.rm.monitor_positions(dfs)
             for symbol, (should_close, reason, notes, partial_pct) in closes.items():
                 if not should_close:
@@ -304,7 +275,10 @@ class UnicoBot:
                     await self.rm.close_position(symbol, CloseReason.MANUAL, pos.current_price, 1.0)
                     continue
                 contracts_to_close = pos.original_contracts * partial_pct if partial_pct < 1.0 else pos.contracts
-                result = await self.executor.close_position(symbol=symbol, side=close_side, contracts=contracts_to_close, current_price=pos.current_price, reason=reason)
+                result = await self.executor.close_position(
+                    symbol=symbol, side=close_side, contracts=contracts_to_close,
+                    current_price=pos.current_price, reason=reason
+                )
                 if result is None or result.get("is_ghost"):
                     await self.rm.close_position(symbol, CloseReason.MANUAL, pos.current_price, 1.0)
                     continue
@@ -318,59 +292,63 @@ class UnicoBot:
         await asyncio.sleep(self.config["SCAN_INTERVAL"])
 
     async def _process_signal(self, signal: Signal) -> None:
-        df = await self.api.fetch_ohlcv(signal.symbol, timeframe=signal.timeframe, limit=100)
+        try:
+            df = await asyncio.wait_for(
+                self.api.fetch_ohlcv(signal.symbol, timeframe=signal.timeframe, limit=100),
+                timeout=15.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout al procesar {signal.symbol}")
+            return
+
         position_size = await self.rm.evaluate_entry(signal=signal, df=df)
         if not position_size:
             return
+
         open_side = "buy" if signal.signal_type.is_long() else "sell"
         order = await self.executor.open_position(
-            symbol=signal.symbol,
-            side=open_side,
-            position_size=position_size,
-            stop_loss=position_size.stop_loss,
-            take_profit=position_size.take_profit,
+            symbol=signal.symbol, side=open_side, position_size=position_size,
+            stop_loss=position_size.stop_loss, take_profit=position_size.take_profit,
             leverage=position_size.leverage
         )
         if not order:
-            logger.error(f"❌ Error abriendo {signal.symbol}")
+            logger.error(f"Error abriendo {signal.symbol}")
             return
+
         atr = 0.0
         if df is not None and len(df) > 14:
             from risk_manager import PositionCalculator
             df_prep = PositionCalculator._prepare_structural_df(df)
             if not df_prep.empty:
                 atr = float(df_prep["atr"].iloc[-1])
+
         self.rm.register_position(
-            order_id=order["id"],
-            position_size=position_size,
-            pattern_id=signal.pattern_id,
-            signal_type=signal.signal_type.value,
-            arrow_color=None,
-            score=signal.score,
-            atr=atr
+            order_id=order["id"], position_size=position_size,
+            pattern_id=signal.pattern_id, signal_type=signal.signal_type.value,
+            arrow_color=None, score=signal.score, atr=atr
         )
         self.stats["opened"] += 1
-        logger.info(f"✅ Abierta {signal.symbol} {open_side}")
+        logger.info(f"ABIERTA {signal.symbol} {open_side}")
 
     def _log_status(self, capital: Any) -> None:
         logger.info(
-            f"📊 Ciclo {self.stats['cycles']} | Balance: {capital.total_balance:.2f} USDT | "
-            f"Pos: {len(self.rm.positions)} | Señales: {self.stats['signals']} | "
+            f"Ciclo {self.stats['cycles']} | Balance: {capital.total_balance:.2f} | "
+            f"Pos: {len(self.rm.positions)} | Senales: {self.stats['signals']} | "
             f"TP1: {self.stats['tp1_hits']} | TP2: {self.stats['tp2_hits']}"
         )
 
     def _handle_shutdown(self, signum: int, frame: Any) -> None:
-        logger.info(f"🛑 Señal {signum} recibida.")
+        logger.info(f"Senal {signum} recibida.")
         self.running = False
 
     async def shutdown(self) -> None:
-        logger.info("🛑 Deteniendo bot...")
+        logger.info("Deteniendo bot...")
         if self.api:
             await self.api.close()
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="ÚNICO STRATEGY Bot")
+    parser = argparse.ArgumentParser(description="UNICO STRATEGY Bot")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--init-db", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -401,15 +379,11 @@ async def main() -> None:
     try:
         await bot.run()
     except KeyboardInterrupt:
-        logger.info("⏹️ Interrupción manual.")
+        logger.info("Interrupcion manual.")
     finally:
         await bot.shutdown()
 
 
 if __name__ == "__main__":
-    print("""
-╔═══════════════════════════════════════════════════════════════╗
-║        🧠 ÚNICO STRATEGY v6.0 — DIAGNÓSTICO ACTIVO           ║
-╚═══════════════════════════════════════════════════════════════╝
-""")
+    print("UNICO STRATEGY v6.0 - INICIANDO")
     asyncio.run(main())
