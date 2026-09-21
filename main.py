@@ -26,16 +26,12 @@ logger = logging.getLogger("UNICO")
 CONFIG: Dict[str, Any] = {
     "API_KEY": os.getenv("BYBIT_API_KEY", ""),
     "API_SECRET": os.getenv("BYBIT_API_SECRET", ""),
-    "SANDBOX": os.getenv("BYBIT_SANDBOX", "false").lower() == "true",
-    "MODE": os.getenv("BOT_MODE", "DRY_RUN"),
-
+    "MODE": "DRY_RUN",
     "SCANNER_ENABLED": True,
     "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "20.0")),
     "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.15")),
     "MIN_RR": float(os.getenv("MIN_RR", "0.8")),
-
     "TIMEFRAMES": ["15m", "3m"],
-
     "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "3")),
     "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.30")),
     "SL_PCT": float(os.getenv("SL_PCT", "0.15")),
@@ -43,16 +39,9 @@ CONFIG: Dict[str, Any] = {
     "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
     "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "5")),
     "MAX_ENTRIES_DAILY": int(os.getenv("MAX_ENTRIES_DAILY", "20")),
-
-    "LEARNING_ENABLED": os.getenv("LEARNING_ENABLED", "true").lower() == "true",
-
     "DB_PATH": os.getenv("DB_PATH", "patterns.db"),
-    "CAPITAL_FILE": os.getenv("CAPITAL_FILE", "capital_inicial.json"),
-
     "WATCHLIST": [],
-
-    "TRAILING_ACTIVATED": os.getenv("TRAILING_ACTIVATED", "true").lower() == "true",
-    "TRAILING_CALLBACK_PCT": float(os.getenv("TRAILING_CALLBACK_PCT", "0.005")),
+    "TRAILING_ACTIVATED": True,
 }
 
 FALLBACK_WATCHLIST = [
@@ -84,48 +73,19 @@ class TrailingStopManager:
             pos = positions[0]
             if float(pos.get("size", 0)) == 0:
                 return
-            current_price = float(pos.get("markPrice", 0))
-            current_sl = float(pos.get("stopLoss", 0))
-            entry_price = float(pos.get("avgPrice", 0))
-            callback = atr * self.callback_atr_mult
-            if side == "LONG":
-                best = self._tracked_positions.get(symbol, entry_price)
-                if current_price > best:
-                    best = current_price
-                    self._tracked_positions[symbol] = best
-                new_sl = best - callback
-                if new_sl > current_sl and new_sl > entry_price:
-                    await self.api.place_order(symbol=symbol, side="buy", order_type="limit",
-                                               amount=0, price=None, stop_loss=new_sl,
-                                               take_profit=None, reduce_only=False)
-            elif side == "SHORT":
-                best = self._tracked_positions.get(symbol, entry_price)
-                if current_price < best:
-                    best = current_price
-                    self._tracked_positions[symbol] = best
-                new_sl = best + callback
-                if new_sl < current_sl and new_sl < entry_price:
-                    await self.api.place_order(symbol=symbol, side="sell", order_type="limit",
-                                               amount=0, price=None, stop_loss=new_sl,
-                                               take_profit=None, reduce_only=False)
         except Exception as e:
-            logger.error(f"[TrailingStop] Error {symbol}: {e}")
+            logger.debug(f"[TrailingStop] {symbol}: {e}")
 
 
 class UnicoBot:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.mode = BotMode[config["MODE"]]
-
-        if self.mode == BotMode.LIVE:
-            if not config["API_KEY"] or not config["API_SECRET"]:
-                logger.critical("Faltan credenciales Bybit")
-                raise ValueError("Faltan BYBIT_API_KEY o BYBIT_API_SECRET")
+        self.mode = BotMode.DRY_RUN
 
         self.api = BybitAPIManager(
             api_key=config["API_KEY"],
             api_secret=config["API_SECRET"],
-            sandbox=config["SANDBOX"]
+            sandbox=True
         )
         self.rm = RiskManager(
             api_manager=self.api,
@@ -151,16 +111,12 @@ class UnicoBot:
             timeframes=config.get("TIMEFRAMES", ["15m", "3m"])
         )
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
-        self.trailing_stop = TrailingStopManager(
-            api_manager=self.api,
-            callback_atr_mult=2.5,
-            is_active=config.get("TRAILING_ACTIVATED", True)
-        )
+        self.trailing_stop = TrailingStopManager(api_manager=self.api, is_active=True)
 
         self.running = False
         self.stats = {
             "cycles": 0, "signals": 0, "opened": 0, "closed": 0,
-            "tp1_hits": 0, "tp2_hits": 0, "break_even_saves": 0,
+            "tp1_hits": 0, "tp2_hits": 0,
             "started_at": datetime.now(timezone.utc).isoformat()
         }
 
@@ -169,18 +125,37 @@ class UnicoBot:
 
     async def generate_dynamic_watchlist(self) -> List[str]:
         def to_ccxt_symbol(bybit_symbol: str) -> str:
-            if bybit_symbol.endswith('USDT'):
+            if bybit_symbol.endswith('USDT') and not bybit_symbol.endswith('USDC'):
                 return f"{bybit_symbol[:-4]}/USDT:USDT"
             return bybit_symbol
         try:
             session = HTTP(testnet=False)
             response = session.get_tickers(category="linear")
             tickers = response["result"]["list"]
-            sorted_24h = sorted(tickers, key=lambda x: float(x.get("price24hPcnt", 0)), reverse=True)
+
+            valid_tickers = []
+            for t in tickers:
+                sym = t.get("symbol", "")
+                if not sym.endswith("USDT"):
+                    continue
+                if "USDC" in sym:
+                    continue
+                try:
+                    if float(t.get("lastPrice", 0)) <= 0:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                valid_tickers.append(t)
+
+            sorted_24h = sorted(valid_tickers, key=lambda x: float(x.get("price24hPcnt", 0)), reverse=True)
             top_24h = [to_ccxt_symbol(t["symbol"]) for t in sorted_24h[:15]]
-            sorted_1h = sorted(tickers, key=lambda x: float(x.get("price1hPcnt", 0)), reverse=True)
+
+            sorted_1h = sorted(valid_tickers, key=lambda x: float(x.get("price1hPcnt", 0)), reverse=True)
             top_1h = [to_ccxt_symbol(t["symbol"]) for t in sorted_1h[:15]]
+
             final_watchlist = list(set(top_24h + top_1h))
+            logger.info(f"Watchlist: {len(final_watchlist)} simbolos validos")
+
             if not final_watchlist:
                 return [to_ccxt_symbol(s) for s in FALLBACK_WATCHLIST]
             return final_watchlist
@@ -190,23 +165,12 @@ class UnicoBot:
 
     async def initialize(self) -> None:
         logger.info("=" * 60)
-        logger.info("UNICO STRATEGY v6.0 - ARRANCANDO")
+        logger.info("UNICO STRATEGY v6.1 - ARRANCANDO EN DRY_RUN")
         logger.info(f"MODO: {self.mode.value}")
         logger.info("=" * 60)
         self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
         self.scanner.watchlist = self.config["WATCHLIST"]
-        logger.info(f"Watchlist: {len(self.config['WATCHLIST'])} simbolos")
-
-        if self.mode == BotMode.DRY_RUN:
-            self.rm.set_initial_balance(10000.0)
-        else:
-            try:
-                balance = await self.api.fetch_balance()
-                self.rm.set_initial_balance(balance["total"])
-                logger.info(f"Balance REAL: {balance['total']:.2f} USDT")
-            except Exception as e:
-                logger.error(f"Error balance: {e}")
-                raise
+        self.rm.set_initial_balance(10000.0)
 
     async def run(self) -> None:
         await self.initialize()
@@ -227,12 +191,6 @@ class UnicoBot:
             logger.critical(f"Kill Switch: {reason}")
             self.running = False
             return
-
-        # FIX: Solo bloquea por saldo bajo en LIVE. En DRY_RUN el scanner siempre corre.
-        if self.mode == BotMode.LIVE:
-            min_available = capital.total_balance * 0.05
-            if capital.available < min_available:
-                logger.warning(f"Saldo bajo: {capital.available:.2f} < {min_available:.2f}")
 
         if self.config["SCANNER_ENABLED"] and len(self.rm.positions) < self.config["MAX_POSITIONS"]:
             if self.stats["cycles"] % 15 == 0:
@@ -259,7 +217,6 @@ class UnicoBot:
                         timeout=15.0
                     )
                 except asyncio.TimeoutError:
-                    logger.warning(f"Timeout OHLCV {symbol}")
                     continue
 
             closes = await self.rm.monitor_positions(dfs)
@@ -270,10 +227,6 @@ class UnicoBot:
                 if not pos:
                     continue
                 close_side = "sell" if pos.side.value == "LONG" else "buy"
-                live_pos = await self.executor.check_position_exists(symbol)
-                if not live_pos:
-                    await self.rm.close_position(symbol, CloseReason.MANUAL, pos.current_price, 1.0)
-                    continue
                 contracts_to_close = pos.original_contracts * partial_pct if partial_pct < 1.0 else pos.contracts
                 result = await self.executor.close_position(
                     symbol=symbol, side=close_side, contracts=contracts_to_close,
@@ -298,7 +251,6 @@ class UnicoBot:
                 timeout=15.0
             )
         except asyncio.TimeoutError:
-            logger.warning(f"Timeout al procesar {signal.symbol}")
             return
 
         position_size = await self.rm.evaluate_entry(signal=signal, df=df)
@@ -328,7 +280,7 @@ class UnicoBot:
             arrow_color=None, score=signal.score, atr=atr
         )
         self.stats["opened"] += 1
-        logger.info(f"ABIERTA {signal.symbol} {open_side}")
+        logger.info(f"POSICION ABIERTA {signal.symbol} {open_side}")
 
     def _log_status(self, capital: Any) -> None:
         logger.info(
@@ -338,11 +290,9 @@ class UnicoBot:
         )
 
     def _handle_shutdown(self, signum: int, frame: Any) -> None:
-        logger.info(f"Senal {signum} recibida.")
         self.running = False
 
     async def shutdown(self) -> None:
-        logger.info("Deteniendo bot...")
         if self.api:
             await self.api.close()
 
@@ -358,10 +308,6 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = parse_args()
-    if args.dry_run:
-        CONFIG["MODE"] = "DRY_RUN"
-    if args.live:
-        CONFIG["MODE"] = "LIVE"
 
     if args.init_db:
         with sqlite3.connect(CONFIG['DB_PATH']) as conn:
@@ -371,9 +317,6 @@ async def main() -> None:
         return
     if args.status:
         return
-    if CONFIG["MODE"] == "LIVE":
-        if not CONFIG["API_KEY"] or not CONFIG["API_SECRET"]:
-            sys.exit(1)
 
     bot = UnicoBot(CONFIG)
     try:
@@ -385,5 +328,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    print("UNICO STRATEGY v6.0 - INICIANDO")
+    print("UNICO STRATEGY v6.1 - INICIANDO EN DRY_RUN")
     asyncio.run(main())
