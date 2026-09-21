@@ -1,1 +1,1 @@
-worker: python3 main.py --live
+worker: python3 main.py --dry-run
