@@ -82,10 +82,11 @@ class UnicoBot:
         self.config = config
         self.mode = BotMode.DRY_RUN
 
+        # ⚠️ CAMBIO CRÍTICO: sandbox=False para usar datos REALES de mercado
         self.api = BybitAPIManager(
             api_key=config["API_KEY"],
             api_secret=config["API_SECRET"],
-            sandbox=True
+            sandbox=False
         )
         self.rm = RiskManager(
             api_manager=self.api,
@@ -165,7 +166,7 @@ class UnicoBot:
 
     async def initialize(self) -> None:
         logger.info("=" * 60)
-        logger.info("UNICO STRATEGY v6.1 - ARRANCANDO EN DRY_RUN")
+        logger.info("UNICO STRATEGY v6.2 - DRY_RUN + DATOS REALES")
         logger.info(f"MODO: {self.mode.value}")
         logger.info("=" * 60)
         self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
@@ -328,5 +329,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    print("UNICO STRATEGY v6.1 - INICIANDO EN DRY_RUN")
+    print("UNICO STRATEGY v6.2 - INICIANDO EN DRY_RUN CON DATOS REALES")
     asyncio.run(main())
