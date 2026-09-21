@@ -1,12 +1,8 @@
-# strategy_scanner.py - Scanner SIMPLIFICADO pero FUNCIONAL
-# ============================================================
 import logging
-import sqlite3
 import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -79,7 +75,7 @@ class MarketScanner:
         self.timeframes = timeframes or ["15m", "3m"]
         self._signal_cooldown: Dict[str, float] = {}
         self.escaneos_totales = 0
-        logger.info(f"[Scanner] Iniciado | min_score={min_score} | min_rr={min_rr} | tfs={self.timeframes}")
+        logger.info(f"[Scanner] Iniciado | min_score={min_score} | min_rr={min_rr}")
 
     def _calc_rsi(self, prices: pd.Series, period: int = 14) -> pd.Series:
         delta = prices.diff()
@@ -133,45 +129,34 @@ class MarketScanner:
         signal_type = None
         reasons = []
 
-        # RSI oversold + precio en BB lower -> LONG
         if rsi < 35 and price <= bb_lower * 1.01:
             signal_type = SignalType.LONG_REVERSAL
             score += 0.4
-            reasons.append(f"RSI oversold ({rsi:.1f})")
-            reasons.append("Precio en BB lower")
-
-        # RSI overbought + precio en BB upper -> SHORT
+            reasons.append(f"RSI oversold {rsi:.1f}")
         elif rsi > 65 and price >= bb_upper * 0.99:
             signal_type = SignalType.SHORT_REVERSAL
             score += 0.4
-            reasons.append(f"RSI overbought ({rsi:.1f})")
-            reasons.append("Precio en BB upper")
-
-        # Cruce EMA21 sobre EMA55 -> LONG
+            reasons.append(f"RSI overbought {rsi:.1f}")
         elif prev_ema21 <= prev_ema55 and ema21 > ema55:
             signal_type = SignalType.LONG_BREAKOUT
             score += 0.35
-            reasons.append("Cruce EMA21 sobre EMA55")
-
-        # Cruce EMA21 bajo EMA55 -> SHORT
+            reasons.append("Cruce EMA21/EMA55 alcista")
         elif prev_ema21 >= prev_ema55 and ema21 < ema55:
             signal_type = SignalType.SHORT_BREAKOUT
             score += 0.35
-            reasons.append("Cruce EMA21 bajo EMA55")
+            reasons.append("Cruce EMA21/EMA55 bajista")
 
         if signal_type is None:
             return None
 
-        # Volumen confirma
         if vol_ratio > 1.3:
             score += 0.2
-            reasons.append(f"Volumen alto ({vol_ratio:.2f}x)")
+            reasons.append(f"Volumen {vol_ratio:.2f}x")
 
-        # ATR razonable
         atr_pct = atr / price if price > 0 else 0
         if 0.002 < atr_pct < 0.05:
             score += 0.1
-            reasons.append(f"ATR OK ({atr_pct*100:.2f}%)")
+            reasons.append(f"ATR OK {atr_pct*100:.2f}%")
 
         return {
             "signal_type": signal_type,
@@ -202,7 +187,6 @@ class MarketScanner:
                 analysis = self._analyze(df)
                 if not analysis:
                     continue
-
                 if analysis["score"] < self.min_score:
                     continue
 
@@ -240,16 +224,16 @@ class MarketScanner:
                 )
                 signals.append(signal)
                 self._signal_cooldown[symbol] = now
-                logger.info(f"SENAL {st.value} {symbol} | Score {analysis['score']:.2f} | RR {rr:.2f} | RSI {analysis['rsi']:.1f}")
+                logger.info(f"SENAL {st.value} {symbol} | Score {analysis['score']:.2f} | RR {rr:.2f}")
 
             except Exception as e:
                 logger.debug(f"Error en {symbol}: {e}")
                 continue
 
         if not signals:
-            logger.info(f"ESCANEO #{self.escaneos_totales} completado: Sin senales")
+            logger.info(f"ESCANEO #{self.escaneos_totales}: Sin senales")
         else:
-            logger.info(f"ESCANEO #{self.escaneos_totales} completado: {len(signals)} senales")
+            logger.info(f"ESCANEO #{self.escaneos_totales}: {len(signals)} senales")
 
         return signals
 
