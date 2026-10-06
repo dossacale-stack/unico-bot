@@ -1,10 +1,12 @@
-# strategy_scanner.py - Lógica EMA Fibonacci 55/144/233 + BB 21,2
-# =================================================================
-# Basado en estructura real de mercado:
-#   1. Pila de EMAs 55 > 144 > 233 (Fibonacci) define dirección
-#   2. Bollinger Bands 21,2 definen zona de entrada
-#   3. Rechazo en la banda opuesta a la pila
-#   4. Confirmación con vela de rechazo
+# strategy_scanner.py - Scanner con lógica de AGOTAMIENTO
+# =========================================================
+# Basado en la lógica real del trader:
+#   1. Pila EMA 55/144/233 define dirección
+#   2. Precio se "estira" alejándose de EMA55 (distancia)
+#   3. Varias velas seguidas sin corregir (consecutivas)
+#   4. Bollinger se expande fuerte (nerviosismo)
+#   5. Mucho tiempo en la zona extendida (agotamiento)
+#   6. Vela de rechazo confirma la entrada
 
 import logging
 import time
@@ -44,7 +46,7 @@ class Signal:
     entry_price: float
     df: Optional[pd.DataFrame] = None
     pattern_id: Optional[int] = None
-    timeframe: str = "15m"
+    timeframe: str = "1h"
     setup: Optional[Any] = None
     confidence: float = 0.0
     risk_level: str = "MEDIO"
@@ -60,35 +62,38 @@ class Signal:
 
 class MarketScanner:
     """
-    Scanner basado en EMA Fibonacci (55/144/233) + Bollinger Bands (21,2).
+    Scanner de AGOTAMIENTO.
 
-    Reglas:
-    1. Pila alcista (55>144>233, precio arriba) + pullback a BB media/inferior
-       + rechazo → LONG
-    2. Pila bajista (55<144<233, precio abajo) + rebote a BB media/superior
-       + rechazo → SHORT
-    3. Pila entrelazada → NO OPERAR
+    Pila alcista (55>144>233, precio arriba):
+      -> Busca LONG cuando el precio se agota HACIA ABAJO
+    Pila bajista (55<144<233, precio abajo):
+      -> Busca SHORT cuando el precio se agota HACIA ARRIBA
     """
 
-    # Parámetros de la estrategia
     EMA_FAST = 55
     EMA_MID = 144
     EMA_SLOW = 233
     BB_PERIOD = 21
     BB_STD = 2.0
-    REJECTION_WICK_RATIO = 1.5   # mecha debe ser 1.5x el cuerpo
-    MIN_TOUCH_DISTANCE = 0.005   # precio debe estar a 0.5% del BB o EMA
+
+    MIN_DISTANCE_PCT = 0.03
+    MAX_DISTANCE_PCT = 0.25
+    MIN_CONSECUTIVE_CANDLES = 4
+    MIN_BB_EXPANSION = 0.15
+    MIN_TIME_IN_ZONE = 6
+    MIN_EXHAUSTION_SCORE = 0.55
+    REJECTION_WICK_RATIO = 1.4
 
     def __init__(
         self,
         api_manager: BybitAPIManager,
         watchlist: List[str],
-        scan_interval: float = 20.0,
-        min_score: float = 0.15,
-        min_rr: float = 0.8,
+        scan_interval: float = 60.0,
+        min_score: float = 0.55,
+        min_rr: float = 1.0,
         position_pct: float = 0.30,
         db_path: str = "patterns.db",
-        signal_cooldown_seconds: int = 60,
+        signal_cooldown_seconds: int = 300,
         timeframes: List[str] = None,
         modo_aprendizaje=None,
     ):
@@ -100,28 +105,26 @@ class MarketScanner:
         self.position_pct = position_pct
         self.db_path = db_path
         self.signal_cooldown_seconds = signal_cooldown_seconds
-        self.timeframes = timeframes or ["15m"]
+        self.timeframes = timeframes or ["1h"]
         self._signal_cooldown: Dict[str, float] = {}
         self.escaneos_totales = 0
         logger.info(
-            f"[Scanner] EMA Fibonacci {self.EMA_FAST}/{self.EMA_MID}/{self.EMA_SLOW} "
-            f"+ BB({self.BB_PERIOD},{self.BB_STD}) | min_score={min_score}"
+            f"[Scanner] AGOTAMIENTO | EMA {self.EMA_FAST}/{self.EMA_MID}/{self.EMA_SLOW} "
+            f"| BB({self.BB_PERIOD},{self.BB_STD}) | min_score={min_score}"
         )
 
     def _add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        # EMAs Fibonacci
         df["ema_fast"] = df["close"].ewm(span=self.EMA_FAST, adjust=False).mean()
         df["ema_mid"] = df["close"].ewm(span=self.EMA_MID, adjust=False).mean()
         df["ema_slow"] = df["close"].ewm(span=self.EMA_SLOW, adjust=False).mean()
 
-        # Bollinger Bands 21, 2
         df["bb_mid"] = df["close"].rolling(self.BB_PERIOD).mean()
         df["bb_std"] = df["close"].rolling(self.BB_PERIOD).std()
         df["bb_upper"] = df["bb_mid"] + self.BB_STD * df["bb_std"]
         df["bb_lower"] = df["bb_mid"] - self.BB_STD * df["bb_std"]
+        df["bb_bandwidth"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
 
-        # ATR para SL dinámico
         df["tr"] = np.maximum(
             df["high"] - df["low"],
             np.maximum(abs(df["high"] - df["close"].shift(1)),
@@ -129,83 +132,97 @@ class MarketScanner:
         )
         df["atr"] = df["tr"].rolling(14).mean()
 
-        # Volumen relativo
         df["vol_avg"] = df["volume"].rolling(20).mean()
         df["vol_ratio"] = df["volume"] / df["vol_avg"].replace(0, 1e-9)
 
         return df
 
     def _detect_ema_stack(self, row: pd.Series, price: float) -> str:
-        """
-        Detecta la pila de EMAs.
-        Retorna: BULLISH, BEARISH, o TANGLED
-        """
         ef = float(row["ema_fast"])
         em = float(row["ema_mid"])
         es = float(row["ema_slow"])
 
-        # Pila alcista: ema_fast > ema_mid > ema_slow Y precio arriba de la fast
         if ef > em and em > es and price > ef:
             return "BULLISH"
-        # Pila bajista: ema_fast < ema_mid < ema_slow Y precio abajo de la fast
         if ef < em and em < es and price < ef:
             return "BEARISH"
         return "TANGLED"
 
-    def _detect_rejection_bullish(self, row: pd.Series) -> bool:
-        """
-        Vela de rechazo alcista:
-        - Cuerpo pequeño o verde
-        - Mecha inferior larga (> 1.5x cuerpo)
-        - Cierra arriba del mínimo
-        """
-        o = float(row["open"])
-        c = float(row["close"])
-        h = float(row["high"])
-        l = float(row["low"])
+    def _exhaustion_score(self, df: pd.DataFrame, direction: str) -> Dict[str, Any]:
+        last = df.iloc[-1]
+        price = float(last["close"])
+        ema_fast = float(last["ema_fast"])
 
-        body = abs(c - o)
-        if body < 1e-9:
-            body = (h - l) * 0.1  # mínimo
+        distance_pct = (price - ema_fast) / ema_fast
+        if direction == "UP":
+            dist_score = min(max(distance_pct - self.MIN_DISTANCE_PCT, 0) / 0.10, 1.0)
+        else:
+            dist_score = min(max(-distance_pct - self.MIN_DISTANCE_PCT, 0) / 0.10, 1.0)
 
-        lower_wick = min(o, c) - l
-        # Mecha inferior larga Y cuerpo pequeño
-        if lower_wick > body * self.REJECTION_WICK_RATIO and c >= o * 0.998:
-            return True
-        return False
+        closes = df["close"].values
+        consecutive = 0
+        for i in range(len(df) - 2, max(len(df) - 20, 0), -1):
+            if direction == "UP" and closes[i] > closes[i - 1]:
+                consecutive += 1
+            elif direction == "DOWN" and closes[i] < closes[i - 1]:
+                consecutive += 1
+            else:
+                break
+        consec_score = min(consecutive / 10.0, 1.0)
 
-    def _detect_rejection_bearish(self, row: pd.Series) -> bool:
-        """
-        Vela de rechazo bajista:
-        - Mecha superior larga (> 1.5x cuerpo)
-        - Cierra abajo del máximo
-        """
-        o = float(row["open"])
-        c = float(row["close"])
-        h = float(row["high"])
-        l = float(row["low"])
+        bw_now = float(last["bb_bandwidth"])
+        bw_10 = float(df["bb_bandwidth"].iloc[-10])
+        if bw_10 > 0:
+            bb_expansion = (bw_now - bw_10) / bw_10
+        else:
+            bb_expansion = 0.0
+        bb_score = min(max(bb_expansion, 0) / 0.50, 1.0)
 
-        body = abs(c - o)
-        if body < 1e-9:
-            body = (h - l) * 0.1
+        threshold_pct = 0.02 if direction == "UP" else -0.02
+        recent = df.tail(30)
+        candles_in_zone = 0
+        for _, r in recent.iterrows():
+            p = float(r["close"])
+            ef = float(r["ema_fast"])
+            d = (p - ef) / ef
+            if direction == "UP" and d > threshold_pct:
+                candles_in_zone += 1
+            elif direction == "DOWN" and d < threshold_pct:
+                candles_in_zone += 1
+        time_score = min(candles_in_zone / 20.0, 1.0)
 
-        upper_wick = h - max(o, c)
-        if upper_wick > body * self.REJECTION_WICK_RATIO and c <= o * 1.002:
-            return True
-        return False
+        score = (
+            dist_score * 0.35 +
+            consec_score * 0.20 +
+            bb_score * 0.25 +
+            time_score * 0.20
+        )
 
-    def _find_recent_swing(self, df: pd.DataFrame, lookback: int = 20) -> Dict[str, float]:
-        """Encuentra swing high y swing low recientes."""
-        recent = df.tail(lookback)
         return {
-            "swing_high": float(recent["high"].max()),
-            "swing_low": float(recent["low"].min()),
+            "score": score,
+            "dist_score": dist_score,
+            "consec_score": consec_score,
+            "bb_score": bb_score,
+            "time_score": time_score,
+            "distance_pct": distance_pct,
+            "consecutive": consecutive,
+            "bb_expansion": bb_expansion,
+            "candles_in_zone": candles_in_zone,
         }
 
+    def _detect_rejection_bullish(self, row: pd.Series) -> bool:
+        o, c, h, l = float(row["open"]), float(row["close"]), float(row["high"]), float(row["low"])
+        body = abs(c - o) or (h - l) * 0.1
+        lower_wick = min(o, c) - l
+        return lower_wick > body * self.REJECTION_WICK_RATIO and c >= o * 0.998
+
+    def _detect_rejection_bearish(self, row: pd.Series) -> bool:
+        o, c, h, l = float(row["open"]), float(row["close"]), float(row["high"]), float(row["low"])
+        body = abs(c - o) or (h - l) * 0.1
+        upper_wick = h - max(o, c)
+        return upper_wick > body * self.REJECTION_WICK_RATIO and c <= o * 1.002
+
     def _analyze(self, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-        """
-        Lógica central: detecta setup según tu estrategia.
-        """
         if df is None or len(df) < self.EMA_SLOW + 20:
             return None
 
@@ -213,147 +230,88 @@ class MarketScanner:
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
-        if pd.isna(last["ema_slow"]) or pd.isna(last["bb_mid"]) or pd.isna(last["atr"]):
+        if pd.isna(last["ema_slow"]) or pd.isna(last["bb_mid"]):
             return None
 
         price = float(last["close"])
-        ema_fast = float(last["ema_fast"])
-        ema_mid = float(last["ema_mid"])
-        ema_slow = float(last["ema_slow"])
         bb_upper = float(last["bb_upper"])
-        bb_mid = float(last["bb_mid"])
         bb_lower = float(last["bb_lower"])
-        atr = float(last["atr"])
-        vol_ratio = float(last["vol_ratio"])
 
-        # 1. Detectar pila de EMAs
         stack = self._detect_ema_stack(last, price)
         if stack == "TANGLED":
-            return None  # No operar
-
-        score = 0.0
-        reasons = []
-        signal_type = None
-
-        # Distancia al BB (como % del precio)
-        dist_upper = abs(price - bb_upper) / price if price > 0 else 1
-        dist_lower = abs(price - bb_lower) / price if price > 0 else 1
-        dist_mid = abs(price - bb_mid) / price if price > 0 else 1
-
-        # ══════ PILA ALCISTA → buscar LONG en pullback ══════
-        if stack == "BULLISH":
-            # Precio debe estar cerca de BB media o inferior (pullback)
-            if dist_mid < 0.01 or dist_lower < 0.01:
-                score += 0.35
-                reasons.append(f"Pullback a BB {'media' if dist_mid < dist_lower else 'inferior'}")
-
-                # ¿EMA fast o mid actúa como soporte?
-                ema_touch = min(
-                    abs(price - ema_fast) / price,
-                    abs(price - ema_mid) / price
-                )
-                if ema_touch < self.MIN_TOUCH_DISTANCE:
-                    score += 0.20
-                    reasons.append(f"Toque EMA soporte")
-
-                # Vela de rechazo alcista
-                if self._detect_rejection_bullish(last) or self._detect_rejection_bullish(prev):
-                    score += 0.25
-                    reasons.append("Vela de rechazo alcista")
-
-                # Volumen confirma
-                if vol_ratio > 1.2:
-                    score += 0.10
-                    reasons.append(f"Volumen {vol_ratio:.1f}x")
-
-                # Precio cerca del BB inferior = mejor entrada
-                if dist_lower < 0.005:
-                    score += 0.10
-                    reasons.append("En BB inferior")
-
-                if score >= self.min_score:
-                    signal_type = SignalType.LONG_REVERSAL
-
-        # ══════ PILA BAJISTA → buscar SHORT en rebote ══════
-        elif stack == "BEARISH":
-            # Precio debe estar cerca de BB media o superior (rebote)
-            if dist_mid < 0.01 or dist_upper < 0.01:
-                score += 0.35
-                reasons.append(f"Rebote a BB {'media' if dist_mid < dist_upper else 'superior'}")
-
-                ema_touch = min(
-                    abs(price - ema_fast) / price,
-                    abs(price - ema_mid) / price
-                )
-                if ema_touch < self.MIN_TOUCH_DISTANCE:
-                    score += 0.20
-                    reasons.append(f"Toque EMA resistencia")
-
-                if self._detect_rejection_bearish(last) or self._detect_rejection_bearish(prev):
-                    score += 0.25
-                    reasons.append("Vela de rechazo bajista")
-
-                if vol_ratio > 1.2:
-                    score += 0.10
-                    reasons.append(f"Volumen {vol_ratio:.1f}x")
-
-                if dist_upper < 0.005:
-                    score += 0.10
-                    reasons.append("En BB superior")
-
-                if score >= self.min_score:
-                    signal_type = SignalType.SHORT_REVERSAL
-
-        if signal_type is None:
             return None
 
-        # Calcular SL y TP
-        swing = self._find_recent_swing(df, lookback=20)
-
-        if signal_type.is_long():
-            # SL debajo del swing low reciente o EMA mid, lo que esté más cerca
-            sl_candidates = [swing["swing_low"], ema_mid * 0.998]
-            stop_loss = max(sl_candidates)  # el más cercano al precio
-            # TP en BB superior o swing high
-            take_profit = bb_upper
-        else:
-            # SL arriba del swing high reciente o EMA mid
-            sl_candidates = [swing["swing_high"], ema_mid * 1.002]
-            stop_loss = min(sl_candidates)
+        if stack == "BEARISH":
+            ex = self._exhaustion_score(df, "UP")
+            if ex["score"] < self.MIN_EXHAUSTION_SCORE:
+                return None
+            if not (self._detect_rejection_bearish(last) or self._detect_rejection_bearish(prev)):
+                return None
+            recent_high = float(df["high"].tail(10).max())
+            stop_loss = recent_high * 1.003
             take_profit = bb_lower
+            risk = abs(price - stop_loss)
+            reward = abs(take_profit - price)
+            if risk <= 0:
+                return None
+            rr = reward / risk
+            if rr < self.min_rr:
+                return None
+            return {
+                "signal_type": SignalType.SHORT_REVERSAL,
+                "score": ex["score"],
+                "price": price,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "rr": rr,
+                "stack": stack,
+                "exhaustion": ex,
+                "reasons": [
+                    f"Pila BAJISTA",
+                    f"Distancia EMA55: {ex['distance_pct']*100:+.2f}%",
+                    f"Velas seguidas: {ex['consecutive']}",
+                    f"BB expandiendo: {ex['bb_expansion']*100:+.1f}%",
+                    f"Tiempo en zona: {ex['candles_in_zone']} velas",
+                    f"Score agotamiento: {ex['score']:.2f}",
+                ],
+            }
 
-        # Validar SL (no muy lejos)
-        risk = abs(price - stop_loss)
-        if risk / price > 0.05:  # SL > 5% → descartar
-            return None
+        if stack == "BULLISH":
+            ex = self._exhaustion_score(df, "DOWN")
+            if ex["score"] < self.MIN_EXHAUSTION_SCORE:
+                return None
+            if not (self._detect_rejection_bullish(last) or self._detect_rejection_bullish(prev)):
+                return None
+            recent_low = float(df["low"].tail(10).min())
+            stop_loss = recent_low * 0.997
+            take_profit = bb_upper
+            risk = abs(price - stop_loss)
+            reward = abs(take_profit - price)
+            if risk <= 0:
+                return None
+            rr = reward / risk
+            if rr < self.min_rr:
+                return None
+            return {
+                "signal_type": SignalType.LONG_REVERSAL,
+                "score": ex["score"],
+                "price": price,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "rr": rr,
+                "stack": stack,
+                "exhaustion": ex,
+                "reasons": [
+                    f"Pila ALCISTA",
+                    f"Distancia EMA55: {ex['distance_pct']*100:+.2f}%",
+                    f"Velas seguidas: {ex['consecutive']}",
+                    f"BB expandiendo: {ex['bb_expansion']*100:+.1f}%",
+                    f"Tiempo en zona: {ex['candles_in_zone']} velas",
+                    f"Score agotamiento: {ex['score']:.2f}",
+                ],
+            }
 
-        reward = abs(take_profit - price)
-        rr = reward / risk if risk > 0 else 0
-
-        # Reducir score si RR es malo
-        if rr < self.min_rr:
-            return None
-
-        # Bonus por RR alto
-        if rr > 3:
-            score += 0.05
-            reasons.append(f"R:R {rr:.1f}")
-
-        return {
-            "signal_type": signal_type,
-            "score": min(score, 1.0),
-            "price": price,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "rr": rr,
-            "atr": atr,
-            "stack": stack,
-            "reasons": reasons,
-            "bb_position": (
-                "UPPER" if dist_upper < dist_lower else "LOWER"
-                if dist_lower < 0.01 else "MID"
-            ),
-        }
+        return None
 
     async def scan_all(self) -> List[Signal]:
         self.escaneos_totales += 1
@@ -368,8 +326,7 @@ class MarketScanner:
                     if now - self._signal_cooldown[symbol] < self.signal_cooldown_seconds:
                         continue
 
-                # Necesitamos muchas velas para EMA 233
-                df = await self.api.fetch_ohlcv(symbol, timeframe="15m", limit=300)
+                df = await self.api.fetch_ohlcv(symbol, timeframe="1h", limit=400)
                 if df is None or len(df) < self.EMA_SLOW + 20:
                     continue
 
@@ -387,18 +344,18 @@ class MarketScanner:
                     entry_price=analysis["price"],
                     df=df,
                     pattern_id=None,
-                    timeframe="15m",
+                    timeframe="1h",
                     confidence=analysis["score"],
                     entry_reason=" | ".join(analysis["reasons"]),
-                    bb_position=analysis.get("bb_position", ""),
+                    bb_position="UPPER" if analysis["signal_type"].is_short() else "LOWER",
                 )
                 signals.append(signal)
                 self._signal_cooldown[symbol] = now
 
                 logger.info(
-                    f"SENAL {analysis['signal_type'].value} {symbol} | "
+                    f"AGOTAMIENTO {analysis['signal_type'].value} {symbol} | "
                     f"Score {analysis['score']:.2f} | RR {analysis['rr']:.2f} | "
-                    f"Stack {analysis['stack']} | {' | '.join(analysis['reasons'])}"
+                    f"{' | '.join(analysis['reasons'])}"
                 )
 
             except Exception as e:
@@ -406,9 +363,9 @@ class MarketScanner:
                 continue
 
         if not signals:
-            logger.info(f"ESCANEO #{self.escaneos_totales}: Sin senales")
+            logger.info(f"ESCANEO #{self.escaneos_totales}: Sin agotamientos claros")
         else:
-            logger.info(f"ESCANEO #{self.escaneos_totales}: {len(signals)} senales")
+            logger.info(f"ESCANEO #{self.escaneos_totales}: {len(signals)} senales de agotamiento")
 
         return signals
 
