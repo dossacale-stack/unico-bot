@@ -1,12 +1,5 @@
-# strategy_scanner.py - Scanner con lógica de AGOTAMIENTO
+# strategy_scanner.py - Scanner con logica de AGOTAMIENTO
 # =========================================================
-# Basado en la lógica real del trader:
-#   1. Pila EMA 55/144/233 define dirección
-#   2. Precio se "estira" alejándose de EMA55 (distancia)
-#   3. Varias velas seguidas sin corregir (consecutivas)
-#   4. Bollinger se expande fuerte (nerviosismo)
-#   5. Mucho tiempo en la zona extendida (agotamiento)
-#   6. Vela de rechazo confirma la entrada
 
 import logging
 import time
@@ -61,15 +54,6 @@ class Signal:
 
 
 class MarketScanner:
-    """
-    Scanner de AGOTAMIENTO.
-
-    Pila alcista (55>144>233, precio arriba):
-      -> Busca LONG cuando el precio se agota HACIA ABAJO
-    Pila bajista (55<144<233, precio abajo):
-      -> Busca SHORT cuando el precio se agota HACIA ARRIBA
-    """
-
     EMA_FAST = 55
     EMA_MID = 144
     EMA_SLOW = 233
