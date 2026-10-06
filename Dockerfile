@@ -6,7 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Cache busting: cambiar este número fuerza rebuild
-ARG CACHEBUST=1
+ARG CACHEBUST=99
 
 COPY . .
 
