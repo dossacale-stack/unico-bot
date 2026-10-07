@@ -28,17 +28,17 @@ CONFIG: Dict[str, Any] = {
     "API_SECRET": os.getenv("BYBIT_API_SECRET", ""),
     "MODE": "DRY_RUN",
     "SCANNER_ENABLED": True,
-    "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "20.0")),
-    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.15")),
-    "MIN_RR": float(os.getenv("MIN_RR", "0.8")),
-    "TIMEFRAMES": ["15m", "3m"],
-    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "3")),
+    "SCAN_INTERVAL": float(os.getenv("SCAN_INTERVAL", "60.0")),
+    "MIN_SCORE": float(os.getenv("MIN_SCORE", "0.30")),
+    "MIN_RR": float(os.getenv("MIN_RR", "1.0")),
+    "TIMEFRAMES": ["1h"],
+    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "2")),
     "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.30")),
     "SL_PCT": float(os.getenv("SL_PCT", "0.15")),
     "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
     "LEVERAGE": int(os.getenv("LEVERAGE", "10")),
-    "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "5")),
-    "MAX_ENTRIES_DAILY": int(os.getenv("MAX_ENTRIES_DAILY", "20")),
+    "COOLDOWN_MINUTES": int(os.getenv("COOLDOWN_MINUTES", "60")),
+    "MAX_ENTRIES_DAILY": int(os.getenv("MAX_ENTRIES_DAILY", "5")),
     "DB_PATH": os.getenv("DB_PATH", "patterns.db"),
     "WATCHLIST": [],
     "TRAILING_ACTIVATED": True,
@@ -82,7 +82,6 @@ class UnicoBot:
         self.config = config
         self.mode = BotMode.DRY_RUN
 
-        # ⚠️ CAMBIO CRÍTICO: sandbox=False para usar datos REALES de mercado
         self.api = BybitAPIManager(
             api_key=config["API_KEY"],
             api_secret=config["API_SECRET"],
@@ -97,8 +96,8 @@ class UnicoBot:
             sl_pct=config.get("SL_PCT", 0.15),
             tp_multiple=config.get("TP_MULTIPLE", 5.0),
             leverage=config.get("LEVERAGE", 10),
-            cooldown_minutes=config.get("COOLDOWN_MINUTES", 5),
-            max_entries_daily=config.get("MAX_ENTRIES_DAILY", 20)
+            cooldown_minutes=config.get("COOLDOWN_MINUTES", 60),
+            max_entries_daily=config.get("MAX_ENTRIES_DAILY", 5)
         )
         self.scanner = MarketScanner(
             api_manager=self.api,
@@ -108,8 +107,8 @@ class UnicoBot:
             min_rr=config["MIN_RR"],
             position_pct=config["POSITION_PCT"],
             db_path=config["DB_PATH"],
-            signal_cooldown_seconds=60,
-            timeframes=config.get("TIMEFRAMES", ["15m", "3m"])
+            signal_cooldown_seconds=300,
+            timeframes=config.get("TIMEFRAMES", ["1h"])
         )
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
         self.trailing_stop = TrailingStopManager(api_manager=self.api, is_active=True)
@@ -166,7 +165,7 @@ class UnicoBot:
 
     async def initialize(self) -> None:
         logger.info("=" * 60)
-        logger.info("UNICO STRATEGY v6.2 - DRY_RUN + DATOS REALES")
+        logger.info("UNICO STRATEGY v6.3 - AGOTAMIENTO + DATOS REALES")
         logger.info(f"MODO: {self.mode.value}")
         logger.info("=" * 60)
         self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
@@ -211,7 +210,7 @@ class UnicoBot:
             dfs = {}
             for symbol in list(self.rm.positions.keys()):
                 pos = self.rm.positions[symbol]
-                tf = getattr(pos, 'timeframe', '15m')
+                tf = getattr(pos, 'timeframe', '1h')
                 try:
                     dfs[symbol] = await asyncio.wait_for(
                         self.api.fetch_ohlcv(symbol, timeframe=tf, limit=100),
@@ -329,5 +328,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    print("UNICO STRATEGY v6.2 - INICIANDO EN DRY_RUN CON DATOS REALES")
+    print("UNICO STRATEGY v6.3 - INICIANDO EN DRY_RUN")
     asyncio.run(main())
