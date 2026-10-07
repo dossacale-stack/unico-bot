@@ -60,20 +60,20 @@ class MarketScanner:
     BB_PERIOD = 21
     BB_STD = 2.0
 
-    MIN_DISTANCE_PCT = 0.03
+    MIN_DISTANCE_PCT = 0.015
     MAX_DISTANCE_PCT = 0.25
-    MIN_CONSECUTIVE_CANDLES = 4
-    MIN_BB_EXPANSION = 0.15
-    MIN_TIME_IN_ZONE = 6
-    MIN_EXHAUSTION_SCORE = 0.55
-    REJECTION_WICK_RATIO = 1.4
+    MIN_CONSECUTIVE_CANDLES = 3
+    MIN_BB_EXPANSION = 0.05
+    MIN_TIME_IN_ZONE = 4
+    MIN_EXHAUSTION_SCORE = 0.30
+    REJECTION_WICK_RATIO = 1.1
 
     def __init__(
         self,
         api_manager: BybitAPIManager,
         watchlist: List[str],
         scan_interval: float = 60.0,
-        min_score: float = 0.55,
+        min_score: float = 0.30,
         min_rr: float = 1.0,
         position_pct: float = 0.30,
         db_path: str = "patterns.db",
