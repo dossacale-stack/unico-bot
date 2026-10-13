@@ -5,7 +5,9 @@ Se consulta SOLO cuando el score está en zona gris (0.20 - 0.40).
 Por encima de 0.40, se aprueba directo sin consultar.
 Por debajo de 0.20, se descarta sin consultar.
 
-Modelo por defecto: meta-llama/llama-3.1-8b-instruct:free (gratuito)
+Modelo: openrouter/free (router automático que elige el mejor modelo
+gratuito disponible en cada momento). Esto evita que el bot se rompa
+cuando OpenRouter retire un modelo específico.
 """
 
 import hashlib
@@ -23,10 +25,10 @@ logger = logging.getLogger("LLMFilter")
 
 class LLMFilter:
     API_URL = "https://openrouter.ai/api/v1/chat/completions"
-    MODEL = "meta-llama/llama-3.1-8b-instruct:free"
+    MODEL = "openrouter/free"
     SCORE_MIN = 0.20
     SCORE_MAX = 0.40
-    TIMEOUT = 10.0
+    TIMEOUT = 15.0
 
     def __init__(self, db_path: str = "patterns.db"):
         self.db_path = db_path
@@ -107,7 +109,21 @@ class LLMFilter:
                 r.raise_for_status()
                 data = r.json()
                 content = data["choices"][0]["message"]["content"]
+
+                # Limpiar posibles backticks de markdown en la respuesta
+                content = content.strip()
+                if content.startswith("```"):
+                    content = content.strip("`")
+                    if content.startswith("json"):
+                        content = content[4:].strip()
+
                 return json.loads(content)
+        except httpx.HTTPStatusError as e:
+            logger.warning(f"[LLMFilter] HTTP {e.response.status_code} de OpenRouter: {e.response.text[:200]}")
+            return None
+        except json.JSONDecodeError as e:
+            logger.warning(f"[LLMFilter] Respuesta no-JSON del modelo: {e}")
+            return None
         except Exception as e:
             logger.warning(f"[LLMFilter] Error OpenRouter: {e}")
             return None
@@ -115,7 +131,7 @@ class LLMFilter:
     async def should_execute(self, signal) -> Dict:
         """
         Evalúa si la señal debe ejecutarse.
-        Retorna: {"allow": bool, "reason": str, "source": ...}
+        Retorna: {"allow": bool, "reason": str, "source": "score_alto"|"score_bajo"|"llm"|"degradado"}
         """
         score = getattr(signal, "score", 0.0)
 
