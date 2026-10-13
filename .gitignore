@@ -1,10 +1,40 @@
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-*.sqlite3
-*.db
-*.log
-.env
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Entorno virtual
 venv/
 .venv/
+env/
+
+# Variables de entorno (NUNCA subir API keys)
+.env
+.env.local
+
+# Bases de datos (se regeneran)
+*.sqlite3
+*.db
+
+# Caché del backtest (se regenera)
+data_cache/
+backtest_trades.csv
+
+# Cooldowns y estados persistentes (se regeneran)
+cooldowns.json
+
+# Logs
+*.log
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
