@@ -8,6 +8,9 @@ CAMBIOS vs versión anterior:
 - Consulta SetupMemory antes de aprobar entrada
 - SL 15% (no 40%) para sobrevivir rachas
 - Cooldown 5 min (no 15) para no perder reentradas
+
+FIX v7.1:
+- Import corregido: 'strategy_scanner' → 'scanner_v2'
 """
 
 import asyncio
@@ -106,7 +109,6 @@ class OpenPosition:
     score: float = 0.0
     signal_type: Optional[str] = None
     arrow_color: Optional[str] = None
-    # ✅ NUEVOS CAMPOS PARA GESTIÓN DINÁMICA
     tp1_hit: bool = False
     tp2_hit: bool = False
     break_even_set: bool = False
@@ -116,8 +118,8 @@ class OpenPosition:
 
 
 class KillSwitch:
-    DAILY_DRAWDOWN_LIMIT = 15.0   # Bajado de 25% a 15% por leverage alto
-    WEEKLY_DRAWDOWN_LIMIT = 25.0  # Bajado de 30% a 25%
+    DAILY_DRAWDOWN_LIMIT = 15.0
+    WEEKLY_DRAWDOWN_LIMIT = 25.0
 
     def __init__(self):
         self.active = False
@@ -171,16 +173,10 @@ class KillSwitch:
 
 
 class PositionCalculator:
-    """
-    ✅ CAMBIOS CLAVE:
-    - SL 15% (no 40%) → sobrevives rachas largas
-    - TP escalonado: TP1 a 2x, TP2 a 5x, resto trailing
-    - Break-even a 3x riesgo
-    """
     POSITION_PCT = 0.30
-    SL_PCT = 0.15          # ANTES: 0.40
-    TP1_MULTIPLE = 2.0     # Primer objetivo: 2x riesgo
-    TP2_MULTIPLE = 5.0     # Segundo objetivo: 5x riesgo
+    SL_PCT = 0.15
+    TP1_MULTIPLE = 2.0
+    TP2_MULTIPLE = 5.0
     LEVERAGE = 10
     ST_REDUCTION = 0.50
 
@@ -272,18 +268,12 @@ class PositionCalculator:
 
 
 class StructureExitEngine:
-    """
-    ✅ CAMBIO CLAVE: NO cierra por cruce de EMAs.
-    Solo cierra por reversión real (triple techo/suelo con confirmación).
-    Deja correr ganadores.
-    """
     TRIPLE_LOOKBACK = 20
 
     @classmethod
     def evaluate_exit(cls, position: OpenPosition, df: pd.DataFrame, df_1h: Optional[pd.DataFrame] = None) -> Tuple[bool, CloseReason, str]:
         last = df.iloc[-1]
 
-        # Solo cerrar por estructura si el precio retrocedió más del 50% del movimiento
         if position.side == PositionSide.LONG:
             if cls._detect_triple_top(df):
                 return True, CloseReason.REVERSE, "Triple techo detectado"
@@ -377,7 +367,6 @@ class RiskManager:
         self._symbol_daily_entries: Dict[str, int] = defaultdict(int)
         self._last_entry_date: Dict[str, str] = {}
 
-        # ✅ Setup Memory
         try:
             from setup_memory import SetupMemory
             self.setup_memory = SetupMemory(db_path=db_path)
@@ -452,7 +441,6 @@ class RiskManager:
         if signal.symbol in self.positions:
             return None
 
-        # Cooldown
         if signal.symbol in self._symbol_cooldown:
             elapsed = time.time() - self._symbol_cooldown[signal.symbol]
             if elapsed < self.cooldown_minutes * 60:
@@ -461,7 +449,6 @@ class RiskManager:
                 del self._symbol_cooldown[signal.symbol]
                 self._save_cooldowns()
 
-        # Límite diario
         today = datetime.now(timezone.utc).date().isoformat()
         if self._last_entry_date.get(signal.symbol) != today:
             self._symbol_daily_entries[signal.symbol] = 0
@@ -470,7 +457,6 @@ class RiskManager:
         if self._symbol_daily_entries[signal.symbol] >= self.max_entries_daily:
             return None
 
-        # ✅ CONSULTA A SETUP MEMORY
         if self.setup_memory and signal.pattern_id:
             exp = self.setup_memory.get_setup_expectancy(
                 symbol=signal.symbol,
@@ -491,7 +477,8 @@ class RiskManager:
             max_leverage = self.leverage
             is_st = False
 
-        from strategy_scanner import SignalType
+        # ✅ FIX: import corregido de strategy_scanner → scanner_v2
+        from scanner_v2 import SignalType
         side = PositionSide.LONG if signal.signal_type in (SignalType.LONG_BREAKOUT, SignalType.LONG_REVERSAL) else PositionSide.SHORT
 
         atr = 0.0
@@ -522,7 +509,6 @@ class RiskManager:
                           score: float = 0.0,
                           atr: float = 0.0) -> OpenPosition:
 
-        # Calcular TP1 y TP2 según entry real
         risk_distance = abs(position_size.entry_price - position_size.stop_loss)
         if position_size.side == PositionSide.LONG:
             tp1 = position_size.entry_price + (risk_distance * PositionCalculator.TP1_MULTIPLE)
@@ -561,10 +547,6 @@ class RiskManager:
         return pos
 
     async def monitor_positions(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, Tuple[bool, CloseReason, str, float]]:
-        """
-        Retorna: { symbol: (should_close, reason, notes, partial_pct) }
-        partial_pct: 0 = cerrar todo, 0.25 = cerrar 25%, etc.
-        """
         results = {}
 
         for symbol, position in list(self.positions.items()):
@@ -590,7 +572,6 @@ class RiskManager:
             position.unrealized_pnl_pct = pnl_pct * 100 * position.leverage
             position.unrealized_pnl = position.position_usd * pnl_pct * position.leverage
 
-            # 1. SL
             if position.side == PositionSide.LONG:
                 if current <= position.stop_loss:
                     results[symbol] = (True, CloseReason.STOP_LOSS, f"SL {current:.4f}", 1.0)
@@ -600,7 +581,6 @@ class RiskManager:
                     results[symbol] = (True, CloseReason.STOP_LOSS, f"SL {current:.4f}", 1.0)
                     continue
 
-            # 2. TP1 (parcial 25%)
             if not position.tp1_hit:
                 if position.side == PositionSide.LONG and current >= position.tp1_price:
                     results[symbol] = (True, CloseReason.TAKE_PROFIT_1, f"TP1 {current:.4f}", 0.25)
@@ -609,7 +589,6 @@ class RiskManager:
                     results[symbol] = (True, CloseReason.TAKE_PROFIT_1, f"TP1 {current:.4f}", 0.25)
                     continue
 
-            # 3. Break-even a 3x riesgo
             if not position.break_even_set:
                 risk_distance = abs(position.entry_price - position.stop_loss)
                 if position.side == PositionSide.LONG:
@@ -625,7 +604,6 @@ class RiskManager:
                         position.break_even_set = True
                         logger.info(f"[RiskManager] 🔒 Break-even activado {symbol} a {position.stop_loss:.4f}")
 
-            # 4. TP2 (parcial 25%)
             if position.tp1_hit and not position.tp2_hit:
                 if position.side == PositionSide.LONG and current >= position.tp2_price:
                     results[symbol] = (True, CloseReason.TAKE_PROFIT_2, f"TP2 {current:.4f}", 0.25)
@@ -634,7 +612,6 @@ class RiskManager:
                     results[symbol] = (True, CloseReason.TAKE_PROFIT_2, f"TP2 {current:.4f}", 0.25)
                     continue
 
-            # 5. Trailing por ATR (solo después de TP1)
             if position.tp1_hit and position.atr_at_entry > 0:
                 atr = float(last["atr"]) if "atr" in last and not pd.isna(last["atr"]) else position.atr_at_entry
                 callback = atr * 2.5
@@ -656,7 +633,6 @@ class RiskManager:
 
         pos = self.positions[symbol]
 
-        # Calcular PnL de la parte cerrada
         if pos.side == PositionSide.LONG:
             pnl_pct = (current_price - pos.entry_price) / pos.entry_price
         else:
@@ -675,7 +651,6 @@ class RiskManager:
             f"PnL: {pnl_usd:.2f} USDT ({pnl_pct*100:.1f}%) | Razón: {reason.value}"
         )
 
-        # Actualizar setup memory (solo en cierre total)
         if partial_pct >= 1.0 and self.setup_memory and pos.pattern_id:
             self.setup_memory.update(
                 symbol=symbol,
@@ -684,7 +659,6 @@ class RiskManager:
                 pnl_usd=pnl_usd
             )
 
-        # Actualizar patrón en DB
         if pos.pattern_id:
             self._update_pattern_result(
                 pattern_id=pos.pattern_id,
@@ -699,12 +673,10 @@ class RiskManager:
         self._capital.available += portion_usd + pnl_usd
 
         if partial_pct >= 1.0:
-            # Cierre total
             self._symbol_cooldown[symbol] = time.time()
             self._save_cooldowns()
             del self.positions[symbol]
         else:
-            # Cierre parcial: reducir contratos
             pos.contracts -= (pos.original_contracts * partial_pct)
             pos.position_usd -= portion_usd
             if reason == CloseReason.TAKE_PROFIT_1:
