@@ -1,0 +1,31 @@
+# ═══════════════════════════════════════════════════════════
+# PLANTILLA DE VARIABLES DE ENTORNO — UNICO BOT
+# ═══════════════════════════════════════════════════════════
+# Copia este archivo a ".env" y rellena los valores reales.
+# El archivo ".env" NUNCA debe subirse a GitHub (ya está en .gitignore).
+
+# --- Bybit API (producción y testnet usan keys distintas) ---
+BYBIT_API_KEY=
+BYBIT_API_SECRET=
+BYBIT_SANDBOX=true
+
+# --- Modo del bot ---
+# Opciones: DRY_RUN, TESTNET, LIVE
+BOT_MODE=DRY_RUN
+
+# --- Parámetros de riesgo ---
+LEVERAGE=20
+MAX_POSITIONS=2
+POSITION_PCT=0.15
+SL_PCT=0.40
+TP_MULTIPLE=5.0
+COOLDOWN_MINUTES=60
+MAX_ENTRIES_DAILY=5
+SCAN_INTERVAL=60.0
+
+# --- Base de datos ---
+DB_PATH=patterns.db
+
+# --- Groq LLM (para el filtro de confirmación — se usará pronto) ---
+GROQ_API_KEY=
+GROQ_MODEL=llama3-70b-8192
