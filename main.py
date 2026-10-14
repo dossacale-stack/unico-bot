@@ -1,6 +1,9 @@
-
-# main.py - UNICO STRATEGY v7.0 - TODO INTEGRADO
+# main.py - UNICO STRATEGY v7.2 - TODO INTEGRADO
 # =============================================
+# Cambios v7.2:
+# - MAX_POSITIONS: 2 → 4
+# - MIN_EXHAUSTION_SCORE: 0.20 → 0.15
+# - signal_cooldown_seconds: 300 → 120
 
 import argparse
 import asyncio
@@ -83,7 +86,7 @@ class MarketScanner:
     MIN_CONSECUTIVE_CANDLES = 2
     MIN_BB_EXPANSION = 0.02
     MIN_TIME_IN_ZONE = 2
-    MIN_EXHAUSTION_SCORE = 0.20
+    MIN_EXHAUSTION_SCORE = 0.15   # ✅ CAMBIO v7.2: antes 0.20
     REJECTION_WICK_RATIO = 1.0
 
     DEBUG_MODE = True
@@ -409,7 +412,7 @@ CONFIG: Dict[str, Any] = {
     "MIN_SCORE": 0.20,
     "MIN_RR": 0.8,
     "TIMEFRAMES": ["1h"],
-    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "2")),
+    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "4")),   # ✅ CAMBIO v7.2: antes 2
     "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.15")),
     "SL_PCT": float(os.getenv("SL_PCT", "0.40")),
     "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
@@ -486,7 +489,7 @@ class UnicoBot:
             min_rr=config["MIN_RR"],
             position_pct=config["POSITION_PCT"],
             db_path=config["DB_PATH"],
-            signal_cooldown_seconds=300,
+            signal_cooldown_seconds=120,   # ✅ CAMBIO v7.2: antes 300
             timeframes=config.get("TIMEFRAMES", ["1h"]),
         )
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
@@ -572,7 +575,7 @@ class UnicoBot:
 
     async def initialize(self) -> None:
         logger.info("=" * 60)
-        logger.info("UNICO STRATEGY v7.1 - TODO INTEGRADO + AGOTAMIENTO")
+        logger.info("UNICO STRATEGY v7.2 - TODO INTEGRADO + AGOTAMIENTO")
         logger.info(f"MODO: {self.mode.value}")
         logger.info("=" * 60)
         self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
@@ -770,5 +773,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    print("UNICO STRATEGY v7.1 - INICIANDO EN DRY_RUN")
+    print("UNICO STRATEGY v7.2 - INICIANDO EN DRY_RUN")
     asyncio.run(main())
