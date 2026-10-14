@@ -1,9 +1,11 @@
-# main.py - UNICO STRATEGY v7.2 - TODO INTEGRADO
+# main.py - UNICO STRATEGY v7.3 - TODO INTEGRADO
 # =============================================
-# Cambios v7.2:
-# - MAX_POSITIONS: 2 → 4
-# - MIN_EXHAUSTION_SCORE: 0.20 → 0.15
-# - signal_cooldown_seconds: 300 → 120
+# Cambios v7.3:
+# - Integración de RejectionAnalyzer (5 contextos + scoring ponderado + pipeline ML)
+# - Los 4 cambios de v7.2 se mantienen:
+#   * MAX_POSITIONS: 2 → 4
+#   * MIN_EXHAUSTION_SCORE: 0.20 → 0.15
+#   * signal_cooldown_seconds: 300 → 120
 
 import argparse
 import asyncio
@@ -26,6 +28,7 @@ from bybit_api_manager import BybitAPIManager
 from order_executor import OrderExecutor
 from risk_manager import BotMode, CloseReason, RiskManager
 from llm_filter import LLMFilter
+from rejection_analyzer import RejectionAnalyzer
 import seed_patterns
 
 logging.basicConfig(
@@ -86,7 +89,7 @@ class MarketScanner:
     MIN_CONSECUTIVE_CANDLES = 2
     MIN_BB_EXPANSION = 0.02
     MIN_TIME_IN_ZONE = 2
-    MIN_EXHAUSTION_SCORE = 0.15   # ✅ CAMBIO v7.2: antes 0.20
+    MIN_EXHAUSTION_SCORE = 0.15
     REJECTION_WICK_RATIO = 1.0
 
     DEBUG_MODE = True
@@ -115,6 +118,8 @@ class MarketScanner:
         self.timeframes = timeframes or ["1h"]
         self._signal_cooldown: Dict[str, float] = {}
         self.escaneos_totales = 0
+        self.rejection_analyzer = RejectionAnalyzer(db_path=db_path)
+        self._current_symbol = "?"
         logger.info(
             f"[Scanner] AGOTAMIENTO v2 | EMA {self.EMA_FAST}/{self.EMA_MID}/{self.EMA_SLOW} "
             f"| BB({self.BB_PERIOD},{self.BB_STD}) | min_score={min_score} | DEBUG={self.DEBUG_MODE}"
@@ -275,8 +280,11 @@ class MarketScanner:
             ex = self._exhaustion_score(df, "UP")
             if ex["score"] < self.MIN_EXHAUSTION_SCORE:
                 return None
-            if not (self._detect_rejection_bearish(last) or self._detect_rejection_bearish(prev)):
+
+            rej = self.rejection_analyzer.analyze(df, "BEARISH", symbol=self._current_symbol)
+            if not rej["is_rejection"]:
                 return None
+
             recent_high = float(df["high"].tail(10).max())
             stop_loss = recent_high * 1.003
             take_profit = bb_lower
@@ -287,6 +295,12 @@ class MarketScanner:
             rr = reward / risk
             if rr < self.min_rr:
                 return None
+
+            logger.info(
+                f"[RejectionAnalyzer] {self._current_symbol} BEARISH | "
+                f"Score rechazo {rej['score']:.2f} | Contextos: {rej['contexts_met']}"
+            )
+
             return {
                 "signal_type": SignalType.SHORT_REVERSAL,
                 "score": ex["score"],
@@ -303,6 +317,7 @@ class MarketScanner:
                     f"BB expandiendo: {ex['bb_expansion']*100:+.1f}%",
                     f"Tiempo en zona: {ex['candles_in_zone']} velas",
                     f"Score agotamiento: {ex['score']:.2f}",
+                    f"Score rechazo: {rej['score']:.2f}",
                 ],
             }
 
@@ -310,8 +325,11 @@ class MarketScanner:
             ex = self._exhaustion_score(df, "DOWN")
             if ex["score"] < self.MIN_EXHAUSTION_SCORE:
                 return None
-            if not (self._detect_rejection_bullish(last) or self._detect_rejection_bullish(prev)):
+
+            rej = self.rejection_analyzer.analyze(df, "BULLISH", symbol=self._current_symbol)
+            if not rej["is_rejection"]:
                 return None
+
             recent_low = float(df["low"].tail(10).min())
             stop_loss = recent_low * 0.997
             take_profit = bb_upper
@@ -322,6 +340,12 @@ class MarketScanner:
             rr = reward / risk
             if rr < self.min_rr:
                 return None
+
+            logger.info(
+                f"[RejectionAnalyzer] {self._current_symbol} BULLISH | "
+                f"Score rechazo {rej['score']:.2f} | Contextos: {rej['contexts_met']}"
+            )
+
             return {
                 "signal_type": SignalType.LONG_REVERSAL,
                 "score": ex["score"],
@@ -338,6 +362,7 @@ class MarketScanner:
                     f"BB expandiendo: {ex['bb_expansion']*100:+.1f}%",
                     f"Tiempo en zona: {ex['candles_in_zone']} velas",
                     f"Score agotamiento: {ex['score']:.2f}",
+                    f"Score rechazo: {rej['score']:.2f}",
                 ],
             }
 
@@ -360,6 +385,7 @@ class MarketScanner:
                 if df is None or len(df) < self.EMA_SLOW + 20:
                     continue
 
+                self._current_symbol = symbol
                 analysis = self._analyze(df)
                 if not analysis:
                     continue
@@ -412,7 +438,7 @@ CONFIG: Dict[str, Any] = {
     "MIN_SCORE": 0.20,
     "MIN_RR": 0.8,
     "TIMEFRAMES": ["1h"],
-    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "4")),   # ✅ CAMBIO v7.2: antes 2
+    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "4")),
     "POSITION_PCT": float(os.getenv("POSITION_PCT", "0.15")),
     "SL_PCT": float(os.getenv("SL_PCT", "0.40")),
     "TP_MULTIPLE": float(os.getenv("TP_MULTIPLE", "5.0")),
@@ -489,7 +515,7 @@ class UnicoBot:
             min_rr=config["MIN_RR"],
             position_pct=config["POSITION_PCT"],
             db_path=config["DB_PATH"],
-            signal_cooldown_seconds=120,   # ✅ CAMBIO v7.2: antes 300
+            signal_cooldown_seconds=120,
             timeframes=config.get("TIMEFRAMES", ["1h"]),
         )
         self.executor = OrderExecutor(api_manager=self.api, mode=self.mode)
@@ -575,7 +601,7 @@ class UnicoBot:
 
     async def initialize(self) -> None:
         logger.info("=" * 60)
-        logger.info("UNICO STRATEGY v7.2 - TODO INTEGRADO + AGOTAMIENTO")
+        logger.info("UNICO STRATEGY v7.3 - TODO INTEGRADO + AGOTAMIENTO + REJECTION ANALYZER")
         logger.info(f"MODO: {self.mode.value}")
         logger.info("=" * 60)
         self.config["WATCHLIST"] = await self.generate_dynamic_watchlist()
@@ -773,5 +799,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    print("UNICO STRATEGY v7.2 - INICIANDO EN DRY_RUN")
+    print("UNICO STRATEGY v7.3 - INICIANDO EN DRY_RUN")
     asyncio.run(main())
