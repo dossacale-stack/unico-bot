@@ -2,7 +2,7 @@
 
 Bot de trading algorítmico para futuros perpetuos USDT en Bybit, con panel web para ## Estrategia v10: interés y desinterés (la que usa por defecto)
 
-Explicada por Karla con TIA y VVV. Colores: **morada = EMA55**, **azul = EMA144**, **amarilla = EMA233** (exponenciales;
+Explicada por Karlos con TIA y VVV. Colores: **morada = EMA55**, **azul = EMA144**, **amarilla = EMA233** (exponenciales;
 se usan 55/144/233 y no 50/100/200 porque la mayoría trabaja con estas últimas).
 
 - 🔻 **Venta por desinterés**: el precio cierra bajo la morada y la azul; vuelve a acercarse por debajo a la morada, la
